@@ -3,7 +3,10 @@
 #include <cinttypes>
 #include <cstdio>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -52,6 +55,36 @@ bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAcce
 		}
 		if (finish <= current || (region.State & MEM_COMMIT) == 0 ||
 		    !IsAccessible(region.Protect, access)) {
+			break;
+		}
+		current = finish < end ? finish : end;
+	}
+#elif defined(__APPLE__)
+	while (current < end) {
+		mach_vm_address_t              region_address = current;
+		mach_vm_size_t                 region_size    = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t         info_count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t                    object_name = MACH_PORT_NULL;
+		const auto result =
+		    mach_vm_region(mach_task_self(), &region_address, &region_size,
+		                   VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info),
+		                   &info_count, &object_name);
+		if (object_name != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), object_name);
+		}
+		if (result != KERN_SUCCESS) {
+			break;
+		}
+
+		const auto begin = static_cast<uint64_t>(region_address);
+		auto       finish = begin + static_cast<uint64_t>(region_size);
+		if (finish < begin) {
+			finish = UINT64_MAX;
+		}
+		const bool allowed =
+		    access == HostMemoryAccess::Mapped || (info.protection & VM_PROT_READ) != 0;
+		if (begin > current || finish <= current || !allowed) {
 			break;
 		}
 		current = finish < end ? finish : end;
