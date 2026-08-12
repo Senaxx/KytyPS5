@@ -2,6 +2,12 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish successful platform artifacts as a GitHub release
+        required: false
+        default: false
+        type: boolean
   push:
     branches: [ main, master ]
   pull_request:
@@ -375,7 +381,8 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish_release)) &&
       vars.KYTY_ENABLE_RELEASES == 'true' &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
