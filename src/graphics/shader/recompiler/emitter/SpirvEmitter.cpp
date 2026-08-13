@@ -1209,6 +1209,25 @@ bool ProgramSupportsLogicalMultiWaveWorkgroup(const IR::Program& program) {
 	return true;
 }
 
+void AnalyzeComputeSubgroupCompatibility(IR::Program& program, uint32_t local_threads) {
+	if (program.wave_size != 64u) {
+		return;
+	}
+	program.compute_subgroup.local_threads           = local_threads;
+	program.compute_subgroup.requires_exact_subgroup = ProgramRequiresExactSubgroupSize(program);
+	program.compute_subgroup.half_wave_separable     = ProgramSupportsHalfWaveSeparable(program);
+
+	auto logical_program = program;
+	logical_program.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
+	program.compute_subgroup.logical_single_wave_supported =
+	    local_threads == program.wave_size &&
+	    ProgramSupportsLogicalSingleWaveWorkgroup(logical_program);
+	program.compute_subgroup.logical_multi_wave_supported =
+	    local_threads > program.wave_size && local_threads % program.wave_size == 0u &&
+	    ProgramSupportsLogicalMultiWaveWorkgroup(logical_program);
+	program.compute_subgroup.complete = true;
+}
+
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
                  const ShaderVertexInputInfo*  vertex_input_info,
                  const ShaderPixelInputInfo*   pixel_input_info,

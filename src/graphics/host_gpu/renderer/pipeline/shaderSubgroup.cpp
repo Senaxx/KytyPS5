@@ -46,15 +46,27 @@ ShaderLaneMaskMode SelectComputeProgramLaneMaskMode(
 	// FlattenedMasks path even when one guest wave spans two host subgroups.
 	// Per-invocation lowering changes the representation of EXEC/VCC, so only
 	// select it for programs which actually require exact guest-wave semantics.
+	const bool cached = native_program.compute_subgroup.complete &&
+	                    native_program.compute_subgroup.local_threads == local_threads;
+	const bool requires_exact =
+	    cached ? native_program.compute_subgroup.requires_exact_subgroup
+	           : ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(native_program);
 	if (SelectComputeLaneMaskMode(capabilities, guest_wave_size, local_threads) !=
 	        ShaderLaneMaskMode::PerInvocation ||
-	    !ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(native_program)) {
+	    !requires_exact) {
 		return ShaderLaneMaskMode::NativeWave;
 	}
 	if (guest_wave_size == 64u && capabilities.subgroup_size == 32u &&
 	    local_threads == guest_wave_size &&
-	    ShaderRecompiler::Spirv::ProgramSupportsHalfWaveSeparable(native_program)) {
+	    (cached ? native_program.compute_subgroup.half_wave_separable
+	            : ShaderRecompiler::Spirv::ProgramSupportsHalfWaveSeparable(native_program))) {
 		return ShaderLaneMaskMode::NativeWave;
+	}
+	if (cached) {
+		const bool supported = local_threads == guest_wave_size
+		                           ? native_program.compute_subgroup.logical_single_wave_supported
+		                           : native_program.compute_subgroup.logical_multi_wave_supported;
+		return supported ? ShaderLaneMaskMode::PerInvocation : ShaderLaneMaskMode::NativeWave;
 	}
 	auto logical_program           = native_program;
 	logical_program.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
@@ -88,13 +100,20 @@ ShaderSubgroupConfiguration ConfigureShaderSubgroup(const ShaderSubgroupCapabili
 		            : ShaderSubgroupMode::PerInvocationGraphics,
 		        0};
 	}
+	const bool cached = program.compute_subgroup.complete &&
+	                    program.compute_subgroup.local_threads == local_threads;
 	if (program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation) {
-		if (local_threads == guest_wave_size &&
-		    ShaderRecompiler::Spirv::ProgramSupportsLogicalSingleWaveWorkgroup(program)) {
+		const bool single_supported =
+		    cached ? program.compute_subgroup.logical_single_wave_supported
+		           : ShaderRecompiler::Spirv::ProgramSupportsLogicalSingleWaveWorkgroup(program);
+		if (local_threads == guest_wave_size && single_supported) {
 			return {ShaderSubgroupMode::LogicalSingleWaveWorkgroup, 0};
 		}
+		const bool multi_supported =
+		    cached ? program.compute_subgroup.logical_multi_wave_supported
+		           : ShaderRecompiler::Spirv::ProgramSupportsLogicalMultiWaveWorkgroup(program);
 		if (local_threads > guest_wave_size && local_threads % guest_wave_size == 0u &&
-		    ShaderRecompiler::Spirv::ProgramSupportsLogicalMultiWaveWorkgroup(program)) {
+		    multi_supported) {
 			return {ShaderSubgroupMode::LogicalMultiWaveWorkgroup, 0};
 		}
 		return {};
@@ -120,10 +139,14 @@ ShaderSubgroupConfiguration ConfigureShaderSubgroup(const ShaderSubgroupCapabili
 	}
 	if (guest_wave_size == 64u && capabilities.subgroup_size == 32u &&
 	    local_threads == guest_wave_size &&
-	    ShaderRecompiler::Spirv::ProgramSupportsHalfWaveSeparable(program)) {
+	    (cached ? program.compute_subgroup.half_wave_separable
+	            : ShaderRecompiler::Spirv::ProgramSupportsHalfWaveSeparable(program))) {
 		return {ShaderSubgroupMode::HalfWaveIndependent, 0};
 	}
-	if (!ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(program)) {
+	const bool requires_exact =
+	    cached ? program.compute_subgroup.requires_exact_subgroup
+	           : ShaderRecompiler::Spirv::ProgramRequiresExactSubgroupSize(program);
+	if (!requires_exact) {
 		return {ShaderSubgroupMode::FlattenedMasks, 0};
 	}
 	return {};

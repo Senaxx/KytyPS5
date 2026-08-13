@@ -628,6 +628,22 @@ void TestNativeSubgroupPolicy() {
 	Check(ShaderRecompiler::Spirv::ProgramSupportsLogicalMultiWaveWorkgroup(
 	          cross_lane_compute),
 	      "uniform cross-lane program was rejected by multi-wave certification");
+	auto cached_cross_lane = cross_lane_compute;
+	cached_cross_lane.lane_mask_mode = ShaderLaneMaskMode::NativeWave;
+	ShaderRecompiler::Spirv::AnalyzeComputeSubgroupCompatibility(cached_cross_lane, 64);
+	Check(cached_cross_lane.compute_subgroup.complete &&
+	          cached_cross_lane.compute_subgroup.local_threads == 64 &&
+	          cached_cross_lane.compute_subgroup.requires_exact_subgroup &&
+	          cached_cross_lane.compute_subgroup.logical_single_wave_supported &&
+	          SelectComputeProgramLaneMaskMode(subgroup_caps, 64, 64, cached_cross_lane) ==
+	              ShaderLaneMaskMode::PerInvocation,
+	      "cached subgroup analysis changed logical single-wave selection");
+	ShaderRecompiler::Spirv::AnalyzeComputeSubgroupCompatibility(cached_cross_lane, 128);
+	Check(cached_cross_lane.compute_subgroup.local_threads == 128 &&
+	          cached_cross_lane.compute_subgroup.logical_multi_wave_supported &&
+	          SelectComputeProgramLaneMaskMode(subgroup_caps, 64, 128, cached_cross_lane) ==
+	              ShaderLaneMaskMode::PerInvocation,
+	      "cached subgroup analysis changed logical multi-wave selection");
 
 	auto numeric_mask = cross_lane_compute;
 	numeric_mask.blocks.clear();

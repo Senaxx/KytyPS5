@@ -933,6 +933,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (dispatcher_fallback) {
 		LOGF("%s dispatcher fallback used: %s\n", GetDumpLabel(options), dispatcher_reason.c_str());
 	}
+	if (options.stage == ShaderType::Compute) {
+		const uint32_t local_threads = std::max(info_options.compute->threads_num[0], 1u) *
+		                               std::max(info_options.compute->threads_num[1], 1u) *
+		                               std::max(info_options.compute->threads_num[2], 1u);
+		Spirv::AnalyzeComputeSubgroupCompatibility(ir, local_threads);
+	}
 
 	result.spirv     = std::move(spirv);
 	result.program   = std::move(ir);

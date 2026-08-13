@@ -479,6 +479,15 @@ struct ShaderInfo {
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
+struct ComputeSubgroupAnalysis {
+	uint32_t local_threads                 = 0;
+	bool     complete                      = false;
+	bool     requires_exact_subgroup       = false;
+	bool     half_wave_separable           = false;
+	bool     logical_single_wave_supported = false;
+	bool     logical_multi_wave_supported  = false;
+};
+
 struct Program {
 	ShaderType              stage               = ShaderType::Unknown;
 	ShaderLaneMaskMode      lane_mask_mode      = ShaderLaneMaskMode::NativeWave;
@@ -489,6 +498,7 @@ struct Program {
 	bool                    compute_linear_local64 = false;
 	int32_t                 compute_workgroup_register = -1;
 	int32_t                 compute_thread_ids_num     = 0;
+	ComputeSubgroupAnalysis compute_subgroup;
 	bool                    dispatcher_fallback = false;
 	CFG::FailureKind        cfg_failure_kind    = CFG::FailureKind::None;
 	std::string             fallback_reason;
