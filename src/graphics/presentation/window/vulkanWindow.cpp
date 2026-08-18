@@ -532,11 +532,19 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 
 	const auto robustness2_ext_enabled =
 	    HasExtension(device_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+	const auto fragment_barycentric_ext_enabled =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT supported_robustness2 {};
 	supported_robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
 	supported_robustness2.pNext = nullptr;
-	if (robustness2_ext_enabled) {
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_barycentric {};
+	supported_barycentric.sType =
+	    vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+	supported_barycentric.pNext = robustness2_ext_enabled ? &supported_robustness2 : nullptr;
+	if (fragment_barycentric_ext_enabled) {
+		supported_features12.pNext = &supported_barycentric;
+	} else if (robustness2_ext_enabled) {
 		supported_features12.pNext = &supported_robustness2;
 	}
 
@@ -552,6 +560,8 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	                     supported_features13.synchronization2 != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.sampleRateShading != VK_TRUE);
 	EXIT_NOT_IMPLEMENTED(supported_features2.features.depthBiasClamp != VK_TRUE);
+	EXIT_NOT_IMPLEMENTED(fragment_barycentric_ext_enabled &&
+	                     supported_barycentric.fragmentShaderBarycentric != VK_TRUE);
 	features12.timelineSemaphore = VK_TRUE;
 
 	vk::PhysicalDeviceFeatures device_features {};
@@ -580,10 +590,17 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	const auto* base_feature_chain = (subgroup_size_control.subgroupSizeControl == VK_TRUE
 	                                      ? static_cast<const void*>(&subgroup_size_control)
 	                                      : static_cast<const void*>(&features12));
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric {};
+	barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
+	barycentric.pNext = const_cast<void*>(base_feature_chain);
+	barycentric.fragmentShaderBarycentric =
+	    fragment_barycentric_ext_enabled ? VK_TRUE : VK_FALSE;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 	robustness2.sType = vk::StructureType::ePhysicalDeviceRobustness2FeaturesEXT;
-	robustness2.pNext = const_cast<void*>(base_feature_chain);
+	robustness2.pNext = fragment_barycentric_ext_enabled
+	                      ? static_cast<void*>(&barycentric)
+	                      : const_cast<void*>(base_feature_chain);
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -591,13 +608,18 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	}
 
 	auto features13 = required_features13;
-	features13.pNext =
-	    robustness2_ext_enabled ? &robustness2 : const_cast<void*>(base_feature_chain);
+	features13.pNext = robustness2_ext_enabled
+	                       ? static_cast<void*>(&robustness2)
+	                       : (fragment_barycentric_ext_enabled
+	                              ? static_cast<void*>(&barycentric)
+	                              : const_cast<void*>(base_feature_chain));
 	features13.robustImageAccess = supported_features13.robustImageAccess;
 
 	LOGF("Vulkan robustness: robustImageAccess=%s robustImageAccess2=%s\n",
 	     features13.robustImageAccess == VK_TRUE ? "true" : "false",
 	     robustness2_ext_enabled && robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false");
+	LOGF("Vulkan fragment barycentric: %s\n",
+	     fragment_barycentric_ext_enabled ? "true" : "false");
 
 	vk::DeviceCreateInfo create_info {};
 	create_info.sType                   = vk::StructureType::eDeviceCreateInfo;
@@ -959,6 +981,10 @@ void WindowContext::CreateVulkan() {
 		}
 		if (HasExtension(available_extensions, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions,
+		                 VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 		}
 	}
 

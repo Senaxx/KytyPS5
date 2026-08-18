@@ -9,14 +9,15 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 void AddInput(ShaderInfo& info, StageInputKind kind, uint32_t location, uint32_t components,
-              std::string name) {
+              std::string name, bool per_vertex = false) {
 	const auto input = std::find_if(info.inputs.begin(), info.inputs.end(), [=](const auto& value) {
 		return value.kind == kind && value.location == location;
 	});
 	if (input == info.inputs.end()) {
-		info.inputs.push_back({kind, location, components, std::move(name)});
+		info.inputs.push_back({kind, location, components, std::move(name), per_vertex});
 	} else {
 		input->component_count = std::max(input->component_count, components);
+		input->per_vertex      = input->per_vertex || per_vertex;
 	}
 }
 
@@ -70,14 +71,20 @@ bool ValidateValueReferences(const Program& program, const ShaderInfoOptions& op
 			switch (inst.GetOpcode()) {
 				case ValueOpcode::GetAttribute: {
 					if (!inst.Arg(0).IsImmediate() || inst.Arg(0).GetType() != Type::U32 ||
-					    !inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32) {
+					    !inst.Arg(1).IsImmediate() || inst.Arg(1).GetType() != Type::U32 ||
+					    !inst.Arg(2).IsImmediate() || inst.Arg(2).GetType() != Type::U32) {
 						return Fail("typed attribute reference is not constant");
 					}
 					if (program.stage == ShaderType::Vertex &&
 					    (inst.Arg(1).U32() >= 4u ||
 					     inst.Arg(0).U32() >=
-					         static_cast<uint32_t>(options.vertex->resources_num))) {
+					         static_cast<uint32_t>(options.vertex->resources_num) ||
+					     inst.Arg(2).U32() != UINT32_MAX)) {
 						return Fail("vertex input reference is out of range");
+					}
+					if (program.stage == ShaderType::Pixel && inst.Arg(2).U32() != UINT32_MAX &&
+					    inst.Arg(2).U32() > 2u) {
+						return Fail("pixel per-vertex input selector is out of range");
 					}
 					break;
 				}
@@ -150,7 +157,8 @@ void CollectVertexInputs(const Program& program, const ShaderVertexInputInfo* ve
 	}
 }
 
-void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
+void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixel,
+                        ShaderInfo& info) {
 	if (pixel->HasPositionInput()) {
 		AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
 	}
@@ -158,7 +166,16 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input));
+		bool per_vertex = false;
+		for (const auto* block: program.values->blocks) {
+			for (const auto& inst: *block) {
+				per_vertex = per_vertex ||
+				             (inst.GetOpcode() == ValueOpcode::GetAttribute &&
+				              inst.Arg(0).U32() == input && inst.Arg(2).U32() != UINT32_MAX);
+			}
+		}
+		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
+		         per_vertex);
 	}
 }
 
@@ -287,7 +304,7 @@ bool CollectShaderInfo(Program& program, const ShaderInfoOptions& options, std::
 	    });
 	switch (program.stage) {
 		case ShaderType::Vertex: CollectVertexInputs(program, options.vertex, next); break;
-		case ShaderType::Pixel: CollectPixelInputs(options.pixel, next); break;
+		case ShaderType::Pixel: CollectPixelInputs(program, options.pixel, next); break;
 		case ShaderType::Compute: CollectComputeInputs(options.compute, next); break;
 		default: return false;
 	}

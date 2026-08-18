@@ -181,9 +181,17 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
+	bool needs_per_vertex = false;
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
+		needs_per_vertex = needs_per_vertex || binding.per_vertex;
+	}
+	if (needs_per_vertex) {
+		state.bary_coord_variable          = state.builder.AllocateId();
+		state.bary_coord_no_persp_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.bary_coord_variable);
+		state.interface_variables.push_back(state.bary_coord_no_persp_variable);
 	}
 	if (state.needs_subgroup_local_invocation_id) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
@@ -241,6 +249,14 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 }
 
 void AddInputAnnotationsAndNames(EmitterState& state) {
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddName(state.bary_coord_variable, "gl_BaryCoordKHR");
+		state.builder.AddAnnotation({OpDecorate, state.bary_coord_variable, DecorationBuiltIn,
+		                             BuiltInBaryCoordKHR});
+		state.builder.AddName(state.bary_coord_no_persp_variable, "gl_BaryCoordNoPerspKHR");
+		state.builder.AddAnnotation({OpDecorate, state.bary_coord_no_persp_variable,
+		                             DecorationBuiltIn, BuiltInBaryCoordNoPerspKHR});
+	}
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddName(state.subgroup_local_invocation_id_variable,
 		                      "gl_SubgroupInvocationID");
@@ -254,6 +270,14 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Parameter) {
+			if (input.per_vertex) {
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationPerVertexKHR});
+				const auto location = PixelParameterLocation(state, input.location);
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationLocation, location});
+				continue;
+			}
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
@@ -431,6 +455,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.ptr_input_vec3_uint          = state.builder.AllocateId();
 	state.ptr_input_vec4_uint          = state.builder.AllocateId();
 	state.ptr_input_vec4_float         = state.builder.AllocateId();
+	if (state.bary_coord_variable != 0) {
+		state.per_vertex_input_array_type = state.builder.AllocateId();
+		state.ptr_input_per_vertex_array  = state.builder.AllocateId();
+	}
 	state.sample_mask_array_type       = state.builder.AllocateId();
 	state.ptr_output_int               = state.builder.AllocateId();
 	state.ptr_output_sample_mask_array = state.builder.AllocateId();
@@ -483,6 +511,10 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	state.glsl_std450               = state.builder.AllocateId();
 
 	state.builder.AddCapability({CapabilityShader});
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddCapability({CapabilityFragmentBarycentricKHR});
+		state.builder.AddExtension("SPV_KHR_fragment_shader_barycentric");
+	}
 	state.builder.AddCapability({CapabilitySampled1D});
 	state.builder.AddCapability({CapabilityImage1D});
 	state.builder.AddCapability({CapabilityImageQuery});
@@ -610,6 +642,16 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	    {OpTypePointer, state.ptr_input_vec4_uint, StorageClassInput, state.vec4_uint_type});
 	state.builder.AddType(
 	    {OpTypePointer, state.ptr_input_vec4_float, StorageClassInput, state.vec4_float_type});
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddType({OpTypeArray, state.per_vertex_input_array_type,
+		                       state.vec4_float_type, ConstantU32(state, 3)});
+		state.builder.AddType({OpTypePointer, state.ptr_input_per_vertex_array, StorageClassInput,
+		                       state.per_vertex_input_array_type});
+		state.builder.AddType({OpVariable, state.ptr_input_vec3_float,
+		                       state.bary_coord_variable, StorageClassInput});
+		state.builder.AddType({OpVariable, state.ptr_input_vec3_float,
+		                       state.bary_coord_no_persp_variable, StorageClassInput});
+	}
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddType({OpVariable, state.ptr_input_uint,
 		                       state.subgroup_local_invocation_id_variable, StorageClassInput});
@@ -627,7 +669,9 @@ void EmitHeaderAndTypes(EmitterState& state) {
 			case IR::StageInputKind::FragCoord: ptr_type = state.ptr_input_vec4_float; break;
 			case IR::StageInputKind::FrontFacing: ptr_type = state.ptr_input_bool; break;
 			case IR::StageInputKind::Parameter:
-				if (state.stage == ShaderType::Vertex) {
+				if (input.per_vertex) {
+					ptr_type = state.ptr_input_per_vertex_array;
+				} else if (state.stage == ShaderType::Vertex) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
 					const auto components = VertexParameterComponentCount(state, input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);

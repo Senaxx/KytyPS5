@@ -4869,6 +4869,8 @@ void TestNewShaderRecompilerVintrpLowering() {
       EncodeVintrp(0, 10, 1, 2, 4), // v_interp_p1_f32 v10, v4, attr1.z
       EncodeVintrp(1, 11, 1, 2, 4), // v_interp_p2_f32 v11, v4, attr1.z
       EncodeVintrp(2, 12, 0, 3, 2), // v_interp_mov_f32 v12, p0, attr0.w
+      EncodeVintrp(2, 13, 0, 0, 0), // v_interp_mov_f32 v13, p10, attr0.x
+      EncodeVintrp(2, 14, 0, 1, 1), // v_interp_mov_f32 v14, p20, attr0.y
       0xbf810000u,
   };
 
@@ -4900,6 +4902,15 @@ void TestNewShaderRecompilerVintrpLowering() {
         "VINTRP MOV did not lower to input-load IR");
   Check(Common::ContainsStr(result.ir_dump, "input_attr=0 input_chan=3"),
         "VINTRP MOV did not preserve attr/channel metadata");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "input_attr=0 input_chan=3 input_vertex=0"),
+        "VINTRP MOV P0 did not preserve vertex metadata");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "input_attr=0 input_chan=0 input_vertex=1"),
+        "VINTRP MOV P10 did not preserve vertex metadata");
+  Check(Common::ContainsStr(result.ir_dump,
+                            "input_attr=0 input_chan=1 input_vertex=2"),
+        "VINTRP MOV P20 did not preserve vertex metadata");
   Check(ProgramInputCount(result.program,
                           ShaderRecompiler::IR::StageInputKind::Parameter) == 2,
         "VINTRP pixel shader did not reflect parameter inputs");
@@ -4911,6 +4922,10 @@ void TestNewShaderRecompilerVintrpLowering() {
         "SPIR-V binary does not contain input component extraction");
   Check(SpirvContainsOpcode(result.spirv, 124),
         "SPIR-V binary does not contain input bitcast");
+  Check(SpirvContainsCapability(result.spirv, 5284u),
+        "VINTRP MOV SPIR-V does not request FragmentBarycentricKHR");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u),
+        "VINTRP MOV input did not emit a PerVertexKHR decoration");
   CheckSpirvBinaryValidates(result.spirv);
 
   const uint32_t remapped_shader[] = {
@@ -4979,10 +4994,10 @@ void TestNewShaderRecompilerVintrpLowering() {
   Check(
       ShaderRecompiler::TryRecompile(flat_shader, options, flat_result, &error),
       error.c_str());
-  Check(SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 14u),
-        "flat VINTRP input did not emit a Flat decoration");
+  Check(SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 5285u),
+        "VINTRP MOV input did not emit a PerVertexKHR decoration");
   Check(!SpirvHasDecorationValueWithDecoration(flat_result.spirv, 30u, 0u, 13u),
-        "flat VINTRP input should not also emit NoPerspective");
+        "per-vertex VINTRP input should not emit NoPerspective");
   Check(SpirvHasDecorationValue(flat_result.spirv, 30u, 0u),
         "flat VINTRP input did not preserve Location 0");
   CheckSpirvBinaryValidates(flat_result.spirv);
@@ -4994,8 +5009,13 @@ void TestNewShaderRecompilerVintrpLowering() {
 
   options.input_info.pixel = &no_perspective_ps_info;
 
+  const uint32_t no_perspective_shader[] = {
+      EncodeVintrp(1, 12, 0, 0, 4), // v_interp_p2_f32 v12, v4, attr0.x
+      0xbf810000u,
+  };
+
   ShaderRecompiler::CompileResult no_perspective_result;
-  Check(ShaderRecompiler::TryRecompile(flat_shader, options,
+  Check(ShaderRecompiler::TryRecompile(no_perspective_shader, options,
                                        no_perspective_result, &error),
         error.c_str());
   Check(SpirvHasDecorationValueWithDecoration(no_perspective_result.spirv, 30u,

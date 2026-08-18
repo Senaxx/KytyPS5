@@ -122,8 +122,9 @@ struct ExportInfo {
 };
 
 struct InputInfo {
-	uint32_t attr = 0;
-	uint32_t chan = 0;
+	uint32_t attr         = 0;
+	uint32_t chan         = 0;
+	uint32_t vertex_index = UINT32_MAX;
 
 	bool operator==(const InputInfo& other) const = default;
 };
@@ -260,6 +261,7 @@ struct StageInput {
 	uint32_t       location        = 0;
 	uint32_t       component_count = 1;
 	std::string    debug_name;
+	bool           per_vertex = false;
 
 	bool operator==(const StageInput& other) const = default;
 };

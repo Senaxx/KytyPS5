@@ -15,7 +15,8 @@ bool Translator::TranslateAttributeOperation(const IR::Instruction& inst) {
 	if (inst.op == IR::Opcode::LoadInputF32) {
 		WriteOperand(inst.dst,
 		             ir.Emit(IR::ValueOpcode::GetAttribute,
-		                     {IR::Value(inst.input_info.attr), IR::Value(inst.input_info.chan)}));
+		                     {IR::Value(inst.input_info.attr), IR::Value(inst.input_info.chan),
+		                      IR::Value(inst.input_info.vertex_index)}));
 		return true;
 	}
 	if (inst.op == IR::Opcode::Export) {

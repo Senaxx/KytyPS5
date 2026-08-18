@@ -160,7 +160,8 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	return result;
 }
 
-uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
+uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan,
+                       uint32_t vertex_index) {
 	auto&       state = ctx.state;
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
@@ -168,6 +169,46 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan) {
 	}
 	if (state.stage == ShaderType::Vertex) {
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
+	}
+	if (input->per_vertex) {
+		auto LoadVertexComponent = [&](uint32_t vertex) {
+			const auto pointer = state.builder.AllocateId();
+			const auto value   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpAccessChain, state.ptr_input_float, pointer, input->variable_id,
+			     ConstantU32(state, vertex), ConstantU32(state, chan & 3u)});
+			state.builder.AddFunction({OpLoad, state.float_type, value, pointer});
+			return value;
+		};
+
+		uint32_t component = 0;
+		if (vertex_index != UINT32_MAX || PixelParameterIsFlat(state, attr)) {
+			component = LoadVertexComponent(vertex_index != UINT32_MAX ? vertex_index : 0u);
+		} else {
+			const auto bary_variable = state.input_info.pixel->ps_no_perspective
+			                               ? state.bary_coord_no_persp_variable
+			                               : state.bary_coord_variable;
+			const auto bary = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, state.vec3_float_type, bary, bary_variable});
+			for (uint32_t vertex = 0; vertex < 3; vertex++) {
+				const auto weight = state.builder.AllocateId();
+				const auto term   = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpCompositeExtract, state.float_type, weight, bary, vertex});
+				state.builder.AddFunction(
+				    {OpFMul, state.float_type, term, LoadVertexComponent(vertex), weight});
+				if (vertex == 0) {
+					component = term;
+				} else {
+					const auto sum = state.builder.AllocateId();
+					state.builder.AddFunction({OpFAdd, state.float_type, sum, component, term});
+					component = sum;
+				}
+			}
+		}
+		const auto bits = state.builder.AllocateId();
+		state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+		return bits;
 	}
 	const auto vector    = state.builder.AllocateId();
 	const auto component = state.builder.AllocateId();
@@ -547,7 +588,8 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		}
 		case IR::ValueOpcode::GetAttribute:
-			ctx.Define(inst, EmitAttribute(ctx, inst.Arg(0).U32(), inst.Arg(1).U32()));
+			ctx.Define(inst, EmitAttribute(ctx, inst.Arg(0).U32(), inst.Arg(1).U32(),
+			                               inst.Arg(2).U32()));
 			return true;
 		case IR::ValueOpcode::SetAttribute: EmitExport(ctx, inst); return true;
 		case IR::ValueOpcode::GetShaderBase:
