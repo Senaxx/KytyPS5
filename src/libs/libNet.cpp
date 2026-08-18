@@ -1408,6 +1408,20 @@ namespace LibNpCommerce {
 
 LIB_VERSION("NpCommerce", 1, "NpCommerce", 1, 1);
 
+static int KYTY_SYSV_ABI NpCommerceDialogInitialize() {
+	PRINT_NAME();
+
+	// Kyty does not expose the system commerce UI, but games may still use its
+	// lifecycle entry points while bringing up common-dialog infrastructure.
+	return OK;
+}
+
+static int KYTY_SYSV_ABI NpCommerceDialogTerminate() {
+	PRINT_NAME();
+
+	return OK;
+}
+
 static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 	PRINT_NAME();
 
@@ -1415,6 +1429,8 @@ static int KYTY_SYSV_ABI NpCommerceDialogUpdateStatus() {
 }
 
 LIB_DEFINE(InitNet_1_NpCommerce) {
+	LIB_FUNC("0aR2aWmQal4", NpCommerceDialogInitialize);
+	LIB_FUNC("m-I92Ab50W8", NpCommerceDialogTerminate);
 	LIB_FUNC("LR5cwFMMCVE", NpCommerceDialogUpdateStatus);
 }
 
