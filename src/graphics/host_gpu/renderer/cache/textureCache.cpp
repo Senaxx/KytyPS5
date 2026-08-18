@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "debugger/target/graphics.h"
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -19,6 +21,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -31,6 +34,11 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Allocated lazily and only when the external debugger requests a preview. This accommodates
+// large HDR targets without increasing normal emulator memory use.
+constexpr uint64_t DebugPreviewCapacity   = 256ull * 1024 * 1024;
+constexpr uint32_t DebugPreviewWidth      = 480;
+constexpr uint32_t DebugPreviewHeight     = 270;
 
 thread_local const TextureCache* g_locked_cache = nullptr;
 
@@ -51,6 +59,349 @@ public:
 private:
 	TrackingSpinLock& m_lock;
 };
+
+float HalfToFloat(uint16_t value) {
+	const uint32_t sign = static_cast<uint32_t>(value & 0x8000u) << 16u;
+	uint32_t exponent = (value >> 10u) & 0x1fu;
+	uint32_t mantissa = value & 0x3ffu;
+	uint32_t bits = 0;
+	if (exponent == 0) {
+		if (mantissa == 0) {
+			bits = sign;
+		} else {
+			exponent = 113;
+			while ((mantissa & 0x400u) == 0) {
+				mantissa <<= 1u;
+				exponent--;
+			}
+			bits = sign | (exponent << 23u) | ((mantissa & 0x3ffu) << 13u);
+		}
+	} else if (exponent == 31) {
+		bits = sign | 0x7f800000u | (mantissa << 13u);
+	} else {
+		bits = sign | ((exponent + 112u) << 23u) | (mantissa << 13u);
+	}
+	return std::bit_cast<float>(bits);
+}
+
+uint8_t PreviewByte(float value) {
+	if (!std::isfinite(value)) return 255;
+	value = std::clamp(value, 0.0f, 1.0f);
+	return static_cast<uint8_t>(std::lround(value * 255.0f));
+}
+
+template <typename T>
+T PreviewRead(const uint8_t* data) {
+	T value {};
+	std::memcpy(&value, data, sizeof(value));
+	return value;
+}
+
+uint8_t PreviewUnsigned(uint64_t value, uint64_t maximum) {
+	return PreviewByte(static_cast<float>(static_cast<double>(value) / maximum));
+}
+
+uint8_t PreviewSigned(int64_t value, int64_t maximum) {
+	const auto normalized = std::clamp(static_cast<double>(value) / maximum, -1.0, 1.0);
+	return PreviewByte(static_cast<float>(normalized * 0.5 + 0.5));
+}
+
+float PreviewUnsignedFloat(uint32_t exponent, uint32_t mantissa, uint32_t mantissa_bits) {
+	if (exponent == 0) return std::ldexp(static_cast<float>(mantissa), 1 - 15 - mantissa_bits);
+	if (exponent == 31)
+		return mantissa == 0 ? std::numeric_limits<float>::infinity()
+		                     : std::numeric_limits<float>::quiet_NaN();
+	return std::ldexp(1.0f + static_cast<float>(mantissa) / (1u << mantissa_bits),
+	                  static_cast<int>(exponent) - 15);
+}
+
+void RecordDebuggerImageEvent(const char* action, ImageId id, const Image& image,
+                              bool active = true, const char* note = nullptr) {
+	if (!Debugger::Graphics::IsCapturing()) return;
+	Debugger::Graphics::ResourceEvent event {};
+	event.action = action != nullptr ? action : "image";
+	event.note = note != nullptr ? note : "";
+	event.image_index = id.index;
+	event.image_generation = id.generation;
+	event.host_image = image.backing.image == nullptr
+	                       ? 0
+	                       : reinterpret_cast<uintptr_t>(static_cast<VkImage>(image.backing.image));
+	event.active = active;
+	const auto& info = image.info;
+	event.address = info.data.address;
+	event.size = info.data.size;
+	event.stencil_address = info.stencil.address;
+	event.stencil_size = info.stencil.size;
+	event.metadata_address = info.metadata.range.address;
+	event.metadata_size = info.metadata.range.size;
+	event.width = info.extent.width;
+	event.height = info.extent.height;
+	event.depth = info.extent.depth;
+	event.pitch = info.pitch;
+	event.bytes_per_block = info.bytes_per_block;
+	event.guest_format = static_cast<uint32_t>(info.guest_format);
+	event.host_format = static_cast<uint32_t>(info.pixel_format);
+	event.tile_mode = static_cast<uint32_t>(info.tile_mode);
+	event.image_type = static_cast<uint32_t>(info.type);
+	event.samples = info.samples;
+	event.levels = info.resources.levels;
+	event.layers = info.resources.layers;
+	event.metadata_kind = static_cast<uint32_t>(info.metadata.kind);
+	event.registered = image.registered;
+	event.cpu_dirty = image.IsDefinitelyCpuDirty();
+	event.maybe_cpu_dirty = image.IsMaybeCpuDirty();
+	event.buffer_modified = image.IsBufferModified();
+	event.gpu_modified = image.IsGpuModified();
+	event.usage_texture = image.usage.texture;
+	event.usage_storage = image.usage.storage;
+	event.usage_render_target = image.usage.render_target;
+	event.usage_depth_target = image.usage.depth_target;
+	event.usage_video_out = image.usage.video_out;
+	event.bound = image.binding.is_bound;
+	event.target = image.binding.is_target;
+	event.needs_rebind = image.binding.needs_rebind;
+	event.force_general = image.binding.force_general;
+	event.shader_write = image.binding.shader_write;
+	Debugger::Graphics::RecordImageEvent(std::move(event));
+}
+
+uint32_t PreviewPixelBytes(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8Sint:
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8Snorm: return 1;
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8Sint:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8G8Snorm:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16Sint:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16Snorm:
+		case vk::Format::eR16Sfloat: return 2;
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Sint:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Snorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16Sint:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR16G16Snorm:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32Sint:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eB10G11R11UfloatPack32: return 4;
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16G16B16A16Snorm:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32Sint:
+		case vk::Format::eR32G32Sfloat: return 8;
+		case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint:
+		case vk::Format::eR32G32B32A32Sfloat: return 16;
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint: return 2;
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint: return 4;
+		default: return 0;
+	}
+}
+
+std::pair<uint32_t, bool> PreviewFloatLayout(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR16Sfloat: return {1, true};
+		case vk::Format::eR16G16Sfloat: return {2, true};
+		case vk::Format::eR16G16B16A16Sfloat: return {4, true};
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint: return {1, false};
+		case vk::Format::eR32G32Sfloat: return {2, false};
+		case vk::Format::eR32G32B32A32Sfloat: return {4, false};
+		default: return {0, false};
+	}
+}
+
+Debugger::Graphics::PreviewDiagnostics DiagnosePreview(const uint8_t* raw, uint32_t width,
+	                                                     uint32_t height, vk::Format format) {
+	Debugger::Graphics::PreviewDiagnostics diagnostics {};
+	const auto bpp = PreviewPixelBytes(format);
+	if (raw == nullptr || bpp == 0 || width == 0 || height == 0) return diagnostics;
+	diagnostics.total_pixels = static_cast<uint64_t>(width) * height;
+	const uint64_t raw_size = diagnostics.total_pixels * bpp;
+	uint64_t hash = 1469598103934665603ull;
+	for (uint64_t index = 0; index < raw_size; index++) {
+		hash ^= raw[index];
+		hash *= 1099511628211ull;
+	}
+	diagnostics.content_hash = hash;
+	const auto [components, half] = PreviewFloatLayout(format);
+	for (uint64_t pixel_index = 0; pixel_index < diagnostics.total_pixels; pixel_index++) {
+		const auto* pixel = raw + pixel_index * bpp;
+		bool zero = true;
+		for (uint32_t byte = 0; byte < bpp; byte++) zero &= pixel[byte] == 0;
+		diagnostics.zero_pixels += zero ? 1 : 0;
+		bool non_finite = false;
+		for (uint32_t component = 0; component < components; component++) {
+			const auto value = half ? HalfToFloat(PreviewRead<uint16_t>(pixel + component * 2))
+			                        : PreviewRead<float>(pixel + component * 4);
+			if (!std::isfinite(value)) {
+				diagnostics.non_finite_components++;
+				non_finite = true;
+			}
+		}
+		diagnostics.non_finite_pixels += non_finite ? 1 : 0;
+	}
+	return diagnostics;
+}
+
+std::vector<uint8_t> MakePreview(const uint8_t* raw, uint32_t source_width,
+	                              uint32_t source_height, vk::Format format,
+	                              uint32_t& width_out, uint32_t& height_out) {
+	const auto scale = std::min({1.0, static_cast<double>(DebugPreviewWidth) / source_width,
+	                             static_cast<double>(DebugPreviewHeight) / source_height});
+	width_out  = std::max(1u, static_cast<uint32_t>(source_width * scale));
+	height_out = std::max(1u, static_cast<uint32_t>(source_height * scale));
+	const auto bpp = PreviewPixelBytes(format);
+	std::vector<uint8_t> rgba(static_cast<size_t>(width_out) * height_out * 4);
+	for (uint32_t y = 0; y < height_out; y++) {
+		const auto source_y = std::min(source_height - 1, y * source_height / height_out);
+		for (uint32_t x = 0; x < width_out; x++) {
+			const auto source_x = std::min(source_width - 1, x * source_width / width_out);
+			const auto* pixel = raw + (static_cast<size_t>(source_y) * source_width + source_x) * bpp;
+			auto* out = rgba.data() + (static_cast<size_t>(y) * width_out + x) * 4;
+			out[0] = out[1] = out[2] = 0;
+			out[3] = 255;
+			const auto set_gray = [out](uint8_t value) { out[0] = out[1] = out[2] = value; };
+			switch (format) {
+				case vk::Format::eR8Uint:
+				case vk::Format::eR8Unorm: out[0] = out[1] = out[2] = pixel[0]; out[3] = 255; break;
+				case vk::Format::eR8Sint:
+				case vk::Format::eR8Snorm: set_gray(PreviewSigned(static_cast<int8_t>(pixel[0]), 127)); break;
+				case vk::Format::eR8G8Uint:
+				case vk::Format::eR8G8Unorm: out[0] = pixel[0]; out[1] = pixel[1]; break;
+				case vk::Format::eR8G8Sint:
+				case vk::Format::eR8G8Snorm:
+					out[0] = PreviewSigned(static_cast<int8_t>(pixel[0]), 127);
+					out[1] = PreviewSigned(static_cast<int8_t>(pixel[1]), 127);
+					break;
+				case vk::Format::eR8G8B8A8Sint:
+				case vk::Format::eR8G8B8A8Snorm:
+					for (uint32_t c = 0; c < 4; c++)
+						out[c] = PreviewSigned(static_cast<int8_t>(pixel[c]), 127);
+					break;
+				case vk::Format::eB8G8R8A8Unorm:
+				case vk::Format::eB8G8R8A8Srgb:
+					out[0] = pixel[2]; out[1] = pixel[1]; out[2] = pixel[0]; out[3] = pixel[3]; break;
+				case vk::Format::eR16G16B16A16Sfloat: {
+					for (uint32_t c = 0; c < 4; c++) {
+						uint16_t half = 0;
+						std::memcpy(&half, pixel + c * 2, sizeof(half));
+						out[c] = PreviewByte(HalfToFloat(half));
+					}
+					break;
+				}
+				case vk::Format::eR16Uint:
+				case vk::Format::eR16Unorm: set_gray(PreviewUnsigned(PreviewRead<uint16_t>(pixel), 65535)); break;
+				case vk::Format::eR16Sint:
+				case vk::Format::eR16Snorm: set_gray(PreviewSigned(PreviewRead<int16_t>(pixel), 32767)); break;
+				case vk::Format::eR16Sfloat: set_gray(PreviewByte(HalfToFloat(PreviewRead<uint16_t>(pixel)))); break;
+				case vk::Format::eR16G16Uint:
+				case vk::Format::eR16G16Unorm:
+					for (uint32_t c = 0; c < 2; c++) out[c] = PreviewUnsigned(PreviewRead<uint16_t>(pixel + c * 2), 65535);
+					break;
+				case vk::Format::eR16G16Sint:
+				case vk::Format::eR16G16Snorm:
+					for (uint32_t c = 0; c < 2; c++) out[c] = PreviewSigned(PreviewRead<int16_t>(pixel + c * 2), 32767);
+					break;
+				case vk::Format::eR16G16Sfloat:
+					for (uint32_t c = 0; c < 2; c++) out[c] = PreviewByte(HalfToFloat(PreviewRead<uint16_t>(pixel + c * 2)));
+					break;
+				case vk::Format::eR16G16B16A16Uint:
+				case vk::Format::eR16G16B16A16Unorm:
+					for (uint32_t c = 0; c < 4; c++) out[c] = PreviewUnsigned(PreviewRead<uint16_t>(pixel + c * 2), 65535);
+					break;
+				case vk::Format::eR16G16B16A16Sint:
+				case vk::Format::eR16G16B16A16Snorm:
+					for (uint32_t c = 0; c < 4; c++) out[c] = PreviewSigned(PreviewRead<int16_t>(pixel + c * 2), 32767);
+					break;
+				case vk::Format::eR32G32B32A32Sfloat: {
+					for (uint32_t c = 0; c < 4; c++) {
+						float value = 0;
+						std::memcpy(&value, pixel + c * 4, sizeof(value));
+						out[c] = PreviewByte(value);
+					}
+					break;
+				}
+				case vk::Format::eR32Uint: set_gray(PreviewUnsigned(PreviewRead<uint32_t>(pixel), UINT32_MAX)); break;
+				case vk::Format::eR32Sint: set_gray(PreviewSigned(PreviewRead<int32_t>(pixel), INT32_MAX)); break;
+				case vk::Format::eR32Sfloat: set_gray(PreviewByte(PreviewRead<float>(pixel))); break;
+				case vk::Format::eR32G32Uint:
+					for (uint32_t c = 0; c < 2; c++) out[c] = PreviewUnsigned(PreviewRead<uint32_t>(pixel + c * 4), UINT32_MAX);
+					break;
+				case vk::Format::eR32G32Sint:
+					for (uint32_t c = 0; c < 2; c++) out[c] = PreviewSigned(PreviewRead<int32_t>(pixel + c * 4), INT32_MAX);
+					break;
+				case vk::Format::eR32G32Sfloat:
+					for (uint32_t c = 0; c < 2; c++) out[c] = PreviewByte(PreviewRead<float>(pixel + c * 4));
+					break;
+				case vk::Format::eR32G32B32A32Uint:
+					for (uint32_t c = 0; c < 4; c++) out[c] = PreviewUnsigned(PreviewRead<uint32_t>(pixel + c * 4), UINT32_MAX);
+					break;
+				case vk::Format::eR32G32B32A32Sint:
+					for (uint32_t c = 0; c < 4; c++) out[c] = PreviewSigned(PreviewRead<int32_t>(pixel + c * 4), INT32_MAX);
+					break;
+				case vk::Format::eA2B10G10R10UnormPack32: {
+					const auto packed = PreviewRead<uint32_t>(pixel);
+					out[0] = PreviewUnsigned(packed & 0x3ffu, 0x3ffu);
+					out[1] = PreviewUnsigned((packed >> 10u) & 0x3ffu, 0x3ffu);
+					out[2] = PreviewUnsigned((packed >> 20u) & 0x3ffu, 0x3ffu);
+					out[3] = PreviewUnsigned(packed >> 30u, 3);
+					break;
+				}
+				case vk::Format::eA2R10G10B10UnormPack32: {
+					const auto packed = PreviewRead<uint32_t>(pixel);
+					out[2] = PreviewUnsigned(packed & 0x3ffu, 0x3ffu);
+					out[1] = PreviewUnsigned((packed >> 10u) & 0x3ffu, 0x3ffu);
+					out[0] = PreviewUnsigned((packed >> 20u) & 0x3ffu, 0x3ffu);
+					out[3] = PreviewUnsigned(packed >> 30u, 3);
+					break;
+				}
+				case vk::Format::eB10G11R11UfloatPack32: {
+					const auto packed = PreviewRead<uint32_t>(pixel);
+					out[0] = PreviewByte(PreviewUnsignedFloat((packed >> 6u) & 0x1fu, packed & 0x3fu, 6));
+					out[1] = PreviewByte(PreviewUnsignedFloat((packed >> 17u) & 0x1fu, (packed >> 11u) & 0x3fu, 6));
+					out[2] = PreviewByte(PreviewUnsignedFloat((packed >> 27u) & 0x1fu, (packed >> 22u) & 0x1fu, 5));
+					break;
+				}
+				case vk::Format::eD16Unorm:
+				case vk::Format::eD16UnormS8Uint:
+					set_gray(PreviewUnsigned(PreviewRead<uint16_t>(pixel), 65535));
+					break;
+				case vk::Format::eD24UnormS8Uint:
+					set_gray(PreviewUnsigned(PreviewRead<uint32_t>(pixel) & 0x00ffffffu,
+					                         0x00ffffffu));
+					break;
+				case vk::Format::eD32Sfloat:
+				case vk::Format::eD32SfloatS8Uint:
+					set_gray(PreviewByte(PreviewRead<float>(pixel)));
+					break;
+				default: std::memcpy(out, pixel, 4); break;
+			}
+		}
+	}
+	return rgba;
+}
 
 } // namespace
 
@@ -185,6 +536,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
+	RecordDebuggerImageEvent("create", id, *slot.image, true, "native image allocated");
 	return id;
 }
 
@@ -255,6 +607,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (owner->info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(owner->info.metadata.range.address);
 	}
+	RecordDebuggerImageEvent("retire", id, *owner, false, "native image retired");
 	UnregisterImage(id);
 	const auto erase_slot = [this, id, retained = owner] {
 		auto& slot = m_slots[id.index];
@@ -730,7 +1083,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		auto& command = m_scheduler.Current();
 		RetainImage(command, cached_id);
 		RetainImage(command, replacement_id);
-		CommitGpuWrite(replacement);
+		CommitGpuWrite(replacement_id, replacement);
 	} else {
 		LOGF_COLOR(Log::Color::BrightYellow,
 		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
@@ -1092,6 +1445,10 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	if (data_imported) {
+		RecordDebuggerImageEvent("upload", id, image, true,
+		                         "guest or buffer backing copied to native image");
+	}
 }
 
 void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
@@ -1303,13 +1660,17 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				if (!image.registered || image.depth_id) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
 				}
-				CommitGpuWrite(image);
+				CommitGpuWrite(id, image);
 			}
 			TrackImageDownloadLocked(id, image);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
 	const auto view = image.FindView(desc.view_info);
+	if (desc.type == BindingType::Texture) {
+		image.usage.texture = true;
+		RecordDebuggerImageEvent("sample", id, image, true, "shader sampled the native image");
+	}
 	RetainImage(m_scheduler.Current(), id);
 	return view;
 }
@@ -1327,7 +1688,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id, desc);
-	CommitGpuWrite(image);
+	CommitGpuWrite(id, image);
 	TrackImageDownloadLocked(id, image);
 	const auto view = image.FindView(desc.view_info);
 	RetainImage(m_scheduler.Current(), id);
@@ -1352,7 +1713,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		m_surface_metas.try_emplace(desc.info.metadata.range.address,
 		                            MetaDataInfo {.clear_mask = image.info.htile_clear_mask});
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(id, image);
 	if (desc.info.HasStencil()) {
 		AssociateStencilLocked(id, desc.info.stencil);
 	}
@@ -1368,10 +1729,10 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
 	TrackImage(id);
-	CommitGpuWrite(image);
+	CommitGpuWrite(id, image);
 }
 
-void TextureCache::CommitGpuWrite(Image& image) {
+void TextureCache::CommitGpuWrite(ImageId id, Image& image) {
 	if (image.depth_id || image.backing.image == nullptr) {
 		EXIT("TextureCache: stencil association cannot own image contents\n");
 	}
@@ -1379,7 +1740,12 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	if (!image.info.data.Empty()) {
+		m_buffer_cache.DiscardGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	}
 	image.MarkGpuModified();
+	RecordDebuggerImageEvent("gpu write", id, image, true,
+	                         "native image became authoritative");
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -1458,7 +1824,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		command.Handle().clearDepthStencilImage(
 		    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
 	}
-	CommitGpuWrite(image);
+	CommitGpuWrite(selected, image);
+	RecordDebuggerImageEvent("clear", selected, image, true,
+	                         "formatted buffer clear was consumed as a native image clear");
 	RetainImage(command, selected);
 	return true;
 }
@@ -1680,6 +2048,8 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 		}
 	}
 	m_texture_cache.DownloadImageData(image, buffer, buf_offset, copy_size, std::move(plan));
+	RecordDebuggerImageEvent("publish to buffer", selected, image, true,
+	                         "native image copied into an overlapping BufferCache range");
 	m_texture_cache.RetainImage(m_scheduler.Current(), selected);
 	return true;
 }
@@ -1739,6 +2109,8 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	DownloadImageData(image, download, offset, range.size, std::move(plan));
 
 	QueueDownload(range, download, mapped, offset);
+	RecordDebuggerImageEvent("download", id, image, true,
+	                         "native image scheduled for publication to guest backing");
 	return true;
 }
 
@@ -1769,6 +2141,8 @@ bool TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size,
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
+		RecordDebuggerImageEvent("buffer alias write", id, image, true,
+		                         "formatted GPU buffer write became authoritative");
 		found = true;
 	}
 	return found;
@@ -1803,6 +2177,8 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		if (owner->Overlaps(address, size)) {
 			owner->InvalidateCpuWrite(address, size);
 			UntrackImage(id);
+			RecordDebuggerImageEvent("cpu alias write", id, *owner, true,
+			                         "guest CPU write invalidated native image contents");
 			continue;
 		}
 		const auto image_begin = owner->info.data.address;
@@ -1814,6 +2190,8 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 		} else {
 			MarkAsMaybeDirty(id, *owner);
 		}
+		RecordDebuggerImageEvent("cpu page alias", id, *owner, true,
+		                         "guest CPU write touched an adjacent tracked page");
 	}
 }
 
@@ -1823,6 +2201,8 @@ void TextureCache::ClearGpuModified(ImageId id) {
 		return;
 	}
 	owner->ClearGpuModified();
+	RecordDebuggerImageEvent("gpu ownership cleared", id, *owner, true,
+	                         "native image is no longer the authoritative owner");
 }
 
 bool TextureCache::IsMeta(uint64_t address) {
@@ -1947,6 +2327,7 @@ void TextureCache::RunGarbageCollector() {
 
 void TextureCache::ProcessDownloadImages() {
 	CacheLock lock(*this, m_lock);
+	ProcessDebuggerPreview();
 	for (const auto id: m_download_images) {
 		const auto owner = ResolveOwner(id);
 		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
@@ -1954,6 +2335,113 @@ void TextureCache::ProcessDownloadImages() {
 		}
 	}
 	m_download_images.clear();
+}
+
+void TextureCache::ProcessDebuggerPreview() {
+	Debugger::Graphics::PreviewRequest request {};
+	if (!Debugger::Graphics::TakePreviewRequest(request)) return;
+
+	ImageId selected {};
+	for (const auto id: FindImagesInRegion(request.address, std::max<uint64_t>(request.size, 1),
+	                                      false)) {
+		const auto owner = ResolveOwner(id);
+		if (owner == nullptr || owner->info.data.address != request.address ||
+		    (request.size != 0 && owner->info.data.size != request.size)) {
+			continue;
+		}
+		if (selected && ResolveOwner(selected).get() != owner.get()) {
+			Debugger::Graphics::PublishResourcePreview(
+			    request.id, request.address, 0, 0, 0, 0, 0, {},
+			    "multiple native images match this guest range");
+			return;
+		}
+		if (!selected) selected = id;
+	}
+	if (!selected) {
+		Debugger::Graphics::PublishResourcePreview(request.id, request.address, 0, 0, 0, 0, 0, {},
+		                                           "no live native image matches this event");
+		return;
+	}
+
+	auto owner = ResolveOwner(selected);
+	if (owner == nullptr || owner->backing.image_type != vk::ImageType::e2D ||
+	    owner->backing.layers == 0) {
+		Debugger::Graphics::PublishResourcePreview(request.id, request.address, 0, 0, 0, 0, 0, {},
+		                                           "this image type is not previewable yet");
+		return;
+	}
+	if (owner->backing.samples != 1) {
+		Debugger::Graphics::PublishResourcePreview(
+		    request.id, request.address, owner->backing.extent.width, owner->backing.extent.height,
+		    static_cast<uint32_t>(owner->backing.format), 0, 0, {},
+		    "multisampled image preview needs an explicit sample/resolve path");
+		return;
+	}
+	const auto format = owner->backing.format;
+	const auto bpp = PreviewPixelBytes(format);
+	const auto width = owner->backing.extent.width;
+	const auto height = owner->backing.extent.height;
+	if (bpp == 0) {
+		Debugger::Graphics::PublishResourcePreview(request.id, request.address, width, height,
+		                                           static_cast<uint32_t>(format), 0, 0, {},
+		                                           "host format " + std::to_string(static_cast<uint32_t>(format)) +
+		                                               " is not supported for preview yet");
+		return;
+	}
+	if (width == 0 || height == 0 || static_cast<uint64_t>(width) > UINT64_MAX / height ||
+	    static_cast<uint64_t>(width) * height > DebugPreviewCapacity / bpp) {
+		Debugger::Graphics::PublishResourcePreview(
+		    request.id, request.address, width, height, static_cast<uint32_t>(format), 0, 0, {},
+		    "image is empty or exceeds the 256 MiB preview readback limit");
+		return;
+	}
+	const uint64_t raw_size = static_cast<uint64_t>(width) * height * bpp;
+	if (m_debug_preview_download == nullptr) {
+		m_debug_preview_download = std::make_unique<StreamBuffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, DebugPreviewCapacity);
+	}
+	auto [mapped, offset] = m_debug_preview_download->Map(raw_size, std::max<uint32_t>(bpp, 4));
+	if (mapped == nullptr) {
+		Debugger::Graphics::PublishResourcePreview(request.id, request.address, width, height,
+		                                           static_cast<uint32_t>(format), 0, 0, {},
+		                                           "preview download buffer is busy");
+		return;
+	}
+	m_debug_preview_download->Commit();
+
+	vk::BufferImageCopy copy {};
+	copy.bufferOffset = offset;
+	copy.imageSubresource = {owner->info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                                             : vk::ImageAspectFlagBits::eColor,
+	                         0, 0, 1};
+	copy.imageExtent = {width, height, 1};
+	owner->Download(std::span<const vk::BufferImageCopy>(&copy, 1),
+	                m_debug_preview_download->Handle(), offset, raw_size);
+
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer = m_debug_preview_download->Handle();
+	barrier.offset = offset;
+	barrier.size = raw_size;
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                                               1, &barrier, 0, nullptr);
+	RetainImage(m_scheduler.Current(), selected);
+	auto* download = m_debug_preview_download.get();
+	m_scheduler.DeferPriorityOperation([download, mapped, offset, raw_size, request, width, height,
+	                                    format] {
+		download->Invalidate(offset, raw_size);
+		uint32_t preview_width = 0;
+		uint32_t preview_height = 0;
+		const auto diagnostics = DiagnosePreview(mapped, width, height, format);
+		auto rgba = MakePreview(mapped, width, height, format, preview_width, preview_height);
+		Debugger::Graphics::PublishResourcePreview(
+		    request.id, request.address, width, height, static_cast<uint32_t>(format), preview_width,
+		    preview_height, std::move(rgba), {}, diagnostics);
+	});
 }
 
 } // namespace Libs::Graphics

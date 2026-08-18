@@ -5,6 +5,7 @@
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
@@ -33,8 +34,24 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 	return report;
 }
 
+static std::atomic<FatalHandler> g_fatal_handler {nullptr};
+
+void SetFatalHandler(FatalHandler handler) {
+	g_fatal_handler.store(handler, std::memory_order_release);
+}
+
+// Offer the failing thread to the debugger before the emulator starts tearing itself down, so
+// there is still something to inspect when it stops.
+static void OfferToDebugger(const std::string& report) {
+	if (const auto handler = g_fatal_handler.load(std::memory_order_acquire); handler != nullptr) {
+		handler(report.c_str());
+	}
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
-	Log::WriteFatal(BuildFatalReport(title, text, file, line));
+	const auto report = BuildFatalReport(title, text, file, line);
+	Log::WriteFatal(report);
+	OfferToDebugger(report);
 	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
@@ -49,12 +66,16 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 }
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
-	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
+	const auto report = BuildFatalReport("--- Error ---", text, file, line);
+	Log::WriteFatal(report);
+	OfferToDebugger(report);
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
-	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
+	const auto report = BuildFatalReport("--- Error ---", text, file, line);
+	Log::WriteFatal(style, report);
+	OfferToDebugger(report);
 	return 1;
 }
 

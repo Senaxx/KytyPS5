@@ -151,6 +151,11 @@ struct BufferCacheTestAccess {
                                          uint64_t address, uint64_t size) {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
+
+  static void DiscardGpuDirtyBytes(BufferCache &cache, uint64_t address,
+                                   uint64_t size) {
+    cache.DiscardGpuDirtyBytes(address, size);
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -2803,6 +2808,21 @@ public:
       Require(name, "registered-range removal",
               !cache.IsRegionRegistered(index_begin, index_span),
               "unmapped Buffer owner remained in the registered-range index");
+
+      constexpr uint64_t ownership_offset = 0x400000;
+      const uint64_t image_bytes = base + ownership_offset + 0x100;
+      const uint64_t sibling_bytes = base + ownership_offset + 0x200;
+      MarkGpuWrite(image_bytes, sizeof(uint32_t));
+      MarkGpuWrite(sibling_bytes, sizeof(uint32_t));
+      cache.FillBuffer(image_bytes, sizeof(uint32_t), 0x11223344u);
+      cache.FillBuffer(sibling_bytes, sizeof(uint32_t), 0x55667788u);
+      BufferCacheTestAccess::DiscardGpuDirtyBytes(cache, image_bytes,
+                                                  sizeof(uint32_t));
+      Require(name, "image supersedes exact Buffer bytes",
+              !cache.HasGpuDirtyBytes(image_bytes, sizeof(uint32_t)) &&
+                  cache.HasGpuDirtyBytes(sibling_bytes, sizeof(uint32_t)) &&
+                  cache.IsRegionGpuModified(sibling_bytes, sizeof(uint32_t)),
+              "image ownership retained stale bytes or discarded a dirty sibling");
 
       MarkGpuWrite(base + first_offset, sizeof(first_value));
       MarkGpuWrite(base + second_offset, sizeof(second_value));

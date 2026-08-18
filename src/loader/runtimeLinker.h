@@ -175,6 +175,10 @@ public:
 
 	SymbolDatabase* Symbols() { return m_symbols.get(); }
 
+	// Snapshot of the loaded programs, for the debugger's module list. Copied under the linker
+	// mutex so callers never hold it while inspecting.
+	std::vector<Program*> Programs();
+
 	static uint64_t ReadFromElf(Program* program, uint64_t vaddr);
 	Program*        FindProgramByAddr(uint64_t vaddr);
 	Program*        FindProgramById(int32_t id);

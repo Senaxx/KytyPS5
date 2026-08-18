@@ -13,6 +13,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "debugger/debugger.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -782,6 +783,14 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
+	// Debugger traps are not crashes. If the debugger is disabled nothing claims them earlier in
+	// the chain, and they must fall through untouched so an attached native debugger still works
+	// — dumping a crash report here would fire on every breakpoint.
+	if (info->type == Common::HostException::ExceptionType::Breakpoint ||
+	    info->type == Common::HostException::ExceptionType::SingleStep) {
+		return false;
+	}
+
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
 		return true;
@@ -1415,6 +1424,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Execute: %s\n---\n", "Main");
 
+	// Modules are mapped and relocated by now, so symbol-based breakpoints can finally resolve.
+	Debugger::OnGuestEntry(GetEntry());
+
 	if (auto entry = GetEntry(); entry != 0) {
 		auto* params = reinterpret_cast<EntryParams*>(
 		    (reinterpret_cast<uintptr_t>(main_stack_top) - 0x100u) & ~static_cast<uintptr_t>(0x0f));
@@ -1637,6 +1649,12 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	}
 
 	return nullptr;
+}
+
+std::vector<Program*> RuntimeLinker::Programs() {
+	Common::LockGuard lock(m_mutex);
+
+	return m_programs;
 }
 
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {

@@ -9,6 +9,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "debugger/target/io.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -23,6 +24,13 @@
 #include <random>
 #include <system_error>
 #include <vector>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <intrin.h>
+#define KYTY_IO_CALLER() reinterpret_cast<uint64_t>(_ReturnAddress())
+#else
+#define KYTY_IO_CALLER() reinterpret_cast<uint64_t>(__builtin_return_address(0))
+#endif
 
 namespace Libs::LibKernel::FileSystem {
 
@@ -434,6 +442,9 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		LOGF_COLOR(Log::Color::Green, "\tOpen device: %s, [ok]\n",
 		           Common::PathToString(file->real_name).c_str());
 
+		Debugger::Io::Record("open", descriptor, file->name,
+		                     Common::PathToString(file->real_name), 0, 0, descriptor,
+		                     KYTY_IO_CALLER());
 		return descriptor;
 	}
 
@@ -509,6 +520,8 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->opened = true;
+	Debugger::Io::Record("open", descriptor, file->name, Common::PathToString(file->real_name), 0,
+	                     0, descriptor, KYTY_IO_CALLER());
 	return descriptor;
 }
 
@@ -539,6 +552,8 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 	file->opened = false;
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
+	Debugger::Io::Record("close", d, file->name, Common::PathToString(file->real_name), -1, 0, OK,
+	                     KYTY_IO_CALLER());
 
 	g_files->DeleteDescriptor(d);
 
@@ -579,6 +594,8 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 		LOGF("\tRead %" PRIu64 " random bytes from: %s\n", static_cast<uint64_t>(nbytes),
 		     Common::PathToString(file->real_name).c_str());
 
+		Debugger::Io::Record("read", d, file->name, Common::PathToString(file->real_name), -1,
+		                     nbytes, static_cast<int64_t>(nbytes), KYTY_IO_CALLER());
 		return static_cast<int64_t>(nbytes);
 	}
 
@@ -601,6 +618,8 @@ int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes) {
 	}
 
 	LOGF("\tRead %u bytes from: %s\n", bytes_read, Common::PathToString(file->real_name).c_str());
+	Debugger::Io::Record("read", d, file->name, Common::PathToString(file->real_name),
+	                     static_cast<int64_t>(pos), nbytes, bytes_read, KYTY_IO_CALLER());
 
 	return bytes_read;
 }
@@ -621,6 +640,8 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 			return KERNEL_ERROR_EIO;
 		}
 
+		Debugger::Io::Record(d == 1 ? "stdout" : "stderr", d, {}, {}, -1, nbytes,
+		                     static_cast<int64_t>(written), KYTY_IO_CALLER());
 		return static_cast<int64_t>(written);
 	}
 
@@ -653,6 +674,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	if (file->append) {
 		file->f.Seek(file->f.Size());
 	}
+	const auto write_offset = file->f.Tell();
 	file->f.Write(buf, static_cast<uint32_t>(nbytes), &bytes_written);
 	if (file->sync_writes) {
 		file->f.Flush();
@@ -666,6 +688,9 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 	}
 
 	LOGF("\tWrite %u bytes to: %s\n", bytes_written, Common::PathToString(file->real_name).c_str());
+	Debugger::Io::Record("write", d, file->name, Common::PathToString(file->real_name),
+	                     static_cast<int64_t>(write_offset), nbytes, bytes_written,
+	                     KYTY_IO_CALLER());
 
 	return bytes_written;
 }
@@ -703,6 +728,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 		LOGF("\tRead %" PRIu64 " random bytes (pos = %" PRId64 ") from: %s\n",
 		     static_cast<uint64_t>(nbytes), offset, Common::PathToString(file->real_name).c_str());
 
+		Debugger::Io::Record("pread", d, file->name, Common::PathToString(file->real_name), offset,
+		                     nbytes, static_cast<int64_t>(nbytes), KYTY_IO_CALLER());
 		return static_cast<int64_t>(nbytes);
 	}
 
@@ -729,6 +756,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	LOGF("\tRead %u bytes (pos = %" PRId64 ") from: %s\n", bytes_read, offset,
 	     Common::PathToString(file->real_name).c_str());
+	Debugger::Io::Record("pread", d, file->name, Common::PathToString(file->real_name), offset,
+	                     nbytes, bytes_read, KYTY_IO_CALLER());
 
 	return bytes_read;
 }
@@ -782,6 +811,8 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	LOGF("\tWrite %u bytes (pos = %" PRId64 ") to: %s\n", bytes_written, offset,
 	     Common::PathToString(file->real_name).c_str());
+	Debugger::Io::Record("pwrite", d, file->name, Common::PathToString(file->real_name), offset,
+	                     nbytes, bytes_written, KYTY_IO_CALLER());
 
 	return bytes_written;
 }
@@ -839,6 +870,8 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	LOGF("\tLseek (pos = %" PRId64 ") to: %s\n", offset,
 	     Common::PathToString(file->real_name).c_str());
+	Debugger::Io::Record("seek", d, file->name, Common::PathToString(file->real_name), offset, 0,
+	                     pos, KYTY_IO_CALLER());
 
 	return pos;
 }
@@ -890,6 +923,8 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	stat.st_ctim     = stat.st_atim;
 	stat.st_birthtim = stat.st_mtim;
 	*sb              = stat;
+	Debugger::Io::Record("stat", -1, path_s, Common::PathToString(real_file_name), -1, 0, OK,
+	                     KYTY_IO_CALLER());
 
 	return OK;
 }

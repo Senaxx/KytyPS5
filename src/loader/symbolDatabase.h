@@ -48,6 +48,9 @@ public:
 
 	void DbgDump(const std::string& folder, const std::string& file_name);
 
+	// Read-only iteration for the debugger's symbol search and address→name lookup.
+	[[nodiscard]] const std::vector<SymbolRecord>& Records() const { return m_symbols; }
+
 	KYTY_CLASS_NO_COPY(SymbolDatabase);
 
 	static std::string GenerateName(const SymbolResolve& s);

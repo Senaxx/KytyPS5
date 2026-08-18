@@ -6,6 +6,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "debugger/core/session.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -544,6 +545,15 @@ void GuestGpu::ThreadRun(void* data) {
 
 		EXIT_IF(!has_submission);
 		const bool complete = gpu->Process(submission);
+		if (complete) {
+			std::string break_reason;
+			if (Debugger::Graphics::TakeBreakRequest(break_reason)) {
+				LOGF("Debugger: GPU break condition: %s\n", break_reason.c_str());
+				// Resource and draw callbacks run while renderer/cache locks may be held. Pause only
+				// here, after the whole submission and its ownership transitions have completed.
+				Debugger::Session::Pause();
+			}
+		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
@@ -581,6 +591,14 @@ bool GuestGpu::Process(Submission& submission) {
 		cp.SetSubmitId(++m_submit_id);
 		cp.ResetDeCe();
 		cp.SetFlip({});
+		if (submission.type == SubmissionType::Graphics ||
+		    submission.type == SubmissionType::Compute) {
+			Debugger::Graphics::RecordSubmission(
+			    m_submit_id, submission.queue_id, submission.type == SubmissionType::Compute,
+			    submission.commands.Data(), submission.commands.Size(),
+			    submission.constant_commands.Data(), submission.constant_commands.Size(),
+			    submission.trigger_agc_interrupt_on_done, submission.reset_processor);
+		}
 	}
 
 	cp.BufferInit();
@@ -876,6 +894,44 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 	}
 }
 
+// Report a draw to the debugger's GPU trace. Reads the currently bound shader bases so the draw
+// list can be matched against the shader registry. Skipped entirely when the debugger is off.
+void CommandProcessor::RecordDrawForDebugger(Debugger::Graphics::DrawKind kind, uint32_t count,
+                                             uint32_t instances) {
+	if (!Debugger::Graphics::IsCapturing()) {
+		return;
+	}
+
+	Debugger::Graphics::DrawRecord record {};
+	record.submit_id = m_submit_id;
+	record.kind      = kind;
+	record.count     = count;
+	record.instances = instances;
+
+	const auto& vs    = m_sh_ctx.GetVs();
+	record.vs_address = vs.es_regs.data_addr != 0 ? vs.es_regs.data_addr : vs.gs_regs.data_addr;
+	record.ps_address = m_sh_ctx.GetPs().ps_regs.data_addr;
+
+	Debugger::Graphics::RecordDraw(record);
+}
+
+void CommandProcessor::RecordDispatchForDebugger(uint32_t groups_x, uint32_t groups_y,
+                                                 uint32_t groups_z) {
+	if (!Debugger::Graphics::IsCapturing()) {
+		return;
+	}
+
+	Debugger::Graphics::DrawRecord record {};
+	record.submit_id  = m_submit_id;
+	record.kind       = Debugger::Graphics::DrawKind::Dispatch;
+	record.groups[0]  = groups_x;
+	record.groups[1]  = groups_y;
+	record.groups[2]  = groups_z;
+	record.cs_address = m_sh_ctx.GetCs().cs_regs.data_addr;
+
+	Debugger::Graphics::RecordDraw(record);
+}
+
 void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, uint32_t flags,
                                  uint32_t type, uint32_t instance_count, const void* object_ids,
                                  uint32_t render_target_slice_offset, int32_t vertex_offset_add,
@@ -897,6 +953,8 @@ void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, u
 		     "\n",
 		     vertex_offset_add, first_instance);
 	}
+	RecordDrawForDebugger(Debugger::Graphics::DrawKind::DrawIndexed, index_count, instance_count);
+
 	m_renderer.GetRenderExecutor().DrawIndex(
 	    m_submit_id, CurrentBuffer(), m_index_type_and_size, index_count, index_addr, flags, type,
 	    instance_count, render_target_slice_offset, vertex_offset_add, first_instance);
@@ -1133,6 +1191,8 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
+		RecordDispatchForDebugger(thread_group_x, thread_group_y, thread_group_z);
+
 		const auto& cs = m_sh_ctx.GetCs().cs_regs;
 		// local_x        = std::max(cs.num_thread_x, 1u);
 		// local_y        = std::max(cs.num_thread_y, 1u);
@@ -1199,6 +1259,8 @@ void CommandProcessor::SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flag
                                             uint32_t render_target_slice_offset,
                                             uint32_t first_vertex, uint32_t first_instance) {
 	CheckBuffer();
+
+	RecordDrawForDebugger(Debugger::Graphics::DrawKind::Draw, vertex_count, m_num_instances);
 
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), vertex_count, flags,
 	                                        render_target_slice_offset, m_num_instances,
@@ -1531,6 +1593,9 @@ void CommandProcessor::Flip() {
 	if (GraphicsRunDebugDumpEnabled()) {
 		LOGF("CommandProcessor::Flip()\n");
 	}
+
+	// A flip is what closes a frame for the debugger's per-frame draw list.
+	Debugger::Graphics::RecordFlip();
 
 	auto& command = CurrentBuffer();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,

@@ -228,6 +228,29 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/loader/*.h"
 )
 
+# The debugger is inert unless the emulator is launched with --debugger; this option strips it
+# from the binary entirely.
+option(KYTY_DEBUGGER "Build the in-emulator debugger overlay" ON)
+
+if (KYTY_DEBUGGER)
+	file(GLOB kyty_debugger_src CONFIGURE_DEPENDS
+		"${KYTY_SOURCE_DIR}/debugger/*.cpp"
+		"${KYTY_SOURCE_DIR}/debugger/*.h"
+		"${KYTY_SOURCE_DIR}/debugger/core/*.cpp"
+		"${KYTY_SOURCE_DIR}/debugger/core/*.h"
+		"${KYTY_SOURCE_DIR}/debugger/symbols/*.cpp"
+		"${KYTY_SOURCE_DIR}/debugger/symbols/*.h"
+		"${KYTY_SOURCE_DIR}/debugger/target/*.cpp"
+		"${KYTY_SOURCE_DIR}/debugger/target/*.h"
+		"${KYTY_SOURCE_DIR}/debugger/remote/*.cpp"
+		"${KYTY_SOURCE_DIR}/debugger/remote/*.h"
+		"${KYTY_SOURCE_DIR}/debugger/ui/*.cpp"
+		"${KYTY_SOURCE_DIR}/debugger/ui/*.h"
+	)
+	list(APPEND kyty_emulator_src ${kyty_debugger_src})
+	add_compile_definitions(KYTY_DEBUGGER_ENABLED=1)
+endif()
+
 find_program(KYTY_GLSLANG_VALIDATOR glslangValidator REQUIRED)
 set(gpu_tiler_shader_dir "${KYTY_SOURCE_DIR}/graphics/host_gpu/shaders")
 set(gpu_tiler_generated_dir "${PROJECT_BINARY_DIR}/gpu_tiler_shaders")
@@ -372,6 +395,10 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+if (KYTY_DEBUGGER)
+	add_kyty_full_emulator_test(debugger_core_tests "${KYTY_TESTS_DIR}/DebuggerCoreTests.cpp")
+endif()
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -514,6 +541,9 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	if (KYTY_DEBUGGER)
+		add_test(NAME debugger_core COMMAND $<TARGET_FILE:debugger_core_tests>)
+	endif()
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME shader_stage_runtime COMMAND $<TARGET_FILE:shader_stage_runtime_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -637,6 +667,7 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+	add_subdirectory("${KYTY_SOURCE_DIR}/debugger_app" "${CMAKE_CURRENT_BINARY_DIR}/debugger_app")
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)

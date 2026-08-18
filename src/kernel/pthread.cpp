@@ -651,6 +651,8 @@ public:
 
 	void FreeDetachedThreads();
 
+	void Enumerate(std::vector<GuestThreadInfo>& out);
+
 private:
 	std::vector<Pthread> m_threads;
 	Common::Mutex        m_mutex;
@@ -1590,6 +1592,33 @@ void PthreadPool::FreeDetachedThreads() {
 		if (p->detached && p->almost_done && !p->free) {
 			PthreadJoin(p, nullptr);
 		}
+	}
+}
+
+void PthreadPool::Enumerate(std::vector<GuestThreadInfo>& out) {
+	Common::LockGuard lock(m_mutex);
+
+	out.reserve(out.size() + m_threads.size());
+
+	for (auto* p: m_threads) {
+		if (p == nullptr) {
+			continue;
+		}
+
+		GuestThreadInfo info {};
+		info.handle          = p;
+		info.unique_id       = p->unique_id;
+		info.guest_thread_id = p->guest.thread_id;
+		info.host_thread_id  = p->host_thread_id;
+		info.name            = p->name;
+		info.alive           = !p->free && !p->almost_done;
+
+		if (p->attr != nullptr && p->attr->stack_addr != nullptr) {
+			info.stack_addr = reinterpret_cast<uint64_t>(p->attr->stack_addr);
+			info.stack_size = static_cast<uint64_t>(p->attr->stack_size);
+		}
+
+		out.push_back(std::move(info));
 	}
 }
 
@@ -3276,6 +3305,23 @@ bool PthreadKillHost(Pthread thread, int host_signal) {
 
 	return ::pthread_kill(thread->p, host_signal) == 0;
 }
+
+bool PthreadKillHostByOsId(uint64_t host_thread_id, int host_signal) {
+	if (host_thread_id == 0 || g_pthread_context == nullptr) {
+		return false;
+	}
+
+	std::vector<GuestThreadInfo> threads;
+	PthreadEnumerate(threads);
+
+	for (const auto& info: threads) {
+		if (info.host_thread_id == host_thread_id) {
+			return PthreadKillHost(info.handle, host_signal);
+		}
+	}
+
+	return false;
+}
 #endif
 
 void PthreadQueuePendingSignal(Pthread thread, int signum) {
@@ -3303,6 +3349,42 @@ bool PthreadTakePendingSignal(Pthread thread, int signum) {
 
 	const auto mask = 1ull << static_cast<uint32_t>(signum);
 	return (thread->pending_signal_mask.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
+}
+
+void PthreadEnumerate(std::vector<GuestThreadInfo>& out) {
+	out.clear();
+
+	if (g_pthread_context == nullptr) {
+		return;
+	}
+
+	if (auto* pool = g_pthread_context->GetPthreadPool(); pool != nullptr) {
+		pool->Enumerate(out);
+	}
+
+	// The main guest thread is created before the pool and is not a member of it.
+	if (g_pthread_main != nullptr) {
+		const bool already_listed =
+		    std::any_of(out.begin(), out.end(),
+		                [](const GuestThreadInfo& info) { return info.handle == g_pthread_main; });
+
+		if (!already_listed) {
+			GuestThreadInfo info {};
+			info.handle          = g_pthread_main;
+			info.unique_id       = g_pthread_main->unique_id;
+			info.guest_thread_id = g_pthread_main->guest.thread_id;
+			info.host_thread_id  = g_pthread_main->host_thread_id;
+			info.name            = g_pthread_main->name;
+			info.alive           = true;
+
+			if (g_pthread_main->attr != nullptr && g_pthread_main->attr->stack_addr != nullptr) {
+				info.stack_addr = reinterpret_cast<uint64_t>(g_pthread_main->attr->stack_addr);
+				info.stack_size = static_cast<uint64_t>(g_pthread_main->attr->stack_size);
+			}
+
+			out.insert(out.begin(), std::move(info));
+		}
+	}
 }
 
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size) {

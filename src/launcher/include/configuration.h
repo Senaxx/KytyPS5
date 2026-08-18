@@ -99,6 +99,8 @@ public:
 	QString                printf_output_file          = "_kyty.txt";
 	ProfilerDirection      profiler_direction          = ProfilerDirection::None;
 	bool                   renderdoc_enabled           = false;
+	bool                   debugger_enabled            = false;
+	bool                   external_debugger_enabled   = false;
 #if defined(_WIN32)
 	bool red_zone_protection_enabled = false;
 #endif
@@ -122,6 +124,8 @@ public:
 		printf_output_file          = other.printf_output_file;
 		profiler_direction          = other.profiler_direction;
 		renderdoc_enabled           = other.renderdoc_enabled;
+		debugger_enabled            = other.debugger_enabled;
+		external_debugger_enabled   = other.external_debugger_enabled;
 #if defined(_WIN32)
 		red_zone_protection_enabled = other.red_zone_protection_enabled;
 #endif
@@ -162,6 +166,8 @@ public:
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_direction);
 		KYTY_CFG_SET(renderdoc_enabled);
+		KYTY_CFG_SET(debugger_enabled);
+		KYTY_CFG_SET(external_debugger_enabled);
 #if defined(_WIN32)
 		KYTY_CFG_SET(red_zone_protection_enabled);
 #endif
@@ -192,6 +198,9 @@ public:
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_direction);
 		KYTY_CFG_GET(renderdoc_enabled);
+		debugger_enabled = s->value("debugger_enabled", debugger_enabled).toBool();
+		external_debugger_enabled =
+		    s->value("external_debugger_enabled", external_debugger_enabled).toBool();
 #if defined(_WIN32)
 		red_zone_protection_enabled =
 		    s->value("red_zone_protection_enabled", red_zone_protection_enabled).toBool();

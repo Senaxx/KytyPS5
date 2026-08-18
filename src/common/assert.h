@@ -27,6 +27,15 @@ int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
 
+// Called after a fatal report has been written but before anything is torn down, so a debugger
+// can halt the failing thread and let its state be inspected. The handler returns when the halt
+// is released, and the process then exits as it would have.
+//
+// A function pointer rather than a direct call because `common` is built without the debugger.
+using FatalHandler = void (*)(const char* report);
+
+void SetFatalHandler(FatalHandler handler);
+
 } // namespace Common
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX

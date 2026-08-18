@@ -9,6 +9,7 @@
 #include "common/magicEnum.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "debugger/target/graphics.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -1344,7 +1345,81 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 static bool ShaderRecompilerTextDumpEnabled() {
 	// Graphics debug dump already writes SPIR-V binaries to _Shaders. Keep the very large
 	// disassembly/IR text behind the shader-log switch so file logging cannot stall boot.
-	return Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent;
+	//
+	// The debugger's shader views need the same text, so --debugger asks for it too; that is a
+	// deliberate cost of running with the debugger on, not of running at all.
+	return Config::GetShaderLogDirection() != Config::ShaderLogDirection::Silent ||
+	       Debugger::Graphics::WantsShaderText();
+}
+
+// Hand a freshly recompiled shader to the debugger's registry. Cheap and skipped entirely when
+// the debugger is off; the strings are only non-empty when it asked for them above.
+static void RecordShaderForDebugger(Debugger::Graphics::ShaderStage stage, uint64_t hash,
+                                    uint64_t base_address, std::span<const uint32_t> code,
+                                    const ShaderRecompiler::CompileResult& result,
+                                    const std::vector<uint32_t>&           spirv) {
+	if (!Debugger::Graphics::IsCapturing()) {
+		return;
+	}
+
+	std::vector<Debugger::Graphics::ShaderCode::Resource> resources;
+	const auto descriptor = [](const ShaderRecompiler::IR::DescriptorValue* value) {
+		std::vector<uint32_t> out;
+		if (value != nullptr && value->dword_count <= value->dwords.size()) {
+			out.assign(value->dwords.begin(), value->dwords.begin() + value->dword_count);
+		}
+		return out;
+	};
+	for (uint32_t i = 0; i < result.program.info.buffers.size(); i++) {
+		const auto& resource = result.program.info.buffers[i];
+		const auto* value = i < result.resources.buffers.size() ? &result.resources.buffers[i] : nullptr;
+		Debugger::Graphics::ShaderCode::Resource captured {
+		    "buffer", i, resource.source, resource.first_use_pc, resource.read, resource.written,
+		    resource.atomic, descriptor(value)};
+		if (value != nullptr) {
+			ShaderBufferResource decoded {};
+			const auto count = std::min<size_t>(value->dword_count, std::size(decoded.fields));
+			std::copy_n(value->dwords.begin(), count, decoded.fields);
+			captured.address = decoded.Base48();
+			captured.size = static_cast<uint64_t>(decoded.Stride()) * decoded.NumRecords();
+			captured.format = decoded.RawFormat();
+		}
+		resources.push_back(std::move(captured));
+	}
+	for (uint32_t i = 0; i < result.program.info.images.size(); i++) {
+		const auto& resource = result.program.info.images[i];
+		const auto* value = i < result.resources.images.size() ? &result.resources.images[i] : nullptr;
+		Debugger::Graphics::ShaderCode::Resource captured {
+		    "image", i, resource.source, resource.first_use_pc, resource.read, resource.written,
+		    resource.atomic, descriptor(value)};
+		if (value != nullptr) {
+			ShaderTextureResource decoded {};
+			const auto count = std::min<size_t>(value->dword_count, std::size(decoded.fields));
+			std::copy_n(value->dwords.begin(), count, decoded.fields);
+			captured.address = decoded.Base40();
+			captured.width   = static_cast<uint32_t>(decoded.Width5()) + 1u;
+			captured.height  = static_cast<uint32_t>(decoded.Height5()) + 1u;
+			captured.depth   = static_cast<uint32_t>(decoded.Depth()) + 1u;
+			captured.format  = static_cast<uint32_t>(decoded.Format());
+			captured.tile    = static_cast<uint32_t>(decoded.TileMode());
+		}
+		resources.push_back(std::move(captured));
+	}
+	for (uint32_t i = 0; i < result.program.info.samplers.size(); i++) {
+		const auto& resource = result.program.info.samplers[i];
+		const auto* value = i < result.resources.samplers.size() ? &result.resources.samplers[i] : nullptr;
+		resources.push_back({"sampler", i, resource.source, resource.first_use_pc, true, false,
+		                     false, descriptor(value)});
+	}
+	for (uint32_t i = 0; i < result.program.info.addresses.size(); i++) {
+		const auto& resource = result.program.info.addresses[i];
+		resources.push_back({"address", i, resource.source, resource.first_use_pc, resource.read,
+		                     resource.written, resource.atomic, {}});
+	}
+
+	Debugger::Graphics::RecordShader(
+	    stage, hash, base_address, static_cast<uint32_t>(code.size() * sizeof(uint32_t)),
+	    spirv.data(), spirv.size(), result.decoded_dump, result.ir_dump, resources);
 }
 
 static void DumpShaderRecompilerSpirv(const char* type, uint64_t shader_hash,
@@ -1471,6 +1546,8 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash,
 		                            "SPIR-V validation failed");
 	}
+	RecordShaderForDebugger(Debugger::Graphics::ShaderStage::Vertex, options.shader_hash,
+	                        shader_addr, code, result, result.spirv);
 
 	input_info.stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
@@ -1525,6 +1602,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash,
 		                            "SPIR-V validation failed");
 	}
+	RecordShaderForDebugger(Debugger::Graphics::ShaderStage::Pixel, options.shader_hash,
+	                        options.shader_base, code, result, result.spirv);
 	input_info.stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
 	input_info.stage.resources =
@@ -1576,6 +1655,8 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash,
 		                            "SPIR-V validation failed");
 	}
+	RecordShaderForDebugger(Debugger::Graphics::ShaderStage::Compute, options.shader_hash,
+	                        options.shader_base, code, result, result.spirv);
 	input_info.stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));
 	input_info.stage.resources =

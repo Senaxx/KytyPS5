@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <mutex>
 #include <renderdoc_app.h>
 #include <string>
 
@@ -22,15 +23,15 @@
 
 namespace Libs::Graphics {
 
-enum class RenderDocState : uint32_t {
-	Idle,
-	Requested,
-	Capturing,
-};
-
-static RENDERDOC_API_1_6_0*        g_api             = nullptr;
-static std::atomic<RenderDocState> g_state           = RenderDocState::Idle;
-static std::atomic_bool            g_unavailable_log = false;
+static RENDERDOC_API_1_6_0*               g_api             = nullptr;
+static std::atomic<RenderDocCaptureState> g_state = RenderDocCaptureState::Idle;
+static std::atomic_bool                   g_available = false;
+static std::atomic_bool                   g_unavailable_log = false;
+static std::atomic_uint64_t               g_completed_captures = 0;
+static std::atomic_bool                   g_has_result = false;
+static std::atomic_bool                   g_last_succeeded = false;
+static std::mutex                         g_status_mutex;
+static std::string                        g_capture_path;
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
@@ -52,6 +53,7 @@ static bool BindRenderDocApi(void* module) {
 	g_api = static_cast<RENDERDOC_API_1_6_0*>(api);
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
+	g_available.store(true, std::memory_order_release);
 	LOGF("RenderDoc: API 1.6.0 bound\n");
 	return true;
 }
@@ -116,37 +118,60 @@ void RenderDocInit() {
 
 #endif
 
-void RenderDocRequestCapture() {
-	if (g_api == nullptr) {
+bool RenderDocRequestCapture() {
+	if (!g_available.load(std::memory_order_acquire)) {
 		if (!g_unavailable_log.exchange(true)) {
 			LOGF("RenderDoc: capture requested, but RenderDoc is unavailable\n");
 		}
-		return;
+		return false;
 	}
 
-	RenderDocState expected = RenderDocState::Idle;
-	if (g_state.compare_exchange_strong(expected, RenderDocState::Requested)) {
+	RenderDocCaptureState expected = RenderDocCaptureState::Idle;
+	if (g_state.compare_exchange_strong(expected, RenderDocCaptureState::Requested)) {
 		LOGF("RenderDoc: capture requested\n");
+		return true;
 	}
+	return false;
+}
+
+const char* RenderDocCaptureStateName(RenderDocCaptureState state) {
+	switch (state) {
+		case RenderDocCaptureState::Requested: return "requested";
+		case RenderDocCaptureState::Capturing: return "capturing";
+		case RenderDocCaptureState::Idle: return "idle";
+	}
+	return "unknown";
+}
+
+RenderDocStatus RenderDocGetStatus() {
+	RenderDocStatus status;
+	status.available = g_available.load(std::memory_order_acquire);
+	status.state = g_state.load(std::memory_order_acquire);
+	status.completed_captures = g_completed_captures.load(std::memory_order_acquire);
+	status.has_result = g_has_result.load(std::memory_order_acquire);
+	status.last_succeeded = g_last_succeeded.load(std::memory_order_acquire);
+	const std::lock_guard lock(g_status_mutex);
+	status.capture_path = g_capture_path;
+	return status;
 }
 
 bool RenderDocCaptureRequested() {
-	return g_state.load(std::memory_order_acquire) == RenderDocState::Requested;
+	return g_state.load(std::memory_order_acquire) == RenderDocCaptureState::Requested;
 }
 
 bool RenderDocCaptureInProgress() {
-	return g_state.load(std::memory_order_acquire) == RenderDocState::Capturing;
+	return g_state.load(std::memory_order_acquire) == RenderDocCaptureState::Capturing;
 }
 
 void RenderDocStartCapture() {
-	RenderDocState expected = RenderDocState::Requested;
-	if (g_api == nullptr || !g_state.compare_exchange_strong(expected, RenderDocState::Capturing,
+	RenderDocCaptureState expected = RenderDocCaptureState::Requested;
+	if (g_api == nullptr || !g_state.compare_exchange_strong(expected, RenderDocCaptureState::Capturing,
 	                                                         std::memory_order_acq_rel)) {
 		return;
 	}
 
 	if (g_api->IsFrameCapturing() != 0) {
-		g_state.store(RenderDocState::Idle, std::memory_order_release);
+		g_state.store(RenderDocCaptureState::Idle, std::memory_order_release);
 		LOGF("RenderDoc: capture request ignored because a capture is already active\n");
 		return;
 	}
@@ -155,10 +180,14 @@ void RenderDocStartCapture() {
 	                              std::chrono::system_clock::now().time_since_epoch())
 	                              .count();
 	const auto capture_path = "_RenderDoc/kyty_" + std::to_string(capture_id);
+	{
+		const std::lock_guard lock(g_status_mutex);
+		g_capture_path = capture_path;
+	}
 	g_api->SetCaptureFilePathTemplate(capture_path.c_str());
 	g_api->StartFrameCapture(nullptr, nullptr);
 	if (g_api->IsFrameCapturing() == 0) {
-		g_state.store(RenderDocState::Idle, std::memory_order_release);
+		g_state.store(RenderDocCaptureState::Idle, std::memory_order_release);
 		LOGF("RenderDoc: capture failed to start\n");
 		return;
 	}
@@ -171,7 +200,10 @@ void RenderDocEndCapture() {
 	}
 
 	const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
-	g_state.store(RenderDocState::Idle, std::memory_order_release);
+	g_last_succeeded.store(ok != 0, std::memory_order_release);
+	g_has_result.store(true, std::memory_order_release);
+	g_completed_captures.fetch_add(1, std::memory_order_acq_rel);
+	g_state.store(RenderDocCaptureState::Idle, std::memory_order_release);
 	LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
 }
 

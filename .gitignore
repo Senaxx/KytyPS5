@@ -5,3 +5,12 @@ build/
 _Build/vscode-clang/
 _Build/
 cmake-build-debug/
+
+# Written by the emulator when it is run from the repository root.
+_Buffers/
+_DownloadData/
+_logs/
+_SaveData/
+_Shaders/
+_TempData/
+_Textures/

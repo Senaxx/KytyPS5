@@ -25,6 +25,8 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "debugger/debugger.h"
+#include "debugger/ui/overlay.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -329,7 +331,9 @@ public:
 	void                 Recreate(bool surface_lost = false);
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareImeOverlay();
-	void RecordPresentCommands(CommandBuffer& command, VulkanImage& source, bool draw_ime_overlay);
+	[[nodiscard]] bool   PrepareDebuggerOverlay();
+	void RecordPresentCommands(CommandBuffer& command, VulkanImage& source, bool draw_ime_overlay,
+	                           bool draw_debugger_overlay);
 	void Submit(CommandBuffer& command);
 	[[nodiscard]] Status Present();
 
@@ -351,8 +355,11 @@ private:
 	std::vector<vk::Semaphore>  m_image_acquired;
 	std::vector<vk::Semaphore>  m_render_complete;
 	std::unique_ptr<ImeOverlay> m_ime_overlay;
-	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
-	uint32_t                    m_frame_index = 0;
+
+	std::unique_ptr<Debugger::Ui::DebuggerOverlay> m_debugger_overlay;
+
+	uint32_t m_image_index = static_cast<uint32_t>(-1);
+	uint32_t m_frame_index = 0;
 };
 
 struct Presenter::Impl {
@@ -529,6 +536,9 @@ void Swapchain::Destroy() {
 	if (m_ime_overlay != nullptr) {
 		m_ime_overlay->ReleaseVulkan();
 	}
+	if (m_debugger_overlay != nullptr) {
+		m_debugger_overlay->ReleaseVulkan();
+	}
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -620,8 +630,19 @@ bool Swapchain::PrepareImeOverlay() {
 	return m_ime_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
+bool Swapchain::PrepareDebuggerOverlay() {
+	if (!Debugger::IsOverlayVisible()) {
+		return false;
+	}
+	if (m_debugger_overlay == nullptr) {
+		m_debugger_overlay = std::make_unique<Debugger::Ui::DebuggerOverlay>(m_window.graphic_ctx);
+	}
+	return m_debugger_overlay->PrepareFrame(m_extent, m_format, ImageCount());
+}
+
 void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-                                      bool draw_ime_overlay) {
+                                      bool draw_ime_overlay, bool draw_debugger_overlay) {
+	const bool draw_overlay = draw_ime_overlay || draw_debugger_overlay;
 	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
 		     static_cast<void*>(source.image), static_cast<int>(source.state.layout));
@@ -669,12 +690,12 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType         = vk::StructureType::eImageMemoryBarrier;
 	to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-	to_present.dstAccessMask = draw_ime_overlay ? vk::AccessFlagBits::eColorAttachmentRead |
-	                                                  vk::AccessFlagBits::eColorAttachmentWrite
-	                                            : vk::AccessFlagBits::eMemoryRead;
+	to_present.dstAccessMask = draw_overlay ? vk::AccessFlagBits::eColorAttachmentRead |
+	                                              vk::AccessFlagBits::eColorAttachmentWrite
+	                                        : vk::AccessFlagBits::eMemoryRead;
 	to_present.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
-	to_present.newLayout     = draw_ime_overlay ? vk::ImageLayout::eColorAttachmentOptimal
-	                                            : vk::ImageLayout::ePresentSrcKHR;
+	to_present.newLayout =
+	    draw_overlay ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::ePresentSrcKHR;
 	to_present.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_present.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_present.image                           = m_images[m_image_index];
@@ -684,12 +705,18 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
 	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                           draw_ime_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
-	                                            : vk::PipelineStageFlagBits::eAllCommands,
+	                           draw_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+	                                        : vk::PipelineStageFlagBits::eAllCommands,
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 	                           &to_present);
-	if (draw_ime_overlay) {
-		m_ime_overlay->Record(vk_command, m_image_views[m_image_index]);
+	if (draw_overlay) {
+		if (draw_ime_overlay) {
+			m_ime_overlay->Record(vk_command, m_image_views[m_image_index]);
+		}
+		// The debugger draws last so it sits on top of the IME when both are up.
+		if (draw_debugger_overlay) {
+			m_debugger_overlay->Record(vk_command, m_image_views[m_image_index]);
+		}
 		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
@@ -809,6 +836,13 @@ bool Presenter::NeedsImeRefresh() const noexcept {
 	       visual.revision != m_impl->presented_ime_revision.load(std::memory_order_acquire);
 }
 
+// The guest stops flipping the moment the debugger halts it, so the vblank thread has to keep
+// re-presenting the last frame while the overlay is up — otherwise the debugger would freeze
+// along with the game it is debugging.
+bool Presenter::NeedsDebuggerRefresh() const noexcept {
+	return Debugger::IsOverlayVisible();
+}
+
 RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
@@ -856,7 +890,8 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			frame.present_commands->WaitForFenceAndReset();
 			auto&      command          = *frame.present_commands;
 			const bool draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
-			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
+			const bool draw_debugger    = swapchain.PrepareDebuggerOverlay();
+			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay, draw_debugger);
 			swapchain.Submit(command);
 		}
 		status = swapchain.Present();

@@ -142,7 +142,7 @@ private:
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
-	void CommitGpuWrite(Image& image);
+	void CommitGpuWrite(ImageId id, Image& image);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
@@ -159,6 +159,7 @@ private:
 	[[nodiscard]] bool                          TryDownloadImage(ImageId id);
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> MapDownload(uint64_t size, uint64_t alignment);
 	void QueueDownload(GuestRange range, StreamBuffer& download, uint8_t* mapped, uint64_t offset);
+	void ProcessDebuggerPreview();
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -181,6 +182,7 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	std::unique_ptr<StreamBuffer> m_debug_preview_download;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

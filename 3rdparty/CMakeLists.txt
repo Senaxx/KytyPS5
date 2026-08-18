@@ -43,6 +43,8 @@ add_library(imgui STATIC
 	imgui/imgui_tables.cpp
 	imgui/imgui_widgets.cpp
 	imgui/backends/imgui_impl_vulkan.cpp
+	# Headless platform/renderer, used by the debugger's layout regression test.
+	imgui/backends/imgui_impl_null.cpp
 )
 target_include_directories(imgui PUBLIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/imgui"

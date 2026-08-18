@@ -70,6 +70,12 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("\nDebugger (all options below imply --debugger):\n");
+	::printf("  --debugger                           Enable the in-emulator debugger overlay.\n");
+	::printf("  --debugger-ui                        Show the overlay at startup (F1 toggles).\n");
+	::printf("  --debugger-server                    Allow the external debugger to attach.\n");
+	::printf("  --debugger-break-entry               Halt at the guest entry point.\n");
+	::printf("  --debugger-break <sym|addr>          Initial breakpoint; may be repeated.\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -144,6 +150,31 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 		if (arg == "--playgo-hack") {
 			options.config.playgo_hack_enabled = true;
+			continue;
+		}
+
+		// --debugger is the master switch; every other debugger option implies it, so
+		// `--debugger-break main` alone is enough to get a debuggable run.
+		if (arg == "--debugger") {
+			options.config.debugger_enabled = true;
+			continue;
+		}
+
+		if (arg == "--debugger-ui") {
+			options.config.debugger_enabled    = true;
+			options.config.debugger_ui_visible = true;
+			continue;
+		}
+
+		if (arg == "--debugger-server") {
+			options.config.debugger_enabled = true;
+			options.config.debugger_server  = true;
+			continue;
+		}
+
+		if (arg == "--debugger-break-entry") {
+			options.config.debugger_enabled     = true;
+			options.config.debugger_break_entry = true;
 			continue;
 		}
 
@@ -264,6 +295,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--debugger-break") {
+			if (value.empty()) {
+				::printf("--debugger-break needs a symbol name or address\n");
+				return false;
+			}
+			options.config.debugger_enabled = true;
+			options.config.debugger_breakpoints.push_back(value);
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

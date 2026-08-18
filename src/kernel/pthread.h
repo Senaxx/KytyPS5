@@ -4,6 +4,9 @@
 #include "common/abi.h"
 #include "common/common.h"
 
+#include <string>
+#include <vector>
+
 // IWYU pragma: no_include <pthread.h>
 
 extern "C" {
@@ -117,12 +120,31 @@ void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);
 bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_size);
+
+// Snapshot of one guest thread, for the debugger's thread list. Copied by value so callers do
+// not hold the pool lock (or any pointer into it) while inspecting a stopped process.
+struct GuestThreadInfo {
+	Pthread     handle          = nullptr;
+	int         unique_id       = 0;
+	int32_t     guest_thread_id = 0;
+	uint64_t    host_thread_id  = 0;
+	uint64_t    stack_addr      = 0;
+	uint64_t    stack_size      = 0;
+	bool        alive           = false;
+	std::string name;
+};
+
+// Enumerate every guest thread, including the main thread. Safe to call at any time; takes the
+// pool lock, so it must not be called while guest threads are suspended.
+void PthreadEnumerate(std::vector<GuestThreadInfo>& out);
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestGuestStackOwnerLifecycle(uint64_t* first_address, uint64_t* second_address,
                                   uint64_t* map_size);
 #endif
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 bool PthreadKillHost(Pthread thread, int host_signal);
+// Same, addressed by the OS-level thread id the debugger's thread list reports.
+bool PthreadKillHostByOsId(uint64_t host_thread_id, int host_signal);
 #endif
 int PthreadGetPriorityForKernel(Pthread thread);
 int PthreadGetCurrentPriorityForKernel();

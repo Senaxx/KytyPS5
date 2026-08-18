@@ -1,7 +1,10 @@
 #include "common/hostException.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <mutex>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
@@ -25,16 +28,86 @@ namespace Common::HostException {
 
 #if !defined(__APPLE__)
 
-static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
+static thread_local bool    g_in_exception_filter = false;
 
-static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
+
+[[noreturn]] static void FailFast(const char* reason) noexcept {
+	std::fputs("HostException fail-fast: ", stderr);
+	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
+	std::fputc('\n', stderr);
+	std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 #endif
+	std::_Exit(321);
+}
+
+class FilterScope final {
+public:
+	FilterScope() noexcept {
+		if (g_in_exception_filter) {
+			FailFast("nested exception while resolving a host fault");
+		}
+		g_in_exception_filter = true;
+	}
+
+	~FilterScope() { g_in_exception_filter = false; }
+
+	KYTY_CLASS_NO_COPY(FilterScope);
+};
+#endif
+
+namespace {
+
+struct HandlerEntry {
+	Handler fn       = nullptr;
+	int32_t priority = 0;
+};
+
+// Immutable snapshot of the handler chain, sorted by ascending priority. Published by an
+// atomic pointer swap so the fault path never takes a lock; superseded tables are leaked
+// rather than freed, since a fault on another thread may still be walking one. Registration
+// happens a handful of times per process, so the leak is bounded at a few hundred bytes.
+struct HandlerTable {
+	uint32_t     count = 0;
+	HandlerEntry entries[MAX_HANDLERS] {};
+};
+
+std::atomic<const HandlerTable*> g_table {nullptr};
+std::mutex                       g_register_mutex;
+
+static_assert(decltype(g_table)::is_always_lock_free);
+
+// Replace the published chain with `next`. Caller holds g_register_mutex.
+void PublishTable(const HandlerTable& next) {
+	auto* published = new HandlerTable(next); // NOLINT(cppcoreguidelines-owning-memory)
+	g_table.store(published, std::memory_order_release);
+}
+
+// Walk the chain in priority order. Returns true when a handler claims the fault.
+bool DispatchToChain(const ExceptionInfo& info) noexcept {
+	const auto* table = g_table.load(std::memory_order_acquire);
+	if (table == nullptr) {
+		return false;
+	}
+
+	for (uint32_t i = 0; i < table->count; i++) {
+		if (table->entries[i].fn != nullptr && table->entries[i].fn(info)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
+	FilterScope filter_scope;
+
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
@@ -63,6 +136,10 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 		info.access_violation_vaddr = exception_record->ExceptionInformation[1];
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
+	} else if (exception_record->ExceptionCode == EXCEPTION_BREAKPOINT) {
+		info.type = ExceptionType::Breakpoint;
+	} else if (exception_record->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+		info.type = ExceptionType::SingleStep;
 	} else {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
@@ -83,21 +160,30 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	info.r13 = exception->ContextRecord->R13;
 	info.r14 = exception->ContextRecord->R14;
 	info.r15 = exception->ContextRecord->R15;
+	// Windows already reports Rip on the int3 for EXCEPTION_BREAKPOINT, so it needs no
+	// adjustment to satisfy the normalisation described in the header.
+	info.rip    = exception->ContextRecord->Rip;
+	info.rflags = exception->ContextRecord->EFlags;
 
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler != nullptr && handler(info)) {
-		return EXCEPTION_CONTINUE_EXECUTION;
-	}
-	return EXCEPTION_CONTINUE_SEARCH;
+	// Nothing claimed it: CONTINUE_SEARCH, so a native debugger attached to the emulator still
+	// receives its own breakpoints and the OS still terminates on a genuine crash.
+	return DispatchToChain(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 }
 
 #elif defined(__APPLE__)
 
-static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
+static thread_local bool    g_in_exception_filter = false;
 
-static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
+
+[[noreturn]] static void FailFast(const char* reason) noexcept {
+	std::fputs("HostException fail-fast: ", stderr);
+	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
+	std::fputc('\n', stderr);
+	std::fflush(stderr);
+	std::_Exit(321);
+}
 
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
 // bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
@@ -116,6 +202,11 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 // re-executing the faulting instruction against the now-fixed protection. An unresolved
 // fault restores the default disposition so the retry terminates the process.
 static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
+	if (g_in_exception_filter) {
+		FailFast("nested exception while resolving a host fault");
+	}
+	g_in_exception_filter = true;
+
 	auto*       uc = static_cast<ucontext_t*>(uctx);
 	const auto* mc = uc->uc_mcontext;
 	const auto& ss = mc->__ss;
@@ -127,6 +218,9 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 
 	if (sig == SIGILL) {
 		info.type = ExceptionType::IllegalInstruction;
+	} else if (sig == SIGTRAP) {
+		info.type =
+		    (si->si_code == TRAP_TRACE) ? ExceptionType::SingleStep : ExceptionType::Breakpoint;
 	} else {
 		info.type                   = ExceptionType::AccessViolation;
 		info.access_violation_type  = DecodeAccess(mc->__es.__err);
@@ -149,10 +243,23 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	info.r13 = ss.__r13;
 	info.r14 = ss.__r14;
 	info.r15 = ss.__r15;
+	// A SIGTRAP from int3 reports the address after the trap byte; back it onto the instruction
+	// so ExceptionInfo::rip means the same thing here as it does on Windows.
+	info.rip    = (info.type == ExceptionType::Breakpoint) ? ss.__rip - 1 : ss.__rip;
+	info.rflags = ss.__rflags;
 
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler != nullptr && handler(info)) {
+	const bool resolved   = DispatchToChain(info);
+	g_in_exception_filter = false;
+
+	if (resolved) {
 		return; // retry the faulting instruction against the fixed mapping
+	}
+
+	// An unclaimed trap is not fatal and must not disarm the handler: unlike a fault, it does
+	// not re-execute on return, so restoring SIG_DFL here would only kill the process on some
+	// later, unrelated trap.
+	if (sig == SIGTRAP) {
+		return;
 	}
 
 	// Unresolved: restore the default action so the re-executed instruction terminates.
@@ -178,6 +285,8 @@ static void ChainToDefault(int signal_number) noexcept {
 }
 
 static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
+	FilterScope filter_scope;
+
 	auto* context = static_cast<ucontext_t*>(native_context);
 	auto* gregs   = context->uc_mcontext.gregs;
 
@@ -199,6 +308,9 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
 	} else if (signal_number == SIGILL) {
 		info.type = ExceptionType::IllegalInstruction;
+	} else if (signal_number == SIGTRAP) {
+		info.type = (signal_info->si_code == TRAP_TRACE) ? ExceptionType::SingleStep
+		                                                 : ExceptionType::Breakpoint;
 	} else {
 		ChainToDefault(signal_number);
 		return;
@@ -220,9 +332,18 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	info.r13 = static_cast<uint64_t>(gregs[REG_R13]);
 	info.r14 = static_cast<uint64_t>(gregs[REG_R14]);
 	info.r15 = static_cast<uint64_t>(gregs[REG_R15]);
+	// A SIGTRAP from int3 reports the address after the trap byte; back it onto the instruction
+	// so ExceptionInfo::rip means the same thing here as it does on Windows.
+	info.rip =
+	    static_cast<uint64_t>(gregs[REG_RIP]) - (info.type == ExceptionType::Breakpoint ? 1 : 0);
+	info.rflags = static_cast<uint64_t>(gregs[REG_EFL]);
 
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler != nullptr && handler(info)) {
+	if (DispatchToChain(info)) {
+		return;
+	}
+
+	// An unclaimed trap is not fatal and must not disarm the handler (see the macOS path).
+	if (signal_number == SIGTRAP) {
 		return;
 	}
 
@@ -231,21 +352,16 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 
 #endif
 
-bool InstallHandler(Handler handler) {
-	if (handler == nullptr) {
-		return false;
-	}
-
+// Install the OS-level trap hook. Idempotent: only the first successful call arms it.
+static bool EnsureInstalled() {
 	uint32_t expected_state = 0;
 	if (!g_install_state.compare_exchange_strong(expected_state, 1, std::memory_order_acq_rel)) {
-		return expected_state == 2 && g_handler.load(std::memory_order_acquire) == handler;
+		// Another registration already armed it, or is in the middle of doing so.
+		return expected_state != 0;
 	}
 
-	g_handler.store(handler, std::memory_order_release);
-
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
-		g_handler.store(nullptr, std::memory_order_release);
+	if (AddVectoredExceptionHandler(1, ExceptionFilter) == nullptr) {
 		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");
 		return false;
@@ -261,11 +377,11 @@ bool InstallHandler(Handler handler) {
 	sigaddset(&sa.sa_mask, SIGUSR1);
 
 	// macOS raises SIGBUS for protection faults on some paths and SIGSEGV on others;
-	// SIGILL covers instructions the host cannot execute (routed to the x64 emulator).
+	// SIGILL covers instructions the host cannot execute (routed to the x64 emulator);
+	// SIGTRAP carries debugger breakpoints and single-step traps.
 	bool ok = sigaction(SIGSEGV, &sa, nullptr) == 0 && sigaction(SIGBUS, &sa, nullptr) == 0 &&
-	          sigaction(SIGILL, &sa, nullptr) == 0;
+	          sigaction(SIGILL, &sa, nullptr) == 0 && sigaction(SIGTRAP, &sa, nullptr) == 0;
 	if (!ok) {
-		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("sigaction() failed to install the host fault handler\n");
 		return false;
@@ -277,9 +393,8 @@ bool InstallHandler(Handler handler) {
 	// Fault resolution needs the normal thread stack.
 	action.sa_flags = SA_SIGINFO | SA_RESTART;
 
-	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
+	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL, SIGTRAP}) {
 		if (::sigaction(signal_number, &action, nullptr) != 0) {
-			g_handler.store(nullptr, std::memory_order_release);
 			g_install_state.store(0, std::memory_order_release);
 			printf("sigaction(%d) failed\n", signal_number);
 			return false;
@@ -289,6 +404,172 @@ bool InstallHandler(Handler handler) {
 
 	g_install_state.store(2, std::memory_order_release);
 	return true;
+}
+
+bool AddHandler(Handler handler, int32_t priority) {
+	if (handler == nullptr) {
+		return false;
+	}
+
+	const std::lock_guard lock(g_register_mutex);
+
+	HandlerTable next {};
+	if (const auto* current = g_table.load(std::memory_order_acquire); current != nullptr) {
+		next = *current;
+	}
+
+	for (uint32_t i = 0; i < next.count; i++) {
+		if (next.entries[i].fn == handler) {
+			return true; // already registered
+		}
+	}
+
+	if (next.count >= MAX_HANDLERS) {
+		return false;
+	}
+
+	next.entries[next.count++] = HandlerEntry {handler, priority};
+	std::stable_sort(
+	    next.entries, next.entries + next.count,
+	    [](const HandlerEntry& a, const HandlerEntry& b) { return a.priority < b.priority; });
+
+	if (!EnsureInstalled()) {
+		return false;
+	}
+
+	PublishTable(next);
+	return true;
+}
+
+bool RemoveHandler(Handler handler) {
+	if (handler == nullptr) {
+		return false;
+	}
+
+	const std::lock_guard lock(g_register_mutex);
+
+	const auto* current = g_table.load(std::memory_order_acquire);
+	if (current == nullptr) {
+		return false;
+	}
+
+	HandlerTable next {};
+	bool         removed = false;
+	for (uint32_t i = 0; i < current->count; i++) {
+		if (current->entries[i].fn == handler) {
+			removed = true;
+			continue;
+		}
+		next.entries[next.count++] = current->entries[i];
+	}
+
+	if (!removed) {
+		return false;
+	}
+
+	PublishTable(next);
+	return true;
+}
+
+bool InstallHandler(Handler handler) {
+	return AddHandler(handler, PRIORITY_DEFAULT);
+}
+
+void SetInstructionPointer([[maybe_unused]] void* native_context, [[maybe_unused]] uint64_t rip) {
+	if (native_context == nullptr) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static_cast<PCONTEXT>(native_context)->Rip = rip;
+#elif defined(__APPLE__)
+	static_cast<ucontext_t*>(native_context)->uc_mcontext->__ss.__rip = rip;
+#else
+	static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs[REG_RIP] = static_cast<greg_t>(rip);
+#endif
+}
+
+void SetFlagsRegister([[maybe_unused]] void* native_context, [[maybe_unused]] uint64_t rflags) {
+	if (native_context == nullptr) {
+		return;
+	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static_cast<PCONTEXT>(native_context)->EFlags = static_cast<DWORD>(rflags);
+#elif defined(__APPLE__)
+	static_cast<ucontext_t*>(native_context)->uc_mcontext->__ss.__rflags = rflags;
+#else
+	static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs[REG_EFL] =
+	    static_cast<greg_t>(rflags);
+#endif
+}
+
+void SetGpr([[maybe_unused]] void* native_context, [[maybe_unused]] Gpr reg,
+            [[maybe_unused]] uint64_t value) {
+	if (native_context == nullptr) {
+		return;
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	auto* context = static_cast<PCONTEXT>(native_context);
+	switch (reg) {
+		case Gpr::Rax: context->Rax = value; break;
+		case Gpr::Rbx: context->Rbx = value; break;
+		case Gpr::Rcx: context->Rcx = value; break;
+		case Gpr::Rdx: context->Rdx = value; break;
+		case Gpr::Rsi: context->Rsi = value; break;
+		case Gpr::Rdi: context->Rdi = value; break;
+		case Gpr::Rbp: context->Rbp = value; break;
+		case Gpr::Rsp: context->Rsp = value; break;
+		case Gpr::R8: context->R8 = value; break;
+		case Gpr::R9: context->R9 = value; break;
+		case Gpr::R10: context->R10 = value; break;
+		case Gpr::R11: context->R11 = value; break;
+		case Gpr::R12: context->R12 = value; break;
+		case Gpr::R13: context->R13 = value; break;
+		case Gpr::R14: context->R14 = value; break;
+		case Gpr::R15: context->R15 = value; break;
+	}
+#elif defined(__APPLE__)
+	auto& ss = static_cast<ucontext_t*>(native_context)->uc_mcontext->__ss;
+	switch (reg) {
+		case Gpr::Rax: ss.__rax = value; break;
+		case Gpr::Rbx: ss.__rbx = value; break;
+		case Gpr::Rcx: ss.__rcx = value; break;
+		case Gpr::Rdx: ss.__rdx = value; break;
+		case Gpr::Rsi: ss.__rsi = value; break;
+		case Gpr::Rdi: ss.__rdi = value; break;
+		case Gpr::Rbp: ss.__rbp = value; break;
+		case Gpr::Rsp: ss.__rsp = value; break;
+		case Gpr::R8: ss.__r8 = value; break;
+		case Gpr::R9: ss.__r9 = value; break;
+		case Gpr::R10: ss.__r10 = value; break;
+		case Gpr::R11: ss.__r11 = value; break;
+		case Gpr::R12: ss.__r12 = value; break;
+		case Gpr::R13: ss.__r13 = value; break;
+		case Gpr::R14: ss.__r14 = value; break;
+		case Gpr::R15: ss.__r15 = value; break;
+	}
+#else
+	auto*      gregs = static_cast<ucontext_t*>(native_context)->uc_mcontext.gregs;
+	const auto set   = [&](int index) { gregs[index] = static_cast<greg_t>(value); };
+	switch (reg) {
+		case Gpr::Rax: set(REG_RAX); break;
+		case Gpr::Rbx: set(REG_RBX); break;
+		case Gpr::Rcx: set(REG_RCX); break;
+		case Gpr::Rdx: set(REG_RDX); break;
+		case Gpr::Rsi: set(REG_RSI); break;
+		case Gpr::Rdi: set(REG_RDI); break;
+		case Gpr::Rbp: set(REG_RBP); break;
+		case Gpr::Rsp: set(REG_RSP); break;
+		case Gpr::R8: set(REG_R8); break;
+		case Gpr::R9: set(REG_R9); break;
+		case Gpr::R10: set(REG_R10); break;
+		case Gpr::R11: set(REG_R11); break;
+		case Gpr::R12: set(REG_R12); break;
+		case Gpr::R13: set(REG_R13); break;
+		case Gpr::R14: set(REG_R14); break;
+		case Gpr::R15: set(REG_R15); break;
+	}
+#endif
 }
 
 } // namespace Common::HostException

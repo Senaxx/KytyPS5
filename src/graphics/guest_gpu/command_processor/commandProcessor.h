@@ -2,6 +2,7 @@
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
 #include "common/assert.h"
+#include "debugger/target/graphics.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -145,6 +146,10 @@ private:
 	                      uint32_t cache_action, uint32_t event_index, uint32_t event_write_source,
 	                      void* dst_gpu_addr, T value, uint32_t interrupt_selector,
 	                      uint32_t interrupt_context_id);
+	void RecordDrawForDebugger(Debugger::Graphics::DrawKind kind, uint32_t count,
+	                           uint32_t instances);
+	void RecordDispatchForDebugger(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z);
+
 	void ProcessPm4(Pm4Execution& execution, size_t stop_depth);
 	void SuspendPm4();
 	void SubmitNonIndexedDraw(uint32_t vertex_count, uint32_t flags,

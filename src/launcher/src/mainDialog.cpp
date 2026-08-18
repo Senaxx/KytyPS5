@@ -231,6 +231,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.renderdoc_enabled) {
 		args << "--rd";
 	}
+	if (info.debugger_enabled) {
+		args << "--debugger-ui";
+	}
+	if (info.external_debugger_enabled) {
+		args << "--debugger-server";
+	}
 
 	QString game = info.basedir;
 	if (!info.elf.isEmpty()) {
@@ -413,6 +419,16 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	});
 #endif
 	process->start();
+	if (info.external_debugger_enabled) {
+#if defined(_WIN32)
+		const auto debugger = dir.filePath(QStringLiteral("kyty_debugger.exe"));
+#else
+		const auto debugger = dir.filePath(QStringLiteral("kyty_debugger"));
+#endif
+		QTimer::singleShot(750, this, [debugger] {
+			if (QFileInfo::exists(debugger)) QProcess::startDetached(debugger, {});
+		});
+	}
 #if !defined(_WIN32)
 	// Report immediate launch failures.
 	if (!process->waitForStarted(5000)) {

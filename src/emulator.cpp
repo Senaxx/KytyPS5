@@ -11,6 +11,7 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "debugger/debugger.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
@@ -123,6 +124,9 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 	// Initialization order is explicit; destruction is automatic and reversed.
 	subsystems.Initialize<Loader::Timer::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
+	// Before Memory and Graphics: the debugger claims the first slot in the host exception
+	// chain, and it must be in place before anything else registers a fault handler.
+	subsystems.Initialize<Debugger::Lifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();

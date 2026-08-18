@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
+#include "debugger/target/io.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
@@ -563,14 +564,18 @@ public:
 		}
 		if (opened && file.close != nullptr) {
 			file.close(file.object_pointer);
+			Debugger::Io::Record("avplayer close", -1, source_path, {}, -1, 0, 0, 0);
 		}
 	}
 	bool Init(const std::string& path) {
+		source_path = path;
 		if (file.open == nullptr || file.close == nullptr || file.read_offset == nullptr ||
 		    file.size == nullptr) {
 			return false;
 		}
-		if (file.open(file.object_pointer, path.c_str()) < 0) {
+		const auto open_result = file.open(file.object_pointer, path.c_str());
+		Debugger::Io::Record("avplayer open", -1, source_path, {}, 0, 0, open_result, 0);
+		if (open_result < 0) {
 			return false;
 		}
 		opened = true;
@@ -594,8 +599,11 @@ private:
 			return AVERROR_EOF;
 		}
 		len = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
+		const auto offset = s->pos;
 		auto r =
 		    s->file.read_offset(s->file.object_pointer, buf, s->pos, static_cast<uint32_t>(len));
+		Debugger::Io::Record("avplayer read", -1, s->source_path, {},
+		                     static_cast<int64_t>(offset), static_cast<uint64_t>(len), r, 0);
 		if (r <= 0) {
 			return r == 0 ? AVERROR_EOF : r;
 		}
@@ -617,9 +625,11 @@ private:
 		}
 		p      = std::min<int64_t>(p, static_cast<int64_t>(s->size));
 		s->pos = static_cast<uint64_t>(p);
+		Debugger::Io::Record("avplayer seek", -1, s->source_path, {}, p, 0, p, 0);
 		return p;
 	}
 	AvPlayerFileReplacement file;
+	std::string             source_path;
 	bool                    opened = false;
 	uint64_t                pos    = 0;
 	uint64_t                size   = 0;
@@ -671,7 +681,9 @@ public:
 		} else {
 			auto real     = LibKernel::FileSystem::GetRealFilename(std::string(path.c_str()));
 			auto real_str = Common::PathToString(real);
-			if (auto rc = avformat_open_input(&raw, real_str.c_str(), nullptr, nullptr); rc < 0) {
+			const auto rc = avformat_open_input(&raw, real_str.c_str(), nullptr, nullptr);
+			Debugger::Io::Record("avplayer open", -1, path, real_str, 0, 0, rc, 0);
+			if (rc < 0) {
 				LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(),
 				     real_str.c_str());
 				return AVPLAYER_ERROR_OPERATION_FAILED;
