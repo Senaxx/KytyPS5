@@ -130,6 +130,10 @@ std::string InputInfoToString(Opcode op, const InputInfo& input) {
 	if (op != Opcode::LoadInputF32) {
 		return "";
 	}
+	if (input.vertex_index != UINT32_MAX) {
+		return fmt::format(" ; input_attr={} input_chan={} input_vertex={}", input.attr,
+		                   input.chan, input.vertex_index);
+	}
 	return fmt::format(" ; input_attr={} input_chan={}", input.attr, input.chan);
 }
 
