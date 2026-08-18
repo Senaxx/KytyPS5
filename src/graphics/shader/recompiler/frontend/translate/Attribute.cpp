@@ -17,7 +17,8 @@ bool Translator::TranslateAttributeOperation(const IR::Instruction& inst) {
 			WriteOperand(OffsetOperand(inst.dst, component),
 			             ir.Emit(IR::ValueOpcode::GetAttribute,
 			                     {IR::Value(inst.input_info.attr),
-			                      IR::Value(inst.input_info.chan + component)}));
+			                      IR::Value(inst.input_info.chan + component),
+			                      IR::Value(inst.input_info.vertex_index)}));
 		}
 		return true;
 	}

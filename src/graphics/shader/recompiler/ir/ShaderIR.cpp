@@ -849,19 +849,24 @@ bool LowerVInterpP1F32(const Decoder::Instruction& decoded, BasicBlock& block) {
 
 bool LowerVInterpLoadF32(const Decoder::Instruction& decoded, BasicBlock& block,
                          std::string* error) {
-	if (decoded.opcode == Decoder::Opcode::V_INTERP_MOV_F32 && decoded.src0.value != 2u) {
-		if (error != nullptr) {
-			*error = fmt::format("v_interp_mov_f32 mode {} is not implemented at pc 0x{:08x}",
-			                     decoded.src0.value, decoded.pc);
-		}
-		return false;
-	}
-
 	Instruction inst;
 	inst.pc              = decoded.pc;
 	inst.op              = Opcode::LoadInputF32;
 	inst.input_info.attr = decoded.src1.value;
 	inst.input_info.chan = decoded.src2.value;
+	if (decoded.opcode == Decoder::Opcode::V_INTERP_MOV_F32) {
+		switch (decoded.src0.value) {
+			case 0u: inst.input_info.vertex_index = 1u; break; // P10
+			case 1u: inst.input_info.vertex_index = 2u; break; // P20
+			case 2u: inst.input_info.vertex_index = 0u; break; // P0
+			default:
+				if (error != nullptr) {
+					*error = fmt::format("v_interp_mov_f32 mode {} is invalid at pc 0x{:08x}",
+					                     decoded.src0.value, decoded.pc);
+				}
+				return false;
+		}
+	}
 	if (!LowerRegisterOperand(decoded.dst, inst.dst, error)) {
 		return false;
 	}

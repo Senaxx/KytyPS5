@@ -47,6 +47,7 @@ enum : uint32_t {
 	CapabilityGroupNonUniformBallot          = 64,
 	CapabilityGroupNonUniformShuffle         = 65,
 	CapabilitySignedZeroInfNanPreserve       = 4466,
+	CapabilityFragmentBarycentricKHR          = 5284,
 	CapabilityComputeDerivativeGroupQuadsKHR = 5288,
 	StorageClassUniformConstant              = 0,
 	StorageClassInput                        = 1,
@@ -71,6 +72,7 @@ enum : uint32_t {
 	DecorationBinding       = 33,
 	DecorationDescriptorSet = 34,
 	DecorationOffset        = 35,
+	DecorationPerVertexKHR  = 5285,
 };
 
 enum : uint32_t {
@@ -86,6 +88,8 @@ enum : uint32_t {
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
+	BuiltInBaryCoordKHR              = 5286,
+	BuiltInBaryCoordNoPerspKHR       = 5287,
 };
 
 enum : uint32_t {
@@ -282,6 +286,7 @@ struct InputBinding {
 	uint32_t           component_count = 1;
 	uint32_t           variable_id     = 0;
 	std::string        debug_name;
+	bool               per_vertex = false;
 };
 
 struct OutputBinding {
@@ -353,6 +358,8 @@ struct EmitterState {
 	uint32_t                                         current_label                         = 0;
 	uint32_t                                         pixel_valid_mask_variable             = 0;
 	uint32_t                                         subgroup_local_invocation_id_variable = 0;
+	uint32_t                                         bary_coord_variable                    = 0;
+	uint32_t                                         bary_coord_no_persp_variable           = 0;
 	uint32_t                                         per_vertex_variable                   = 0;
 	uint32_t                                         depth_variable                        = 0;
 	uint32_t                                         sample_mask_variable                  = 0;

@@ -390,9 +390,17 @@ static bool MrtUsesUintOutput(const EmitterState& state, uint32_t index) {
 }
 
 void AllocateInputVariables(EmitterState& state) {
+	bool needs_per_vertex = false;
 	for (auto& binding: state.inputs) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
+		needs_per_vertex = needs_per_vertex || binding.per_vertex;
+	}
+	if (needs_per_vertex) {
+		state.bary_coord_variable          = state.builder.AllocateId();
+		state.bary_coord_no_persp_variable = state.builder.AllocateId();
+		state.interface_variables.push_back(state.bary_coord_variable);
+		state.interface_variables.push_back(state.bary_coord_no_persp_variable);
 	}
 	if (state.requirements.subgroup_local_invocation_id) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
@@ -450,6 +458,14 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 }
 
 void AddInputAnnotationsAndNames(EmitterState& state) {
+	if (state.bary_coord_variable != 0) {
+		state.builder.AddName(state.bary_coord_variable, "gl_BaryCoordKHR");
+		state.builder.AddAnnotation({OpDecorate, state.bary_coord_variable, DecorationBuiltIn,
+		                             BuiltInBaryCoordKHR});
+		state.builder.AddName(state.bary_coord_no_persp_variable, "gl_BaryCoordNoPerspKHR");
+		state.builder.AddAnnotation({OpDecorate, state.bary_coord_no_persp_variable,
+		                             DecorationBuiltIn, BuiltInBaryCoordNoPerspKHR});
+	}
 	if (state.subgroup_local_invocation_id_variable != 0) {
 		state.builder.AddName(state.subgroup_local_invocation_id_variable,
 		                      "gl_SubgroupInvocationID");
@@ -463,6 +479,14 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
 		if (input.kind == IR::StageInputKind::Parameter) {
+			if (input.per_vertex) {
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationPerVertexKHR});
+				const auto location = PixelParameterLocation(state, input.location);
+				state.builder.AddAnnotation(
+				    {OpDecorate, input.variable_id, DecorationLocation, location});
+				continue;
+			}
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (flat) {
 				state.builder.AddAnnotation({OpDecorate, input.variable_id, DecorationFlat});
@@ -615,6 +639,10 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(CapabilityShader);
 	state.builder.RequireCapability(CapabilitySignedZeroInfNanPreserve);
+	if (state.bary_coord_variable != 0) {
+		state.builder.RequireCapability(CapabilityFragmentBarycentricKHR);
+		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
+	}
 	if (state.requirements.image_gather_extended) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
@@ -681,6 +709,14 @@ void DefineModule(EmitterState& state) {
 		                                   TypePointer(state, StorageClassInput, TypeU32(state)),
 		                                   StorageClassInput);
 	}
+	if (state.bary_coord_variable != 0) {
+		const auto vec3_float_pointer =
+		    TypePointer(state, StorageClassInput, TypeF32Vector(state, 3));
+		state.builder.DefineGlobalVariable(state.bary_coord_variable, vec3_float_pointer,
+		                                   StorageClassInput);
+		state.builder.DefineGlobalVariable(state.bary_coord_no_persp_variable,
+		                                   vec3_float_pointer, StorageClassInput);
+	}
 	for (const auto& input: state.inputs) {
 		uint32_t ptr_type = TypePointer(state, StorageClassInput, TypeU32(state));
 		switch (input.kind) {
@@ -700,7 +736,11 @@ void DefineModule(EmitterState& state) {
 				ptr_type = TypePointer(state, StorageClassInput, TypeBool(state));
 				break;
 			case IR::StageInputKind::Parameter:
-				if (state.stage == ShaderType::Vertex) {
+				if (input.per_vertex) {
+					const auto array_type = state.builder.Type(
+					    OpTypeArray, {TypeF32Vector(state, 4), ConstantU32(state, 3)});
+					ptr_type = TypePointer(state, StorageClassInput, array_type);
+				} else if (state.stage == ShaderType::Vertex) {
 					const auto kind       = VertexParameterScalarKind(state, input.location);
 					const auto components = VertexParameterComponentCount(state, input);
 					ptr_type = VertexParameterInputPointerType(state, kind, components);
