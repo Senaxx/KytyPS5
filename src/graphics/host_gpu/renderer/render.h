@@ -225,6 +225,7 @@ private:
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
 	void                      TrackImageBinding(ImageId id);
+	void MarkStorageImagesWritten(const DescriptorCache::PreparedBindings& bindings);
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const RenderCommandBuffer&    buffer);

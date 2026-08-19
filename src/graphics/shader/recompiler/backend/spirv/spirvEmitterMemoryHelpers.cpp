@@ -84,6 +84,16 @@ static void EnsureLdsStorage(EmitterState& state) {
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
+uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index) {
+	EnsureLdsStorage(state);
+	const auto pointer       = state.builder.AllocateId();
+	const auto storage_class =
+	    state.stage == ShaderType::Compute ? StorageClassWorkgroup : StorageClassFunction;
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, storage_class), pointer,
+	                           state.lds_variable, index});
+	return pointer;
+}
+
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem) {
 	MemoryResourceAccess access {.kind = mem.kind};
 	switch (mem.kind) {

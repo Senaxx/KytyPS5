@@ -331,9 +331,7 @@ bool ProgramSupportsLogicalSingleWaveWorkgroup(const IR::Program& program) {
 				case IR::ValueOpcode::Permlane16U32:
 				case IR::ValueOpcode::SwizzleU32:
 				case IR::ValueOpcode::DataAppend:
-				case IR::ValueOpcode::DataConsume:
-				case IR::ValueOpcode::GdsDataAppend:
-				case IR::ValueOpcode::GdsDataConsume: return false;
+				case IR::ValueOpcode::DataConsume: return false;
 				default: break;
 			}
 		}

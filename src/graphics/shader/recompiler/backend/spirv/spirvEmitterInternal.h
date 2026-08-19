@@ -748,6 +748,8 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                   uint32_t index);
 
+uint32_t EmitLdsElementPointer(EmitterState& state, uint32_t index);
+
 uint32_t EmitTBufferBitcastF32ToU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitTBufferBitcastU32ToF32(EmitterState& state, uint32_t value);

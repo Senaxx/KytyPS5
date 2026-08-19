@@ -934,6 +934,9 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& resource = program.info.images[i];
+		const bool  defer_gpu_write =
+		    program.stage == ShaderType::Compute && resource.written;
 		const auto old_image = texture_cache.ResolveOwner(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
@@ -946,7 +949,6 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();
-		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
 			EXIT_IF(resource.mip_count == 0u ||
 			        resource.mip_count != binding.desc.view_info.level_count);
@@ -955,7 +957,8 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 				auto desc = binding.desc;
 				desc.view_info.base_level += mip;
 				desc.view_info.level_count = 1;
-				binding.mip_views.push_back(texture_cache.FindTexture(binding.image_id, desc));
+				binding.mip_views.push_back(
+				    texture_cache.FindTexture(binding.image_id, desc, defer_gpu_write));
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
@@ -963,12 +966,37 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 			if (desc.type == TextureCache::BindingType::Storage) {
 				desc.view_info.level_count = 1;
 			}
-			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
+			binding.image_view =
+			    texture_cache.FindTexture(binding.image_id, desc, defer_gpu_write);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
+	}
+}
+
+void RenderExecutor::MarkStorageImagesWritten(
+    const DescriptorCache::PreparedBindings& prepared) {
+	EXIT_IF(prepared.program == nullptr);
+	const auto& program = *prepared.program;
+	const auto& images  = prepared.resources.images;
+	EXIT_IF(images.size() != program.info.images.size());
+	auto& texture_cache = m_context.GetTextureCache();
+	std::vector<ImageId> committed;
+	for (uint32_t index = 0; index < program.info.images.size(); index++) {
+		const auto& resource = program.info.images[index];
+		const auto& binding  = images[index];
+		if (!resource.written || binding.desc.type != TextureCache::BindingType::Storage ||
+		    std::ranges::find(committed, binding.image_id) != committed.end()) {
+			continue;
+		}
+		const auto owner = texture_cache.ResolveOwner(binding.image_id);
+		if (owner == nullptr || owner->info.data.Empty()) {
+			continue;
+		}
+		texture_cache.MarkGpuWritten(binding.image_id);
+		committed.push_back(binding.image_id);
 	}
 }
 
