@@ -338,13 +338,10 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 				                     Unary(ctx.state, OpNot, ctx.state.uint_type, mask)),
 				              value);
 			};
-			if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
-				AtomicUpdate(ctx.state, pointer, mem.kind, merge);
-			} else {
-				const auto old = ctx.state.builder.AllocateId();
-				ctx.state.builder.AddFunction({OpLoad, ctx.state.uint_type, old, pointer});
-				ctx.state.builder.AddFunction({OpStore, pointer, merge(old)});
-			}
+			// A guest sub-dword store updates only one byte or halfword. Different
+			// invocations can target adjacent fields of the same host dword, so a
+			// non-atomic load/merge/store can lose one of those writes.
+			AtomicUpdate(ctx.state, pointer, mem.kind, merge);
 		});
 	});
 }

@@ -15420,14 +15420,16 @@ TestCase BufferStoreVariants() {
   AppendBufferStoreOpcode(&code, 0x1e, 7, 20);
   AppendEnd(&code);
 
-  return {"BufferStoreVariants",
-          code,
-          std::vector<u32>(10, 0),
-          {0xbbccaa00u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
-           0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u},
-          {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT,
-           O::BUFFER_STORE_DWORDX2, O::BUFFER_STORE_DWORDX3, O::BUFFER_STORE_DWORDX4,
-           O::S_ENDPGM}};
+  TestCase test{"BufferStoreVariants",
+                code,
+                std::vector<u32>(10, 0),
+                {0xbbccaa00u, 0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
+                 0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u, 0x99999999u},
+                {O::V_MOV_B32, O::BUFFER_STORE_BYTE, O::BUFFER_STORE_SHORT,
+                 O::BUFFER_STORE_DWORDX2, O::BUFFER_STORE_DWORDX3,
+                 O::BUFFER_STORE_DWORDX4, O::S_ENDPGM}};
+  test.required_spirv = {"OpAtomicCompareExchange"};
+  return test;
 }
 
 TestCase BufferFormatVariants() {
