@@ -482,7 +482,8 @@ bool Translator::TranslateImageMemory(const IR::Instruction& inst) {
 	}
 }
 
-bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
+bool Translator::TranslateSharedMemory(const IR::Instruction&     inst,
+                                       const SharedAddressValues* address_snapshot) {
 	const bool shared =
 	    inst.memory.kind == IR::ResourceKind::Lds || inst.memory.kind == IR::ResourceKind::Gds;
 	if (!shared && inst.op != IR::Opcode::DsSwizzleB32) {
@@ -491,7 +492,10 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 	const bool gds            = inst.memory.kind == IR::ResourceKind::Gds;
 	const auto resource       = shared ? GetSharedResource(inst.memory.kind) : IR::Value {};
 	const auto shared_address = [&](uint32_t source) {
-		return ir.IAdd(ReadU32(inst.src[source]), IR::U32(IR::Value(inst.memory.offset)));
+		const auto base = source == 0u && address_snapshot != nullptr
+		                      ? address_snapshot->address
+		                      : ReadU32(inst.src[source]);
+		return ir.IAdd(base, IR::U32(IR::Value(inst.memory.offset)));
 	};
 	switch (inst.op) {
 		case IR::Opcode::DsReadUbyte:
@@ -594,8 +598,9 @@ bool Translator::TranslateSharedMemory(const IR::Instruction& inst) {
 }
 
 bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
-                                          const BufferAddressValues*      address_snapshot,
-                                          const ScalarMemorySourceValues* scalar_source_snapshot) {
+                                           const BufferAddressValues*      address_snapshot,
+                                           const ScalarMemorySourceValues* scalar_source_snapshot,
+                                           const SharedAddressValues*      shared_address_snapshot) {
 	switch (inst.op) {
 		case IR::Opcode::LoadSrtDword:
 		case IR::Opcode::SLoadDword:
@@ -656,7 +661,8 @@ bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
 		case IR::Opcode::DsConsume:
 		case IR::Opcode::DsAppend:
 		case IR::Opcode::DsWriteAddtidB32:
-		case IR::Opcode::DsReadAddtidB32: return TranslateSharedMemory(inst);
+		case IR::Opcode::DsReadAddtidB32:
+			return TranslateSharedMemory(inst, shared_address_snapshot);
 		default: return false;
 	}
 }

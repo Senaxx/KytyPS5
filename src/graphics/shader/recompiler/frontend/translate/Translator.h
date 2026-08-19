@@ -18,6 +18,10 @@ struct ScalarMemorySourceValues {
 	IR::U32   offset;
 };
 
+struct SharedAddressValues {
+	IR::U32 address;
+};
+
 class Translator {
 public:
 	Translator(IR::ValueProgram& program, IR::Block* block, uint32_t vector_limit,
@@ -100,7 +104,8 @@ private:
 	bool                     TranslateFlatLoad(const IR::Instruction& inst);
 	bool                     TranslateFlatStore(const IR::Instruction& inst);
 	bool                     TranslateImageMemory(const IR::Instruction& inst);
-	bool                     TranslateSharedMemory(const IR::Instruction& inst);
+	bool TranslateSharedMemory(const IR::Instruction& inst,
+	                           const SharedAddressValues* address_snapshot);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
 	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
@@ -112,7 +117,8 @@ private:
 
 	bool TranslateInstruction(const IR::Instruction&          inst,
 	                          const BufferAddressValues*      address_snapshot,
-	                          const ScalarMemorySourceValues* scalar_source_snapshot);
+	                          const ScalarMemorySourceValues* scalar_source_snapshot,
+	                          const SharedAddressValues*      shared_address_snapshot);
 	bool TranslateStateOperation(const IR::Instruction& inst);
 	bool TranslateControlOperation(const IR::Instruction& inst);
 	bool TranslateMove(const IR::Instruction& inst);
@@ -120,7 +126,8 @@ private:
 	bool TranslateAttributeOperation(const IR::Instruction& inst);
 	bool TranslateMemoryOperation(const IR::Instruction&          inst,
 	                              const BufferAddressValues*      address_snapshot,
-	                              const ScalarMemorySourceValues* scalar_source_snapshot);
+	                              const ScalarMemorySourceValues* scalar_source_snapshot,
+	                              const SharedAddressValues*      shared_address_snapshot);
 	bool TranslateIntegerCompare(const IR::Instruction& inst);
 	bool TranslateInteger16Compare(const IR::Instruction& inst);
 	bool TranslateFloatCompare(const IR::Instruction& inst);

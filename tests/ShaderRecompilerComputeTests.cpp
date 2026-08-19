@@ -69,6 +69,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -8499,7 +8501,10 @@ public:
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr,
+                const std::vector<Buffer> *resource_buffers = nullptr,
+                const std::vector<Image> *resource_storage_uint_images =
+                    nullptr) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto Binding = [&](Kind kind) {
@@ -8708,19 +8713,25 @@ public:
 
     const auto *buffers = Binding(Kind::Buffers);
     if (buffers != nullptr) {
+      Require(test.name, "dispatch",
+              resource_buffers == nullptr ||
+                  resource_buffers->size() == buffers->resources.size(),
+              "independent storage-buffer count does not match shader layout");
       buffer_infos.resize(buffers->resources.size());
       for (u32 i = 0; i < buffer_infos.size(); i++) {
         auto &info = buffer_infos[i];
-        info.buffer = buffer.buffer;
+        const auto &resource_buffer =
+            resource_buffers != nullptr ? resource_buffers->at(i) : buffer;
+        info.buffer = resource_buffer.buffer;
         info.offset = 0;
-        info.range = buffer.size;
+        info.range = resource_buffer.size;
         if (test.storage_buffer_range_dwords != 0) {
           const auto offset = i < test.storage_buffer_offsets.size()
                                   ? test.storage_buffer_offsets[i]
                                   : 0u;
           info.range = static_cast<vk::DeviceSize>(
               test.storage_buffer_range_dwords * sizeof(u32) + offset);
-          Require(test.name, "dispatch", info.range <= buffer.size,
+          Require(test.name, "dispatch", info.range <= resource_buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
       }
@@ -8832,13 +8843,24 @@ public:
       storage_infos.resize(storage != nullptr ? storage->resources.size() : 0u);
       storage_uint_infos.resize(
           storage_uint != nullptr ? storage_uint->resources.size() : 0u);
+      Require(test.name, "dispatch",
+              resource_storage_uint_images == nullptr ||
+                  resource_storage_uint_images->size() ==
+                      storage_uint_infos.size(),
+              "independent uint storage-image count does not match shader "
+              "layout");
       for (auto &info : storage_infos) {
         info.imageView = storage_image->view;
         info.imageLayout = storage_image->layout;
       }
-      for (auto &info : storage_uint_infos) {
-        info.imageView = storage_image_uint->view;
-        info.imageLayout = storage_image_uint->layout;
+      for (u32 i = 0; i < storage_uint_infos.size(); i++) {
+        auto &info = storage_uint_infos[i];
+        const auto &resource_image =
+            resource_storage_uint_images != nullptr
+                ? resource_storage_uint_images->at(i)
+                : *storage_image_uint;
+        info.imageView = resource_image.view;
+        info.imageLayout = resource_image.layout;
       }
       if (storage != nullptr) {
         vk::WriteDescriptorSet write{};
@@ -8899,19 +8921,28 @@ public:
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
     if (buffers != nullptr) {
-      vk::BufferMemoryBarrier barrier{};
-      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
-      barrier.srcAccessMask =
-          vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
-      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.buffer = buffer.buffer;
-      barrier.offset = 0;
-      barrier.size = buffer.size;
+      const auto barrier_count = resource_buffers != nullptr
+                                     ? resource_buffers->size()
+                                     : size_t{1};
+      std::vector<vk::BufferMemoryBarrier> barriers(barrier_count);
+      for (size_t i = 0; i < barrier_count; i++) {
+        const auto &resource_buffer =
+            resource_buffers != nullptr ? resource_buffers->at(i) : buffer;
+        auto &barrier = barriers[i];
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead |
+                                vk::AccessFlagBits::eShaderWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = resource_buffer.buffer;
+        barrier.offset = 0;
+        barrier.size = resource_buffer.size;
+      }
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
-                          &barrier, 0, nullptr);
+                          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+                          static_cast<u32>(barriers.size()), barriers.data(), 0,
+                          nullptr);
     }
     if (gds_buffer != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -10736,6 +10767,369 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyBuffer(&buffer);
   CompareWords(test, "readback", test.expected, actual);
   std::printf("[compute] %-32s ok\n", test.name);
+}
+
+std::filesystem::path FindBinkReplayFile(
+    const std::filesystem::path &directory, const std::string &prefix,
+    const std::string &extension = {}) {
+  if (!std::filesystem::is_directory(directory)) {
+    return {};
+  }
+  for (const auto &entry : std::filesystem::recursive_directory_iterator(
+           directory,
+           std::filesystem::directory_options::skip_permission_denied)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const auto name = entry.path().filename().string();
+    if (name.starts_with(prefix) &&
+        (extension.empty() || entry.path().extension() == extension)) {
+      return entry.path();
+    }
+  }
+  return {};
+}
+
+std::vector<uint8_t> ReadBinkReplayBytes(
+    const char *name, const std::filesystem::path &path) {
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  Require(name, "replay input", input.good(),
+          ("cannot open " + path.string()).c_str());
+  const auto size = input.tellg();
+  Require(name, "replay input", size >= 0,
+          ("cannot size " + path.string()).c_str());
+  std::vector<uint8_t> bytes(static_cast<size_t>(size));
+  input.seekg(0);
+  if (!bytes.empty()) {
+    input.read(reinterpret_cast<char *>(bytes.data()), size);
+  }
+  Require(name, "replay input", input.good(),
+          ("cannot read " + path.string()).c_str());
+  return bytes;
+}
+
+std::vector<u32> ReadBinkReplayDwords(
+    const char *name, const std::filesystem::path &path) {
+  const auto bytes = ReadBinkReplayBytes(name, path);
+  Require(name, "replay input", bytes.size() % sizeof(u32) == 0,
+          ("not dword-aligned: " + path.string()).c_str());
+  std::vector<u32> words(bytes.size() / sizeof(u32));
+  if (!bytes.empty()) {
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+  }
+  return words;
+}
+
+std::string ReadBinkReplayText(const char *name,
+                               const std::filesystem::path &path) {
+  const auto bytes = ReadBinkReplayBytes(name, path);
+  return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+}
+
+std::string BinkReplayLine(const char *name, const std::string &text,
+                           const std::string &marker) {
+  const auto begin = text.find(marker);
+  Require(name, "replay manifest", begin != std::string::npos,
+          ("missing manifest marker: " + marker).c_str());
+  const auto end = text.find_first_of("\r\n", begin);
+  return text.substr(begin, end == std::string::npos ? end : end - begin);
+}
+
+u32 BinkReplayCount(const char *name, const std::string &line,
+                    const std::string &marker) {
+  const auto begin = line.find(marker);
+  Require(name, "replay manifest", begin != std::string::npos,
+          ("missing count marker: " + marker).c_str());
+  return static_cast<u32>(
+      std::stoul(line.substr(begin + marker.size()), nullptr, 10));
+}
+
+std::vector<u32> BinkReplayTaggedWords(const char *name,
+                                       const std::string &line, char tag,
+                                       u32 count) {
+  std::vector<u32> words;
+  words.reserve(count);
+  for (u32 i = 0; i < count; i++) {
+    const auto marker = std::string(" ") + tag + std::to_string(i) + "=";
+    const auto begin = line.find(marker);
+    Require(name, "replay manifest", begin != std::string::npos,
+            ("missing word marker: " + marker).c_str());
+    words.push_back(static_cast<u32>(
+        std::stoul(line.substr(begin + marker.size()), nullptr, 16)));
+  }
+  return words;
+}
+
+ShaderRecompiler::IR::DescriptorValue BinkReplayDescriptor(
+    const char *name, const std::string &manifest, const std::string &marker,
+    u32 expected_dwords) {
+  const auto line = BinkReplayLine(name, manifest, marker);
+  const auto count = BinkReplayCount(name, line, "dword_count=");
+  Require(name, "replay manifest", count == expected_dwords,
+          ("unexpected descriptor width: " + marker).c_str());
+  const auto words = BinkReplayTaggedWords(name, line, 'd', count);
+  ShaderRecompiler::IR::DescriptorValue descriptor{};
+  descriptor.dword_count = count;
+  std::copy(words.begin(), words.end(), descriptor.dwords.begin());
+  return descriptor;
+}
+
+void RunBinkReplay(VulkanHarness *vulkan,
+                   const std::filesystem::path &bundle,
+                   const std::filesystem::path &raw_shader,
+                   const std::filesystem::path &output_path) {
+  constexpr const char *name = "BinkReplay";
+  const auto descriptor_path = FindBinkReplayFile(
+      bundle / "descriptors", "compute-resources-", ".txt");
+  Require(name, "replay input", !descriptor_path.empty(),
+          "captured descriptor manifest is missing");
+  const auto manifest = ReadBinkReplayText(name, descriptor_path);
+  const bool intra_kernel =
+      manifest.find("shader_hash=0000000208a63b00") != std::string::npos;
+  const bool chroma_kernel =
+      manifest.find("shader_hash=0000000208a67400") != std::string::npos;
+  const bool filter_kernel =
+      manifest.find("shader_hash=0000000208a68500") != std::string::npos;
+  Require(name, "replay manifest",
+          intra_kernel || chroma_kernel || filter_kernel ||
+              manifest.find("shader_hash=0000000208a64d00") !=
+                  std::string::npos,
+          "bundle is not a supported captured Bink kernel");
+  const bool reconstruction_kernel =
+      !intra_kernel && !chroma_kernel && !filter_kernel;
+  const u32 buffer_count =
+      reconstruction_kernel || filter_kernel ? 5u : 3u;
+  const u32 image_count =
+      reconstruction_kernel || filter_kernel ? 2u : 1u;
+  const uint64_t shader_hash =
+      intra_kernel    ? 0x0000000208a63b00ULL
+      : chroma_kernel ? 0x0000000208a67400ULL
+      : filter_kernel ? 0x0000000208a68500ULL
+                      : 0x0000000208a64d00ULL;
+  const u32 width = chroma_kernel || filter_kernel ? 1920u : 3840u;
+  const u32 height = chroma_kernel || filter_kernel ? 1080u : 2160u;
+  const u32 bytes_per_pixel = chroma_kernel || filter_kernel ? 2u : 1u;
+  const size_t pixel_bytes =
+      static_cast<size_t>(width) * height * bytes_per_pixel;
+
+  ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+  for (u32 i = 0; i < buffer_count; i++) {
+    snapshot.buffers.push_back(BinkReplayDescriptor(
+        name, manifest, "buffer[" + std::to_string(i) + "] ", 4));
+  }
+  for (u32 i = 0; i < image_count; i++) {
+    snapshot.images.push_back(BinkReplayDescriptor(
+        name, manifest, "image[" + std::to_string(i) + "] ", 8));
+  }
+  if (reconstruction_kernel) {
+    snapshot.samplers.push_back(
+        BinkReplayDescriptor(name, manifest, "sampler[0] ", 4));
+  }
+  const auto user_line = BinkReplayLine(name, manifest, "user_data count=");
+  snapshot.user_data = BinkReplayTaggedWords(
+      name, user_line, 'u', BinkReplayCount(name, user_line, "count="));
+  const auto srt_line =
+      BinkReplayLine(name, manifest, "flattened_srt count=");
+  snapshot.flattened_srt = BinkReplayTaggedWords(
+      name, srt_line, 's', BinkReplayCount(name, srt_line, "count="));
+
+  const auto code = ReadBinkReplayDwords(name, raw_shader);
+  const u32 expected_code_words = intra_kernel ? 1012u
+                                  : chroma_kernel ? 956u
+                                  : filter_kernel ? 1548u
+                                                  : 2416u;
+  Require(name, "replay input", code.size() == expected_code_words,
+          "Bink raw shader has the wrong word count");
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64;
+  compute.threads_num[1] = 1;
+  compute.threads_num[2] = 1;
+  compute.group_id[0] = true;
+  compute.group_id[1] = true;
+  compute.wave_size = 64;
+  compute.thread_ids_num = 1;
+  compute.workgroup_register = 4;
+  compute.lds_size_dwords = reconstruction_kernel ? 1152u
+                            : filter_kernel        ? 896u
+                                                   : 640u;
+
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Compute;
+  options.wave_size = 64;
+  options.lane_mask_mode =
+      std::getenv("KYTY_BINK_REPLAY_NATIVE") != nullptr
+          ? ShaderLaneMaskMode::NativeWave
+          : ShaderLaneMaskMode::PerInvocation;
+  options.user_data_count = static_cast<u32>(snapshot.user_data.size());
+  options.shader_hash = shader_hash;
+  options.shader_base = shader_hash;
+  options.dump_ir = std::getenv("KYTY_BINK_REPLAY_DUMP") != nullptr;
+  options.dump_label = name;
+  options.user_data = snapshot.user_data.data();
+  options.resource_snapshot = &snapshot;
+  options.input_info.compute = &compute;
+
+  ShaderRecompiler::CompileResult result;
+  std::string error;
+  Require(name, "recompile",
+          ShaderRecompiler::TryRecompile(code, options, result, &error), error);
+  if (options.dump_ir) {
+    const auto WriteText = [&](const std::filesystem::path &path,
+                               const std::string &text) {
+      std::ofstream dump(path, std::ios::binary | std::ios::trunc);
+      Require(name, "replay dump", dump.good(),
+              ("cannot create " + path.string()).c_str());
+      dump.write(text.data(), static_cast<std::streamsize>(text.size()));
+    };
+    WriteText(output_path.string() + ".decoded.txt", result.decoded_dump);
+    WriteText(output_path.string() + ".ir.txt", result.ir_dump);
+  }
+  ValidateSpirv(name, result.spirv);
+  std::vector<u32> packed_user_data;
+  for (const auto reg : result.program.bindings.user_data_registers) {
+    packed_user_data.push_back(
+        result.resources.user_data[reg - result.program.user_data_base]);
+  }
+  packed_user_data.resize(result.program.bindings.ShaderDataDwords());
+  CompiledShader compiled{std::move(result.spirv), std::move(result.program),
+                          std::move(result.resources.flattened_srt),
+                          std::move(packed_user_data)};
+
+  std::vector<VulkanHarness::Buffer> buffers;
+  buffers.reserve(buffer_count);
+  for (u32 i = 0; i < buffer_count; i++) {
+    const auto path =
+        FindBinkReplayFile(bundle, "buffer-" + std::to_string(i) + "-");
+    Require(name, "replay input", !path.empty(),
+            ("captured buffer " + std::to_string(i) + " is missing").c_str());
+    auto words = ReadBinkReplayDwords(name, path);
+    buffers.push_back(vulkan->CreateStorageBuffer(name, words, words.size()));
+  }
+
+  VulkanHarness::Image sampled{};
+  if (reconstruction_kernel) {
+    const auto source_path = FindBinkReplayFile(
+        bundle / "source-image", "compute-output-", ".raw");
+    Require(name, "replay input", !source_path.empty(),
+            "captured source image is missing");
+    const auto source_bytes = ReadBinkReplayBytes(name, source_path);
+    Require(name, "replay input", source_bytes.size() == pixel_bytes,
+            "captured source image has the wrong extent");
+    std::vector<u32> packed_source((source_bytes.size() + 3u) / 4u);
+    std::memcpy(packed_source.data(), source_bytes.data(), source_bytes.size());
+    sampled = vulkan->CreateImageMips(
+        name, width, height, vk::Format::eR8Uint,
+        vk::ImageUsageFlagBits::eSampled, {std::move(packed_source)}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+        vk::ImageViewType::e2D, 1);
+  }
+
+  const auto storage_format =
+      chroma_kernel || filter_kernel ? vk::Format::eR8G8Uint
+                                     : vk::Format::eR8Uint;
+  auto CreateStorage = [&](const std::filesystem::path &path) {
+    const auto pre_bytes = ReadBinkReplayBytes(name, path);
+    Require(name, "replay input", pre_bytes.size() == pixel_bytes,
+            "captured pre-storage image has the wrong extent");
+    std::vector<u32> packed_pre((pre_bytes.size() + 3u) / 4u);
+    std::memcpy(packed_pre.data(), pre_bytes.data(), pre_bytes.size());
+    return vulkan->CreateImage2D(
+        name, width, height, storage_format,
+        vk::ImageUsageFlagBits::eStorage, packed_pre, 1,
+        vk::ImageLayout::eGeneral);
+  };
+  const auto pre_path = FindBinkReplayFile(
+      bundle / "pre-storage-image", "compute-pre-storage-", ".raw");
+  Require(name, "replay input", !pre_path.empty(),
+          "captured pre-storage image is missing");
+  VulkanHarness::Image filter_sampled{};
+  VulkanHarness::Image storage{};
+  if (filter_kernel) {
+    const auto source_bundle =
+        bundle.parent_path() / "bink-old-685-r0-capture";
+    const auto source_pre_path = FindBinkReplayFile(
+        source_bundle / "pre-storage-image", "compute-pre-storage-", ".raw");
+    Require(name, "replay input", !source_pre_path.empty(),
+            "captured filter input image is missing");
+    const auto source_bytes = ReadBinkReplayBytes(name, source_pre_path);
+    Require(name, "replay input", source_bytes.size() == pixel_bytes,
+            "captured filter input image has the wrong extent");
+    std::vector<u32> packed_source((source_bytes.size() + 3u) / 4u);
+    std::memcpy(packed_source.data(), source_bytes.data(), source_bytes.size());
+    filter_sampled = vulkan->CreateImageMips(
+        name, width, height, storage_format,
+        vk::ImageUsageFlagBits::eSampled, {std::move(packed_source)}, 1,
+        vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+        vk::ImageViewType::e2D, 1);
+    storage = CreateStorage(pre_path);
+  } else {
+    storage = CreateStorage(pre_path);
+  }
+
+  const auto sampler =
+      reconstruction_kernel ? vulkan->CreateNearestSampler(name)
+                            : vk::Sampler{};
+  auto dummy = vulkan->CreateStorageBuffer(name, {}, 1);
+  TestCase dispatch{};
+  dispatch.name = name;
+  dispatch.dispatch_x = 120;
+  dispatch.dispatch_y = 68;
+  dispatch.dispatch_z = 1;
+  auto *const input_sampled = reconstruction_kernel ? &sampled
+                              : filter_kernel        ? &filter_sampled
+                                                     : nullptr;
+  auto *const output_storage = &storage;
+  vulkan->Dispatch(
+      dispatch, compiled, dummy, nullptr, input_sampled, output_storage,
+      output_storage, sampler, &buffers);
+
+  const auto output_words = vulkan->ReadImage(name, output_storage);
+  const auto output = std::span(
+      reinterpret_cast<const uint8_t *>(output_words.data()), pixel_bytes);
+  std::ofstream file(output_path, std::ios::binary | std::ios::trunc);
+  Require(name, "replay output", file.good(),
+          ("cannot create " + output_path.string()).c_str());
+  file.write(reinterpret_cast<const char *>(output.data()), output.size());
+  Require(name, "replay output", file.good(),
+          ("cannot write " + output_path.string()).c_str());
+
+  const auto expected_path = FindBinkReplayFile(
+      bundle / "post-storage-image", "compute-post-storage-", ".raw");
+  Require(name, "replay input", !expected_path.empty(),
+          "captured post-storage image is missing");
+  const auto expected = ReadBinkReplayBytes(name, expected_path);
+  Require(name, "replay input", expected.size() == output.size(),
+          "captured post-storage image has the wrong extent");
+  size_t mismatches = 0;
+  size_t first_mismatch = output.size();
+  for (size_t i = 0; i < output.size(); i++) {
+    if (output[i] != expected[i]) {
+      first_mismatch = std::min(first_mismatch, i);
+      mismatches++;
+    }
+  }
+
+  if (reconstruction_kernel) {
+    vulkan->Device().destroySampler(sampler, nullptr);
+    vulkan->DestroyImage(&sampled);
+  }
+  if (filter_kernel) {
+    vulkan->DestroyImage(&filter_sampled);
+  }
+  vulkan->DestroyImage(&storage);
+  vulkan->DestroyBuffer(&dummy);
+  for (auto &buffer : buffers) {
+    vulkan->DestroyBuffer(&buffer);
+  }
+
+  std::printf("[replay]  %-32s mode=%s mismatches=%zu first=%zu output=%s\n",
+              name,
+              options.lane_mask_mode == ShaderLaneMaskMode::PerInvocation
+                  ? "logical-wave64"
+                  : "native-wave",
+              mismatches, first_mismatch, output_path.string().c_str());
+  Require(name, "expected post image", mismatches == 0,
+          "fresh compiler output differs from the clean captured frame");
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
@@ -14597,6 +14991,47 @@ TestCase LogicalWave64BranchSeesUpperHostSubgroup() {
   return test;
 }
 
+TestCase LogicalWave64LdsSeesUpperHostSubgroup() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      // Each guest lane publishes lane+1 to LDS, then reads the lane in the
+      // other host subgroup32 half. A single PS5 Wave64 issues both DS
+      // instructions in lockstep, so every read must observe the prior write.
+      EncodeVop2(0x1a, 1, InlineU32(2), 0),
+      EncodeVop2(0x25, 2, InlineU32(1), 0),
+      EncodeDs0(0x0d, 0),
+      EncodeDs1(0, 2, 1),
+      EncodeVop2(0x1d, 3, InlineU32(32), 0),
+      EncodeVop2(0x1a, 1, InlineU32(2), 3),
+      EncodeDs0(0x36, 0),
+      EncodeDs1(4, 0, 1),
+  };
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LogicalWave64LdsUpperHalf";
+  test.code = std::move(code);
+  test.initial.resize(64);
+  test.expected.resize(64);
+  for (u32 lane = 0; lane < 64; lane++) {
+    test.expected[lane] = (lane ^ 32u) + 1u;
+  }
+  test.opcodes = {O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::DS_WRITE_B32,
+                  O::V_XOR_B32, O::DS_READ_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
+  test.required_spirv = {"BuiltIn LocalInvocationIndex", "OpControlBarrier"};
+  return test;
+}
+
 TestCase ScalarMemoryLoadVariants() {
   using O = ShaderOpcode;
 
@@ -16311,6 +16746,40 @@ TestCase DsReadWrite2Variants() {
            O::DS_READ2_B64, O::DS_WRITE2_B64, O::DS_WRITE2ST64_B32,
            O::DS_WRITE2ST64_B64, O::DS_READ2ST64_B64, O::BUFFER_STORE_DWORD,
            O::S_ENDPGM}};
+}
+
+TestCase DsWideReadSnapshotsOverlappingAddress() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 2, 0x11223344u);
+  AppendVMovLiteral(&code, 3, 0x55667788u);
+  code.push_back(EncodeDs0(0x4d, 0));
+  code.push_back(EncodeDs1(0, 2, 1));
+  code.push_back(EncodeDs0(0x76, 0));
+  code.push_back(EncodeDs1(1, 0, 1));
+
+  AppendVMovU32(&code, 4, 0);
+  AppendVMovLiteral(&code, 5, 0x99aabbccu);
+  AppendVMovLiteral(&code, 6, 0xddeeff00u);
+  code.push_back(EncodeDs0(0x0e, 1u << 8u));
+  code.push_back(EncodeDs1Ex(0, 6, 5, 4));
+  code.push_back(EncodeDs0(0x37, 1u << 8u));
+  code.push_back(EncodeDs1Ex(4, 0, 0, 4));
+
+  AppendStoreVgpr(&code, 1, 0);
+  AppendStoreVgpr(&code, 2, 1);
+  AppendStoreVgpr(&code, 4, 2);
+  AppendStoreVgpr(&code, 5, 3);
+  AppendEnd(&code);
+
+  return {"DsWideReadSnapshotsOverlappingAddress",
+          code,
+          std::vector<u32>(4, 0),
+          {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u},
+          {O::V_MOV_B32, O::DS_WRITE_B64, O::DS_READ_B64, O::DS_WRITE2_B32,
+           O::DS_READ2_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase DsAtomicNoReturnVariants() {
@@ -18223,6 +18692,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SimpleLoop);
   AddCase(BranchVccnzUsesWholeMask);
   AddCase(LogicalWave64BranchSeesUpperHostSubgroup);
+  AddCase(LogicalWave64LdsSeesUpperHostSubgroup);
   AddCase(BranchVccnzUsesCarryProducedWholeMask);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -18292,6 +18762,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsAppendUsesEncodedGdsSelector);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
+  AddCase(DsWideReadSnapshotsOverlappingAddress);
   AddCase(DsAtomicNoReturnVariants);
   AddCase(DsAtomicReturnVariants);
   AddCase(DsMiscVariants);
@@ -21598,9 +22069,25 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if ((argc == 4 || argc == 5) &&
+      std::strcmp(argv[1], "--bink-replay") == 0) {
+    const std::filesystem::path bundle = argv[2];
+    const std::filesystem::path output =
+        argc == 5 ? std::filesystem::path(argv[4])
+                  : bundle / "bink-replay-output.raw";
+    VulkanHarness vulkan;
+    RunBinkReplay(&vulkan, bundle, argv[3], output);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-wide-overlap-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsWideReadSnapshotsOverlappingAddress());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--logical-wave64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, LogicalWave64BranchSeesUpperHostSubgroup());
+    RunCase(&vulkan, LogicalWave64LdsSeesUpperHostSubgroup());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {

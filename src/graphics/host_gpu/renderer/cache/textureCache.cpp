@@ -1291,7 +1291,10 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
+		// Descriptor acquisition is not a guest write. Establish storage usage
+		// before refreshing the pre-dispatch contents, then promote the image only
+		// after the command that can actually write it has executed.
+		image.usage.storage = true;
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id, desc);
@@ -1303,7 +1306,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				if (!image.registered || image.depth_id) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
 				}
-				CommitGpuWrite(image);
 			}
 			TrackImageDownloadLocked(id, image);
 			break;

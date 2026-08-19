@@ -220,6 +220,8 @@ bool LowerDsRead2(const Decoder::Instruction& decoded, BasicBlock& block, uint32
 			inst.src_count = 1;
 			inst.memory =
 			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[read] + dword * 4u);
+			inst.memory.component_index = index;
+			inst.memory.component_count = 2u * dwords_per_read;
 			if (!LowerRegisterOperand(OffsetDecodedRegister(decoded.dst, index), inst.dst, error) ||
 			    !LowerSourceOperand(decoded.src0, inst.src[0], error)) {
 				return false;
@@ -461,6 +463,8 @@ bool LowerDsWrite2(const Decoder::Instruction& decoded, BasicBlock& block,
 			inst.src_count = 2;
 			inst.memory =
 			    ByteOffsetMemoryInfo(decoded, DsMemoryKind(decoded), offsets[write] + dword * 4u);
+			inst.memory.component_index = write * dwords_per_write + dword;
+			inst.memory.component_count = 2u * dwords_per_write;
 			inst.dst.kind = OperandKind::Null;
 			if (!LowerSourceOperand(OffsetDecodedRegister(*data[write], dword), inst.src[0],
 			                        error) ||

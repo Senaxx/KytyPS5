@@ -940,6 +940,30 @@ void RenderExecutor::RebindImages(CommandBuffer&                     buffer,
 	}
 }
 
+void RenderExecutor::MarkStorageImagesWritten(
+    const DescriptorCache::PreparedBindings& prepared) {
+	EXIT_IF(prepared.program == nullptr);
+	const auto& program = *prepared.program;
+	const auto& images  = prepared.resources.images;
+	EXIT_IF(images.size() != program.info.images.size());
+	auto& texture_cache = m_context.GetTextureCache();
+	std::vector<ImageId> committed;
+	for (uint32_t index = 0; index < program.info.images.size(); index++) {
+		const auto& resource = program.info.images[index];
+		const auto& binding  = images[index];
+		if (!resource.written || binding.desc.type != TextureCache::BindingType::Storage ||
+		    std::ranges::find(committed, binding.image_id) != committed.end()) {
+			continue;
+		}
+		const auto owner = texture_cache.ResolveOwner(binding.image_id);
+		if (owner == nullptr || owner->info.data.Empty()) {
+			continue;
+		}
+		texture_cache.MarkGpuWritten(binding.image_id);
+		committed.push_back(binding.image_id);
+	}
+}
+
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(CommandBuffer& buffer, const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {

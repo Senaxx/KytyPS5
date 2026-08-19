@@ -12,15 +12,17 @@ bool Translator::TranslateU64MaskOperation(const IR::Instruction& inst) {
 }
 
 bool Translator::TranslateInstruction(const IR::Instruction&          inst,
-                                      const BufferAddressValues*      address_snapshot,
-                                      const ScalarMemorySourceValues* scalar_source_snapshot) {
+                                       const BufferAddressValues*      address_snapshot,
+                                       const ScalarMemorySourceValues* scalar_source_snapshot,
+                                       const SharedAddressValues*      shared_address_snapshot) {
 	switch (IR::GetOpcodeInfo(inst.op).lowering_class) {
 		case IR::LoweringClass::Control: return TranslateControlOperation(inst);
 		case IR::LoweringClass::Move: return TranslateMove(inst);
 		case IR::LoweringClass::Lane: return TranslateLaneOperation(inst);
 		case IR::LoweringClass::State: return TranslateStateOperation(inst);
 		case IR::LoweringClass::Memory:
-			return TranslateMemoryOperation(inst, address_snapshot, scalar_source_snapshot);
+			return TranslateMemoryOperation(inst, address_snapshot, scalar_source_snapshot,
+			                                shared_address_snapshot);
 		case IR::LoweringClass::Attribute: return TranslateAttributeOperation(inst);
 		case IR::LoweringClass::IntegerCompare: return TranslateIntegerCompare(inst);
 		case IR::LoweringClass::Integer16Compare: return TranslateInteger16Compare(inst);

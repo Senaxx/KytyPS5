@@ -92,6 +92,49 @@ const IR::Block* TargetBlock(const IR::ValueProgram& program, uint32_t id) {
 	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
 }
 
+bool IsSharedMemoryOpcode(IR::ValueOpcode opcode) {
+	switch (opcode) {
+		case IR::ValueOpcode::LoadSharedU8:
+		case IR::ValueOpcode::LoadSharedU16:
+		case IR::ValueOpcode::LoadSharedU32:
+		case IR::ValueOpcode::WriteSharedU8:
+		case IR::ValueOpcode::WriteSharedU16:
+		case IR::ValueOpcode::WriteSharedU32:
+		case IR::ValueOpcode::SharedAtomicFMin32:
+		case IR::ValueOpcode::SharedAtomicFMax32:
+		case IR::ValueOpcode::SharedAtomicSwap32:
+		case IR::ValueOpcode::SharedAtomicIAdd32:
+		case IR::ValueOpcode::SharedAtomicISub32:
+		case IR::ValueOpcode::SharedAtomicSMin32:
+		case IR::ValueOpcode::SharedAtomicUMin32:
+		case IR::ValueOpcode::SharedAtomicSMax32:
+		case IR::ValueOpcode::SharedAtomicUMax32:
+		case IR::ValueOpcode::SharedAtomicAnd32:
+		case IR::ValueOpcode::SharedAtomicOr32:
+		case IR::ValueOpcode::SharedAtomicXor32: return true;
+		default: return false;
+	}
+}
+
+void EmitLogicalWaveSharedPhaseBarrier(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (!ctx.state.logical_single_wave_workgroup || !IsSharedMemoryOpcode(inst.GetOpcode())) {
+		return;
+	}
+	const auto& memory = ctx.Memory(inst);
+	if (memory.kind != IR::ResourceKind::Lds ||
+	    (memory.component_count > 1u && memory.component_index != 0u)) {
+		return;
+	}
+	// One PS5 Wave64 issues each LDS instruction as a lockstep phase. When it is
+	// represented by two independently scheduled host subgroup32 waves, both
+	// halves must rendezvous before reads and writes. Otherwise one half can
+	// observe the previous phase while the other is still publishing it.
+	const auto scope     = ConstantU32(ctx.state, ScopeWorkgroup);
+	const auto semantics = ConstantU32(
+	    ctx.state, MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory);
+	ctx.state.builder.AddFunction({OpControlBarrier, scope, scope, semantics});
+}
+
 uint32_t EmitLogicalBranchCondition(ValueEmitContext& ctx, const IR::ValueBlockInfo& info) {
 	auto condition = ctx.Def(info.condition);
 	if (!ctx.state.logical_single_wave_workgroup) {
@@ -258,6 +301,7 @@ bool EmitInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    {OpLoad, ctx.TypeId(inst.GetType()), ctx.Result(inst), ctx.phi_variables.at(&inst)});
 		return finish();
 	}
+	EmitLogicalWaveSharedPhaseBarrier(ctx, inst);
 	if (EmitValueFlow(ctx, inst) || EmitValueAlu(ctx, inst) || EmitValueMemory(ctx, inst) ||
 	    EmitValueImage(ctx, inst)) {
 		return finish();
