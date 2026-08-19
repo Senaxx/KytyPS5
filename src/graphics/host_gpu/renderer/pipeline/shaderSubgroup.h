@@ -10,6 +10,7 @@ enum class ShaderSubgroupMode {
 	Natural,
 	Controlled,
 	PerInvocationGraphics,
+	LogicalSingleWaveWorkgroup,
 	FlattenedMasks,
 	Unsupported
 };
@@ -31,9 +32,14 @@ struct ShaderSubgroupCapabilities {
 
 ShaderLaneMaskMode SelectGraphicsLaneMaskMode(uint32_t guest_wave_size);
 
+ShaderLaneMaskMode SelectComputeProgramLaneMaskMode(
+    const ShaderSubgroupCapabilities& capabilities, uint32_t local_threads,
+    const ShaderRecompiler::IR::Program& native_program);
+
 ShaderSubgroupConfiguration ConfigureShaderSubgroup(const ShaderSubgroupCapabilities& capabilities,
                                                     vk::ShaderStageFlagBits           stage,
-                                                    const ShaderRecompiler::IR::Program& program);
+                                                    const ShaderRecompiler::IR::Program& program,
+                                                    uint32_t local_threads = 0);
 
 } // namespace Libs::Graphics
 

@@ -63,6 +63,13 @@ void CopyProgramInputsAndOutputs(EmitterState& state, const IR::Program& program
 		    {input.kind, input.location, input.component_count, 0, input.debug_name,
 		     input.per_vertex});
 	}
+	if (state.logical_single_wave_workgroup &&
+	    std::none_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
+		    return input.kind == IR::StageInputKind::LocalInvocationIndex;
+	    })) {
+		state.inputs.push_back(
+		    {IR::StageInputKind::LocalInvocationIndex, 0, 1, 0, "logical_wave_lane"});
+	}
 	for (const auto& output: program.info.outputs) {
 		if (HasOutput(state.outputs, output.kind, output.index)) {
 			continue;

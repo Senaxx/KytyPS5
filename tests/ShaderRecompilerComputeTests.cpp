@@ -851,6 +851,7 @@ struct TestCase {
     info.lds_size_dwords = 1024;
     return info;
   }();
+  ShaderLaneMaskMode lane_mask_mode = ShaderLaneMaskMode::NativeWave;
   bool has_compute_info = false;
   u32 dispatch_x = 1;
   u32 dispatch_y = 1;
@@ -1064,6 +1065,7 @@ CompiledShader CompileCase(const TestCase &test) {
   }
   ShaderRecompiler::CompileOptions options;
   options.stage = ShaderType::Compute;
+  options.lane_mask_mode = test.lane_mask_mode;
   options.dump_ir = true;
   options.input_info.compute = &test.compute_info;
   options.user_data = user_data.data();
@@ -14564,6 +14566,37 @@ TestCase BranchVccnzUsesWholeMask() {
   return test;
 }
 
+TestCase LogicalWave64BranchSeesUpperHostSubgroup() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeVopc(0xc2, InlineU32(63), 0),
+      EncodeSopp(0x07, 2),
+      EncodeVop1(0x01, 2, InlineU32(11)),
+      EncodeSopp(0x02, 1),
+      EncodeVop1(0x01, 2, InlineU32(42)),
+  };
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "LogicalWave64BranchUpperHalf";
+  test.code = std::move(code);
+  test.expected = {42};
+  test.opcodes = {O::V_CMP_EQ_U32, O::S_CBRANCH_VCCNZ, O::V_MOV_B32,
+                  O::S_BRANCH, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.lane_mask_mode = ShaderLaneMaskMode::PerInvocation;
+  test.required_spirv = {"BuiltIn LocalInvocationIndex", "OpControlBarrier"};
+  test.forbidden_spirv = {"BuiltIn SubgroupLocalInvocationId"};
+  return test;
+}
+
 TestCase ScalarMemoryLoadVariants() {
   using O = ShaderOpcode;
 
@@ -18189,6 +18222,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
   AddCase(BranchVccnzUsesWholeMask);
+  AddCase(LogicalWave64BranchSeesUpperHostSubgroup);
   AddCase(BranchVccnzUsesCarryProducedWholeMask);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -21564,6 +21598,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--logical-wave64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, LogicalWave64BranchSeesUpperHostSubgroup());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--clip-control-only") == 0) {
     CheckClipControlDepthClipState();
     return 0;

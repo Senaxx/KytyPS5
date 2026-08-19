@@ -92,6 +92,37 @@ const IR::Block* TargetBlock(const IR::ValueProgram& program, uint32_t id) {
 	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
 }
 
+uint32_t EmitLogicalBranchCondition(ValueEmitContext& ctx, const IR::ValueBlockInfo& info) {
+	auto condition = ctx.Def(info.condition);
+	if (!ctx.state.logical_single_wave_workgroup) {
+		return condition;
+	}
+
+	const auto kind = info.terminator.condition;
+	const bool zero = kind == CFG::BranchCondition::SccZero ||
+	                  kind == CFG::BranchCondition::VccZero ||
+	                  kind == CFG::BranchCondition::ExecZero;
+	const bool mask_summary = zero || kind == CFG::BranchCondition::SccNonZero ||
+	                          kind == CFG::BranchCondition::VccNonZero ||
+	                          kind == CFG::BranchCondition::ExecNonZero;
+	if (!mask_summary) {
+		return condition;
+	}
+	if (zero) {
+		const auto inverted = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(
+		    {OpLogicalNot, ctx.state.bool_type, inverted, condition});
+		condition = inverted;
+	}
+	condition = EmitLogicalWaveAnyBool(ctx.state, condition);
+	if (!zero) {
+		return condition;
+	}
+	const auto inverted = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction({OpLogicalNot, ctx.state.bool_type, inverted, condition});
+	return inverted;
+}
+
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	ctx.state.builder.AddFunction({OpReturn});
@@ -138,7 +169,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			}
 			StorePhiEdge(ctx, block, true_block);
 			StorePhiEdge(ctx, block, false_block);
-			const auto condition = ctx.Def(info.condition);
+			const auto condition = EmitLogicalBranchCondition(ctx, info);
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
@@ -169,7 +200,7 @@ void EmitDispatcherTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			EmitDispatcherTarget(ctx, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction({OpSelect, ctx.state.uint_type, selected,
-			                               ctx.Def(info.condition),
+			                               EmitLogicalBranchCondition(ctx, info),
 			                               ConstantU32(ctx.state, term.true_block),
 			                               ConstantU32(ctx.state, term.false_block)});
 			ctx.state.builder.AddFunction({OpStore, ctx.state.dispatch_pc_variable, selected});

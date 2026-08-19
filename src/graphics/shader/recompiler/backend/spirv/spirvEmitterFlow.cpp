@@ -498,7 +498,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitWqm(ctx, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
+			ctx.Define(inst, EmitGuestLaneIndex(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
 			if (state.per_invocation_masks) {

@@ -777,7 +777,9 @@ void EmitHeaderAndTypes(EmitterState& state) {
 	if (state.stage == ShaderType::Compute || state.needs_function_lds) {
 		const auto storage_class =
 		    state.needs_function_lds ? StorageClassFunction : StorageClassWorkgroup;
-		const auto lds_dwords = std::max(LdsDwordCount(state), 1u);
+		const auto lds_dwords = std::max(LdsDwordCount(state) +
+		                                     (state.logical_single_wave_workgroup ? 65u : 0u),
+		                                 1u);
 		const auto lds_size   = ConstantU32(state, lds_dwords);
 		state.builder.AddType({OpTypeArray, state.lds_array_type, state.uint_type, lds_size});
 		state.builder.AddType(

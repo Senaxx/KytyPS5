@@ -10,6 +10,7 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 IR::SpirvRequirements GetProgramRequirements(const IR::Program& program);
+bool ProgramSupportsLogicalSingleWaveWorkgroup(const IR::Program& program);
 
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
                  ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv, std::string* error);

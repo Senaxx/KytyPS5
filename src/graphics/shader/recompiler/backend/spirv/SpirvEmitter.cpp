@@ -381,6 +381,35 @@ IR::SpirvRequirements GetProgramRequirements(const IR::Program& program) {
 	return requirements;
 }
 
+bool ProgramSupportsLogicalSingleWaveWorkgroup(const IR::Program& program) {
+	if (program.stage != ShaderType::Compute || program.wave_size != 64u ||
+	    program.lane_mask_mode != ShaderLaneMaskMode::PerInvocation || program.values == nullptr) {
+		return false;
+	}
+	for (const auto* block: program.values->blocks) {
+		for (const auto& inst: *block) {
+			switch (inst.GetOpcode()) {
+				// These require cross-subgroup shuffles or ordered wave primitives that
+				// the logical workgroup path does not emulate yet.
+				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::DppUpdateU32:
+				case IR::ValueOpcode::WqmMask:
+				case IR::ValueOpcode::ReadFirstLane:
+				case IR::ValueOpcode::ReadLane:
+				case IR::ValueOpcode::WriteLane:
+				case IR::ValueOpcode::Permlane16U32:
+				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::DataAppend:
+				case IR::ValueOpcode::DataConsume:
+				case IR::ValueOpcode::GdsDataAppend:
+				case IR::ValueOpcode::GdsDataConsume: return false;
+				default: break;
+			}
+		}
+	}
+	return true;
+}
+
 bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resources,
                  ShaderStageInputInfo input_info, std::vector<uint32_t>& spirv,
                  std::string* error) {
@@ -418,6 +447,22 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.stage                = program.stage;
 	state.wave_size            = program.wave_size;
 	state.per_invocation_masks = program.lane_mask_mode == ShaderLaneMaskMode::PerInvocation;
+	if (state.stage == ShaderType::Compute && state.per_invocation_masks) {
+		const auto* cs = input_info.compute;
+		const auto local_threads = cs != nullptr ? std::max(cs->threads_num[0], 1u) *
+		                                                  std::max(cs->threads_num[1], 1u) *
+		                                                  std::max(cs->threads_num[2], 1u)
+		                                        : 0u;
+		const auto logical_wave_candidate = local_threads == 64u && program.wave_size == 64u;
+		if (logical_wave_candidate && !ProgramSupportsLogicalSingleWaveWorkgroup(program)) {
+			SetError(error, "per-invocation compute requires a supported 64-lane logical workgroup");
+			return false;
+		}
+		state.logical_single_wave_workgroup = logical_wave_candidate;
+		if (state.logical_single_wave_workgroup) {
+			state.logical_wave_scratch_base = cs->lds_size_dwords;
+		}
+	}
 	state.exact_subgroup_operations =
 	    !state.per_invocation_masks && requirements.requires_exact_subgroup;
 	state.registers.reserve(InitialEmitterVectorReserve);

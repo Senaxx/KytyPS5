@@ -334,6 +334,8 @@ struct EmitterState {
 	uint32_t                                         wave_size = 64;
 	bool                                             exact_subgroup_operations    = false;
 	bool                                             per_invocation_masks         = false;
+	bool                                             logical_single_wave_workgroup = false;
+	uint32_t                                         logical_wave_scratch_base     = 0;
 	uint32_t                                         void_type                    = 0;
 	uint32_t                                         bool_type                    = 0;
 	uint32_t                                         uint_type                    = 0;
@@ -645,6 +647,8 @@ uint32_t PointerForRegister(const EmitterState& state, IR::Register reg);
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+uint32_t EmitGuestLaneIndex(EmitterState& state);
+uint32_t EmitLogicalWaveAnyBool(EmitterState& state, uint32_t value_bool);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

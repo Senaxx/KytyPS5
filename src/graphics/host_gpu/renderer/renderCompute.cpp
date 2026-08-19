@@ -34,8 +34,32 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
+namespace {
+
+bool RequiresBinkWave64Compatibility(const HW::ComputeShaderInfo& regs) {
+	// SDK 10's ShShaderResource1Cs does not expose a public GFX10 W32_EN bit.
+	// Preserve the captured Wave64 ABI only for these relocation-safe Bink kernel
+	// identities. Wave32 replay diverges with otherwise identical resources.
+	if (regs.cs_regs.wave_size != 32u || regs.cs_regs.num_thread_x != 64u ||
+	    regs.cs_regs.num_thread_y != 1u || regs.cs_regs.num_thread_z != 1u) {
+		return false;
+	}
+	std::vector<uint32_t> code;
+	if (!ShaderCopyMappedCode(regs.cs_regs.data_addr, code)) {
+		return false;
+	}
+	const auto identity = XXH3_64bits(code.data(), code.size() * sizeof(uint32_t));
+	return (code.size() == 2416u && identity == 0x009d07c027d68a8fULL) ||
+	       (code.size() == 1548u && identity == 0x6339eb0500161b48ULL) ||
+	       (code.size() == 1012u && identity == 0x0b24b686264ed132ULL) ||
+	       (code.size() == 956u && identity == 0x23ba03477d6d648eULL);
+}
+
+} // namespace
+
 static uint64_t BufferDescriptorSize(const ShaderBufferResource& descriptor) {
 	const uint64_t records = descriptor.NumRecords();
 	const uint64_t stride  = descriptor.Stride();
@@ -208,12 +232,32 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 
 	const auto& cs_regs = sh_ctx.GetCs();
 	const auto& sh_regs = ctx.GetShaderRegisters();
+	auto        effective_cs_regs = cs_regs;
+	if (RequiresBinkWave64Compatibility(cs_regs)) {
+		effective_cs_regs.cs_regs.wave_size = 64u;
+	}
 
 	ShaderComputeInputInfo    input_info {};
 	std::span<const uint32_t> cs_shader;
-	if (!ShaderCompileInfoCS(cs_regs, sh_regs, input_info, cs_shader)) {
+	if (!ShaderCompileInfoCS(effective_cs_regs, sh_regs, input_info, cs_shader)) {
 		EXIT("ShaderCompileInfoCS failed for dispatch with CS shader 0x%016" PRIx64 "\n",
 		     cs_regs.cs_regs.data_addr);
+	}
+
+	const uint32_t local_threads = std::max(input_info.threads_num[0], 1u) *
+	                               std::max(input_info.threads_num[1], 1u) *
+	                               std::max(input_info.threads_num[2], 1u);
+	const auto lane_mask_mode = SelectComputeProgramLaneMaskMode(
+	    ShaderSubgroupCapabilities {m_context.GetGraphics()}, local_threads,
+	    *input_info.stage.program);
+	if (lane_mask_mode == ShaderLaneMaskMode::PerInvocation) {
+		ShaderComputeInputInfo logical_info {};
+		if (!ShaderCompileInfoCS(effective_cs_regs, sh_regs, logical_info, cs_shader,
+		                         lane_mask_mode)) {
+			EXIT("ShaderCompileInfoCS logical wave64 failed for CS shader 0x%016" PRIx64 "\n",
+			     cs_regs.cs_regs.data_addr);
+		}
+		input_info = std::move(logical_info);
 	}
 
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
@@ -333,7 +377,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, RenderCommandBuffer& buf
 
 	buffer.EndRendering();
 	auto& pipeline =
-	    m_context.GetPipelineCache().CreateComputePipeline(input_info, sh_ctx.GetCs(), cs_shader);
+	    m_context.GetPipelineCache().CreateComputePipeline(input_info, effective_cs_regs, cs_shader);
 	auto bindings = PrepareBindings(buffer, input_info.stage, vk::ShaderStageFlagBits::eCompute,
 	                                DescriptorCache::Stage::Compute);
 	RebindBuffers(buffer, bindings);
