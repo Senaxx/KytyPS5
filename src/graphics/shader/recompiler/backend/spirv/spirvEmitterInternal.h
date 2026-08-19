@@ -337,6 +337,8 @@ struct EmitterState {
 	ShaderType                                       stage                   = ShaderType::Unknown;
 	uint32_t                                         wave_size               = 64;
 	bool                                             per_invocation_masks    = false;
+	bool                                             logical_single_wave_workgroup = false;
+	uint32_t                                         logical_wave_scratch_base     = 0;
 	uint32_t                                         storage_buffer_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers + IR::ShaderInfo::MaxAddresses>
 	                                                 memory_byte_offsets {};
@@ -596,6 +598,8 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+uint32_t EmitGuestLaneIndex(EmitterState& state);
+uint32_t EmitLogicalWaveAnyBool(EmitterState& state, uint32_t value_bool);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

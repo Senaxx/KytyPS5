@@ -190,6 +190,19 @@ static bool ShaderGetMappedData(uint64_t addr, ShaderMappedData& data) {
 	return false;
 }
 
+bool ShaderCopyMappedCode(uint64_t addr, std::vector<uint32_t>& code) {
+	code.clear();
+	ShaderMappedData data;
+	if (!ShaderGetMappedData(addr, data) || data.code_size_bytes == 0 ||
+	    data.code_size_bytes % sizeof(uint32_t) != 0) {
+		return false;
+	}
+	const auto words   = data.code_size_bytes / sizeof(uint32_t);
+	const auto* source = reinterpret_cast<const uint32_t*>(addr);
+	code.assign(source, source + words);
+	return true;
+}
+
 static bool SpirvDisassemble(const uint32_t* src_binary, size_t src_binary_size,
                              std::string* dst_disassembly) {
 	if (dst_disassembly != nullptr) {
@@ -1214,14 +1227,15 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
 }
 
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& info, std::span<const uint32_t>& spirv) {
+	                     ShaderComputeInputInfo& info, std::span<const uint32_t>& spirv,
+	                     ShaderLaneMaskMode lane_mask_mode) {
 	spirv = {};
 
 	ShaderGetStaticInputInfoCS(regs, sh, info);
 	const auto shader_hash = regs.cs_regs.data_addr;
 	const auto program_id  = ShaderGetIdCS(regs, info, false);
 	const auto key         = MakeShaderStageProgramKey(ShaderType::Compute, shader_hash, program_id,
-	                                                   ShaderLaneMaskMode::NativeWave);
+	                                                   lane_mask_mode);
 
 	{
 		std::scoped_lock lock(g_shader_program_cache_mutex);
@@ -1238,7 +1252,7 @@ bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegi
 	}
 
 	std::vector<uint32_t> compiled_spirv;
-	if (!ShaderCompileSpirvCS(regs, sh, info, compiled_spirv)) {
+	if (!ShaderCompileSpirvCS(regs, sh, lane_mask_mode, info, compiled_spirv)) {
 		return false;
 	}
 
@@ -1560,7 +1574,8 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 }
 
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                          ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv) {
+	                      ShaderLaneMaskMode lane_mask_mode,
+	                      ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv) {
 	KYTY_PROFILER_FUNCTION(profiler::colors::CyanA700);
 
 	const uint64_t shader_addr = regs.cs_regs.data_addr;
@@ -1578,6 +1593,7 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 	options.push_constant_offset       = 0;
 	options.input_info.compute         = &input_info;
 	options.wave_size                  = input_info.wave_size;
+	options.lane_mask_mode             = lane_mask_mode;
 	options.dump_ir                    = ShaderRecompilerTextDumpEnabled();
 	options.early_dump                 = options.dump_ir;
 	options.dump_label                 = "ShaderRecompiler CS";

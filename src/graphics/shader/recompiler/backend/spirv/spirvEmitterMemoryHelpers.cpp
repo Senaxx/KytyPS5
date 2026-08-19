@@ -67,6 +67,10 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return state.stage == ShaderType::Compute ? state.input_info.compute->lds_size_dwords : 8192u;
 }
 
+static uint32_t LdsStorageDwordCount(const EmitterState& state) {
+	return LdsDwordCount(state) + (state.logical_single_wave_workgroup ? 65u : 0u);
+}
+
 static void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
@@ -75,7 +79,7 @@ static void EnsureLdsStorage(EmitterState& state) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
 	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsDwordCount(state)),
+	    TypeU32ArrayPointer(state, StorageClassWorkgroup, LdsStorageDwordCount(state)),
 	    StorageClassWorkgroup);
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }

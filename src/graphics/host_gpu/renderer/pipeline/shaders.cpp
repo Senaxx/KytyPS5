@@ -418,9 +418,11 @@ static void CreateLayout(DescriptorCache&                   descriptor_cache,
 static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStageFlagBits vk_stage,
                                   const ShaderRecompiler::IR::Program&                   program,
                                   vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo& required,
-                                  vk::PipelineShaderStageCreateInfo&                     stage) {
+                                  vk::PipelineShaderStageCreateInfo&                     stage,
+                                  uint32_t local_threads = 0) {
 	const auto config =
-	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program);
+	    ConfigureShaderSubgroup(ShaderSubgroupCapabilities {graphics}, vk_stage, program,
+	                            local_threads);
 	switch (config.mode) {
 		case ShaderSubgroupMode::Natural: return;
 		case ShaderSubgroupMode::PerInvocationGraphics: {
@@ -432,6 +434,7 @@ static void ConfigureSubgroupSize(const GraphicContext& graphics, vk::ShaderStag
 			}
 			return;
 		}
+		case ShaderSubgroupMode::LogicalSingleWaveWorkgroup: return;
 		case ShaderSubgroupMode::FlattenedMasks: {
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
@@ -1075,7 +1078,10 @@ void CreatePipelineInternal(GraphicContext& graphics, DescriptorCache& descripto
 	comp_shader_stage_info.pSpecializationInfo = nullptr;
 	EXIT_IF(!input_info.stage);
 	ConfigureSubgroupSize(graphics, vk::ShaderStageFlagBits::eCompute, *input_info.stage.program,
-	                      comp_subgroup_size, comp_shader_stage_info);
+	                      comp_subgroup_size, comp_shader_stage_info,
+	                      std::max(input_info.threads_num[0], 1u) *
+	                          std::max(input_info.threads_num[1], 1u) *
+	                          std::max(input_info.threads_num[2], 1u));
 
 	vk::DescriptorSetLayout set_layouts[1]  = {};
 	uint32_t                set_layouts_num = 0;

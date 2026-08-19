@@ -123,6 +123,64 @@ uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
 	return value;
 }
 
+uint32_t EmitGuestLaneIndex(EmitterState& state) {
+	return state.logical_single_wave_workgroup ? EmitLocalInvocationIndex(state)
+	                                           : EmitSubgroupLocalInvocationId(state);
+}
+
+uint32_t EmitLogicalWaveAnyBool(EmitterState& state, uint32_t value_bool) {
+	if (!state.logical_single_wave_workgroup) {
+		return value_bool;
+	}
+
+	// A guest wave64 spans two subgroup32 waves on NVIDIA. Publish one Boolean per
+	// guest lane in private LDS scratch and reduce all 64 values at a workgroup barrier.
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	const auto lane      = EmitLocalInvocationIndex(state);
+	const auto own_index = state.builder.AllocateId();
+	state.builder.AddFunction({OpIAdd, TypeU32(state), own_index,
+	                           ConstantU32(state, state.logical_wave_scratch_base), lane});
+	const auto own_ptr = EmitLdsElementPointer(state, own_index);
+	const auto word    = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelect, TypeU32(state), word, value_bool,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+	state.builder.AddFunction({OpStore, own_ptr, word});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, semantics)});
+
+	const auto lane_zero = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpIEqual, TypeBool(state), lane_zero, lane, ConstantU32(state, 0)});
+	const auto summary_index = ConstantU32(state, state.logical_wave_scratch_base + 64u);
+	const auto summary_ptr   = EmitLdsElementPointer(state, summary_index);
+	EmitIfCondition(state, lane_zero, [&]() {
+		uint32_t aggregate = ConstantU32(state, 0);
+		for (uint32_t source_lane = 0; source_lane < 64u; source_lane++) {
+			const auto source_index =
+			    ConstantU32(state, state.logical_wave_scratch_base + source_lane);
+			const auto source_ptr = EmitLdsElementPointer(state, source_index);
+			const auto source     = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, TypeU32(state), source, source_ptr});
+			const auto combined = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpBitwiseOr, TypeU32(state), combined, aggregate, source});
+			aggregate = combined;
+		}
+		state.builder.AddFunction({OpStore, summary_ptr, aggregate});
+	});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, semantics)});
+
+	const auto summary = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), summary, summary_ptr});
+	const auto active = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), active, summary, ConstantU32(state, 0)});
+	return active;
+}
+
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
 	for (const auto& input: state.inputs) {
 		if (input.kind == kind) {

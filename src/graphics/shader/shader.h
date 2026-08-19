@@ -249,6 +249,7 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+bool ShaderCopyMappedCode(uint64_t addr, std::vector<uint32_t>& code);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
@@ -268,7 +269,8 @@ bool ShaderCompileInfoPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegist
                          std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
                          ShaderPixelInputInfo& input_info, std::span<const uint32_t>& spirv);
 bool ShaderCompileInfoCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
-                         ShaderComputeInputInfo& input_info, std::span<const uint32_t>& spirv);
+                         ShaderComputeInputInfo& input_info, std::span<const uint32_t>& spirv,
+                         ShaderLaneMaskMode lane_mask_mode = ShaderLaneMaskMode::NativeWave);
 bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegisters& sh,
                           ShaderLaneMaskMode lane_mask_mode, ShaderVertexInputInfo& input_info,
                           std::vector<uint32_t>& spirv);
@@ -276,6 +278,7 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
                           ShaderLaneMaskMode lane_mask_mode, ShaderPixelInputInfo& input_info,
                           std::vector<uint32_t>& spirv);
 bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+                          ShaderLaneMaskMode lane_mask_mode,
                           ShaderComputeInputInfo& input_info, std::vector<uint32_t>& spirv);
 bool ShaderAddressValid(uint64_t addr);
 

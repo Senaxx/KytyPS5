@@ -196,13 +196,14 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan,
 		return EmitVertexParameterComponentU32(state, *input, chan & 3u);
 	}
 	if (input->per_vertex) {
-		auto LoadVertexComponent = [&](uint32_t vertex) {
-			const auto pointer = state.builder.AllocateId();
-			const auto value   = state.builder.AllocateId();
-			state.builder.AddFunction(
-			    {OpAccessChain, state.ptr_input_float, pointer, input->variable_id,
-			     ConstantU32(state, vertex), ConstantU32(state, chan & 3u)});
-			state.builder.AddFunction({OpLoad, state.float_type, value, pointer});
+			auto LoadVertexComponent = [&](uint32_t vertex) {
+				const auto pointer = state.builder.AllocateId();
+				const auto value   = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpAccessChain, TypePointer(state, StorageClassInput, TypeF32(state)), pointer,
+				     input->variable_id,
+				     ConstantU32(state, vertex), ConstantU32(state, chan & 3u)});
+				state.builder.AddFunction({OpLoad, TypeF32(state), value, pointer});
 			return value;
 		};
 
@@ -214,25 +215,25 @@ uint32_t EmitAttribute(ValueEmitContext& ctx, uint32_t attr, uint32_t chan,
 			                               ? state.bary_coord_no_persp_variable
 			                               : state.bary_coord_variable;
 			const auto bary = state.builder.AllocateId();
-			state.builder.AddFunction({OpLoad, state.vec3_float_type, bary, bary_variable});
+			state.builder.AddFunction({OpLoad, TypeF32Vector(state, 3), bary, bary_variable});
 			for (uint32_t vertex = 0; vertex < 3; vertex++) {
 				const auto weight = state.builder.AllocateId();
 				const auto term   = state.builder.AllocateId();
 				state.builder.AddFunction(
-				    {OpCompositeExtract, state.float_type, weight, bary, vertex});
+				    {OpCompositeExtract, TypeF32(state), weight, bary, vertex});
 				state.builder.AddFunction(
-				    {OpFMul, state.float_type, term, LoadVertexComponent(vertex), weight});
+				    {OpFMul, TypeF32(state), term, LoadVertexComponent(vertex), weight});
 				if (vertex == 0) {
 					component = term;
 				} else {
 					const auto sum = state.builder.AllocateId();
-					state.builder.AddFunction({OpFAdd, state.float_type, sum, component, term});
+					state.builder.AddFunction({OpFAdd, TypeF32(state), sum, component, term});
 					component = sum;
 				}
 			}
 		}
 		const auto bits = state.builder.AllocateId();
-		state.builder.AddFunction({OpBitcast, state.uint_type, bits, component});
+		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, component});
 		return bits;
 	}
 	const auto vector    = state.builder.AllocateId();
@@ -475,7 +476,7 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Define(inst, EmitWqm(ctx, ctx.Arg(inst, 0)));
 			return true;
 		case IR::ValueOpcode::LaneId:
-			ctx.Define(inst, EmitSubgroupLocalInvocationId(state));
+			ctx.Define(inst, EmitGuestLaneIndex(state));
 			return true;
 		case IR::ValueOpcode::Ballot:
 			if (state.per_invocation_masks) {
