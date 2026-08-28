@@ -677,6 +677,17 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
+	if (const char* raw_path = std::getenv("KYTY_DEBUG_SHADER_WORD_COUNT_RAW_DUMP");
+	    raw_path != nullptr && raw_path[0] != '\0') {
+		const char* words_text = std::getenv("KYTY_DEBUG_SHADER_WORD_COUNT");
+		if (words_text != nullptr && words_text[0] != '\0' &&
+		    std::strtoull(words_text, nullptr, 0) == code.size()) {
+			if (auto* file = std::fopen(raw_path, "wb"); file != nullptr) {
+				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {
@@ -890,7 +901,34 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		return false;
 	}
 	IR::EliminateDeadCode(ir.values->blocks);
+	if (const char* dump_path = std::getenv("KYTY_DEBUG_SHADER_VALUE_IR_DUMP");
+	    dump_path != nullptr && dump_path[0] != '\0') {
+		const char* hash_text = std::getenv("KYTY_DEBUG_SHADER_VALUE_IR_HASH");
+		if (hash_text == nullptr || hash_text[0] == '\0' ||
+		    std::strtoull(hash_text, nullptr, 0) == options.shader_hash) {
+			if (auto* file = std::fopen(dump_path, "wb"); file != nullptr) {
+				const auto dump = IR::ValueProgramToString(*ir.values);
+				std::fwrite(dump.data(), 1, dump.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	if (!IR::TrackResources(ir, error)) {
+		if (const char* raw_path = std::getenv("KYTY_DEBUG_SHADER_FAILURE_RAW_DUMP");
+		    raw_path != nullptr && raw_path[0] != '\0') {
+			if (auto* file = std::fopen(raw_path, "wb"); file != nullptr) {
+				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+				std::fclose(file);
+			}
+		}
+		if (const char* dump_path = std::getenv("KYTY_DEBUG_SHADER_VALUE_IR_DUMP");
+		    dump_path != nullptr && dump_path[0] != '\0') {
+			if (auto* file = std::fopen(dump_path, "wb"); file != nullptr) {
+				const auto dump = IR::ValueProgramToString(*ir.values);
+				std::fwrite(dump.data(), 1, dump.size(), file);
+				std::fclose(file);
+			}
+		}
 		return false;
 	}
 	IR::EliminateDeadCode(ir.values->blocks);

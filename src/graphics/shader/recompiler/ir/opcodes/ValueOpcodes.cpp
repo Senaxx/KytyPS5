@@ -113,6 +113,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::GdsAtomicOr32:
 		case ValueOpcode::GdsAtomicXor32:
 		case ValueOpcode::BufferAtomicSwap32:
+		case ValueOpcode::BufferAtomicCompareSwap32:
 		case ValueOpcode::BufferAtomicIAdd32:
 		case ValueOpcode::BufferAtomicISub32:
 		case ValueOpcode::BufferAtomicSMin32:

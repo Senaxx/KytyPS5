@@ -186,6 +186,31 @@ bool LowerBufferAtomicDword(const Decoder::Instruction& decoded, BasicBlock& blo
 	return true;
 }
 
+bool LowerBufferAtomicCompareSwap(const Decoder::Instruction& decoded, BasicBlock& block,
+                                  std::string* error) {
+	if (decoded.idxen && decoded.offen) {
+		if (error != nullptr) {
+			*error = "buffer_atomic_cmpswap with both idxen and offen is not implemented";
+		}
+		return false;
+	}
+	Instruction inst;
+	inst.pc       = decoded.pc;
+	inst.op       = Opcode::AtomicCompareSwapU32;
+	inst.memory   = MemoryInfoFromDecoded(decoded, ResourceKind::Buffer);
+	inst.dst.kind = OperandKind::Null;
+	// The paired VDATA registers are {replacement, comparator}; GLC returns the
+	// observed value in the first register.
+	if ((decoded.glc && !LowerRegisterOperand(decoded.dst, inst.dst, error)) ||
+	    !LowerSourceOperand(decoded.dst, inst.src[0], error) ||
+	    !LowerSourceOperand(OffsetDecodedRegister(decoded.dst, 1), inst.src[1], error) ||
+	    !LowerBufferAddressSources(decoded, inst, 2, error)) {
+		return false;
+	}
+	block.instructions.push_back(inst);
+	return true;
+}
+
 ResourceKind DsMemoryKind(const Decoder::Instruction& decoded) {
 	return decoded.gds ? ResourceKind::Gds : ResourceKind::Lds;
 }
@@ -558,6 +583,8 @@ bool LowerMemoryInstruction(const Decoder::Instruction& decoded, BasicBlock& blo
 			return LowerBufferStore(decoded, block, error);
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicSwapU32, error);
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP:
+			return LowerBufferAtomicCompareSwap(decoded, block, error);
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 			return LowerBufferAtomicDword(decoded, block, Opcode::AtomicAddU32, error);
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
@@ -738,6 +765,7 @@ bool IsMemoryOpcode(Decoder::Opcode opcode) {
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZW:
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP:
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
 		case Decoder::Opcode::BUFFER_ATOMIC_SMIN:

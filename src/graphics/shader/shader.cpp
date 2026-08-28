@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fmt/format.h>
 #include <memory>
@@ -1473,8 +1474,37 @@ bool ShaderCompileSpirvVS(const HW::VertexShaderInfo& regs, const HW::ShaderRegi
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
+	if (std::getenv("KYTY_DEBUG_SHADER_COMPILE_ALL") != nullptr) {
+		std::printf("CompileShader begin VS hash=0x%016" PRIx64 " words=%zu\n",
+		            options.shader_hash, code.size());
+		std::fflush(stdout);
+	}
+	const bool trace_target = std::getenv("KYTY_DEBUG_SHADER_COMPILE_TRACE") != nullptr &&
+	                          options.shader_hash == 0x00000000ced82f22ull;
+	if (trace_target) {
+		std::printf("TargetShader begin VS hash=0x%016" PRIx64 " words=%zu\n",
+		            options.shader_hash, code.size());
+		std::fflush(stdout);
+		if (const char* dump_path = std::getenv("KYTY_DEBUG_SHADER_COMPILE_DUMP");
+		    dump_path != nullptr && dump_path[0] != '\0') {
+			if (auto* file = std::fopen(dump_path, "wb"); file != nullptr) {
+				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler VS", options.shader_hash, error.c_str());
+	}
+	if (std::getenv("KYTY_DEBUG_SHADER_COMPILE_ALL") != nullptr) {
+		std::printf("CompileShader end VS hash=0x%016" PRIx64 " spirv=%zu\n",
+		            options.shader_hash, result.spirv.size());
+		std::fflush(stdout);
+	}
+	if (trace_target) {
+		std::printf("TargetShader end VS hash=0x%016" PRIx64 " spirv=%zu images=%zu\n",
+		            options.shader_hash, result.spirv.size(), result.program.info.images.size());
+		std::fflush(stdout);
 	}
 	DumpShaderRecompilerOriginal("vs", options.shader_hash, code, result.decoded_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler VS", options.shader_hash, result.spirv)) {
@@ -1527,8 +1557,18 @@ bool ShaderCompileSpirvPS(const HW::PixelShaderInfo& regs, const HW::ShaderRegis
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
+	if (std::getenv("KYTY_DEBUG_SHADER_COMPILE_ALL") != nullptr) {
+		std::printf("CompileShader begin PS hash=0x%016" PRIx64 " words=%zu\n",
+		            options.shader_hash, code.size());
+		std::fflush(stdout);
+	}
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler PS", options.shader_hash, error.c_str());
+	}
+	if (std::getenv("KYTY_DEBUG_SHADER_COMPILE_ALL") != nullptr) {
+		std::printf("CompileShader end PS hash=0x%016" PRIx64 " spirv=%zu\n",
+		            options.shader_hash, result.spirv.size());
+		std::fflush(stdout);
 	}
 	DumpShaderRecompilerOriginal("ps", options.shader_hash, code, result.decoded_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler PS", options.shader_hash, result.spirv)) {
@@ -1580,8 +1620,37 @@ bool ShaderCompileSpirvCS(const HW::ComputeShaderInfo& regs, const HW::ShaderReg
 
 	ShaderRecompiler::CompileResult result;
 	std::string                     error;
+	if (std::getenv("KYTY_DEBUG_SHADER_COMPILE_ALL") != nullptr) {
+		std::printf("CompileShader begin CS hash=0x%016" PRIx64 " words=%zu\n",
+		            options.shader_hash, code.size());
+		std::fflush(stdout);
+	}
+	const bool trace_target = std::getenv("KYTY_DEBUG_SHADER_COMPILE_TRACE") != nullptr &&
+	                          options.shader_hash == 0x000000020b44f000ull;
+	if (trace_target) {
+		std::printf("TargetShader begin CS hash=0x%016" PRIx64 " words=%zu\n",
+		            options.shader_hash, code.size());
+		std::fflush(stdout);
+		if (const char* dump_path = std::getenv("KYTY_DEBUG_SHADER_COMPILE_DUMP");
+		    dump_path != nullptr && dump_path[0] != '\0') {
+			if (auto* file = std::fopen(dump_path, "wb"); file != nullptr) {
+				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+				std::fclose(file);
+			}
+		}
+	}
 	if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
 		ExitShaderRecompilerFailure("ShaderRecompiler CS", options.shader_hash, error.c_str());
+	}
+	if (std::getenv("KYTY_DEBUG_SHADER_COMPILE_ALL") != nullptr) {
+		std::printf("CompileShader end CS hash=0x%016" PRIx64 " spirv=%zu\n",
+		            options.shader_hash, result.spirv.size());
+		std::fflush(stdout);
+	}
+	if (trace_target) {
+		std::printf("TargetShader end CS hash=0x%016" PRIx64 " spirv=%zu images=%zu\n",
+		            options.shader_hash, result.spirv.size(), result.program.info.images.size());
+		std::fflush(stdout);
 	}
 	DumpShaderRecompilerOriginal("cs", options.shader_hash, code, result.decoded_dump);
 	if (!SpirvValidateBinary("ShaderRecompiler CS", options.shader_hash, result.spirv)) {

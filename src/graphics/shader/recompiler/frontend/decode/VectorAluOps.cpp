@@ -510,6 +510,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_UBYTE0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::V_NOT_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::V_FFBL_B32, SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
     {Opcode::V_CVT_F16_F32, SdwaSelFull(), SdwaSelWords(), SdwaSelFull(), false},
     {Opcode::V_CVT_F16_U16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
@@ -936,8 +938,8 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
      true, true},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
-    {SdwaSelFull(), SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), false, false},
-    {SdwaSelFull(), SdwaSelFull(), SdwaSelAll(), false, false},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelWords() | SdwaSelFull(), false, false},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==

@@ -28,6 +28,7 @@ const char* StageName(ShaderType stage) {
 bool IsBufferAtomic(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::BufferAtomicSwap32:
+		case ValueOpcode::BufferAtomicCompareSwap32:
 		case ValueOpcode::BufferAtomicIAdd32:
 		case ValueOpcode::BufferAtomicISub32:
 		case ValueOpcode::BufferAtomicSMin32:
@@ -389,6 +390,183 @@ private:
 		           : nullptr;
 	}
 
+	const MemoryInfo* ScalarAddressReadMemory(const Inst& read, uint32_t& index) const {
+		if (read.GetOpcode() != ValueOpcode::LoadAddressU32 || read.NumArgs() < 2u) {
+			return nullptr;
+		}
+		index = read.Flags<MemoryFlags>().index;
+		if (index >= m_values.memory_info.size()) {
+			return nullptr;
+		}
+		const auto& memory = m_values.memory_info[index];
+		return memory.kind == ResourceKind::ScalarAddress && memory.data_bits == 32u &&
+		               memory.data_dwords == 1u
+		           ? &memory
+		           : nullptr;
+	}
+
+	bool IsDirectImageKey(Value key) const {
+		key                  = key.Resolve();
+		const auto* key_inst = key.TryInstruction();
+		if (key_inst == nullptr) {
+			return false;
+		}
+		if (key_inst->GetOpcode() == ValueOpcode::FindILsb32) {
+			return true;
+		}
+		if (key_inst->GetOpcode() == ValueOpcode::ReadLane && key_inst->NumArgs() == 2u &&
+		    key.GetType() == Type::U32) {
+			const auto* selector = key_inst->Arg(1).Resolve().TryInstruction();
+			if (selector == nullptr || selector->GetOpcode() != ValueOpcode::BitwiseAnd32 ||
+			    selector->NumArgs() != 2u) {
+				return false;
+			}
+			uint32_t mask = 0;
+			return (ImmediateU32(selector->Arg(0), mask) ||
+			        ImmediateU32(selector->Arg(1), mask)) &&
+			       mask == 31u;
+		}
+		if (key_inst->GetOpcode() != ValueOpcode::Phi || key_inst->NumArgs() != 2u ||
+		    key.GetType() != Type::U32) {
+			return false;
+		}
+
+		bool has_zero = false;
+		bool has_step = false;
+		for (uint32_t index = 0; index < key_inst->NumArgs(); index++) {
+			const auto incoming = key_inst->Arg(index).Resolve();
+			if (incoming.IsImmediate() && incoming.GetType() == Type::U32 &&
+			    incoming.U32() == 0u) {
+				has_zero = true;
+				continue;
+			}
+			const auto* add = incoming.TryInstruction();
+			if (add == nullptr || add->GetOpcode() != ValueOpcode::IAdd32 ||
+			    add->NumArgs() != 2u) {
+				return false;
+			}
+			uint32_t   step    = 0;
+			const bool forward = add->Arg(0).Resolve() == key && ImmediateU32(add->Arg(1), step);
+			const bool reverse = add->Arg(1).Resolve() == key && ImmediateU32(add->Arg(0), step);
+			if ((!forward && !reverse) || step != 1u) {
+				return false;
+			}
+			has_step = true;
+		}
+		return has_zero && has_step;
+	}
+
+	bool MatchDirectTableOffset(Value value, uint32_t immediate_offset, Value& key,
+	                            uint32_t& table_offset) const {
+		value        = value.Resolve();
+		table_offset = immediate_offset;
+		for (;;) {
+			const auto* add = value.TryInstruction();
+			if (add == nullptr || add->GetOpcode() != ValueOpcode::IAdd32 ||
+			    add->NumArgs() != 2u) {
+				break;
+			}
+			uint32_t immediate = 0;
+			if (ImmediateU32(add->Arg(0), immediate)) {
+				value = add->Arg(1).Resolve();
+			} else if (ImmediateU32(add->Arg(1), immediate)) {
+				value = add->Arg(0).Resolve();
+			} else {
+				return false;
+			}
+			table_offset += immediate;
+		}
+		const auto* shift        = value.TryInstruction();
+		uint32_t    shift_amount = 0;
+		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
+		    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), shift_amount) ||
+		    shift_amount != 5u) {
+			return false;
+		}
+		key = shift->Arg(0).Resolve();
+		return IsDirectImageKey(key);
+	}
+
+	bool TryMakeDirectIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
+			return false;
+		}
+
+		Inst*    table_handle = nullptr;
+		Value    key;
+		uint32_t base_offset = 0;
+		for (uint32_t dword = 0; dword < plan.reads.size(); dword++) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarAddressReadMemory(*read, memory_index);
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
+			if (current_handle == nullptr ||
+			    current_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (table_handle != nullptr &&
+			     !EquivalentValue(m_values, Value(table_handle), Value(current_handle)))) {
+				return false;
+			}
+			Value    current_key;
+			uint32_t current_offset = 0;
+			if (!MatchDirectTableOffset(read->Arg(1), memory->offset, current_key,
+			                            current_offset)) {
+				return false;
+			}
+			if (dword == 0u) {
+				table_handle = current_handle;
+				key          = current_key;
+				base_offset  = current_offset;
+			} else if (!EquivalentValue(m_values, key, current_key) ||
+			           current_offset != base_offset + dword * sizeof(uint32_t)) {
+				return false;
+			}
+			const std::array<const Inst*, 1> image_user {&handle};
+			if (!UsesOnly(*read, image_user)) {
+				return false;
+			}
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = read;
+		}
+
+		DescriptorSource table_source;
+		if (table_handle == nullptr ||
+		    !MakeSource(*table_handle, 2u, false, table_source, pc, nullptr)) {
+			return false;
+		}
+		std::string reason;
+		uint32_t    bad_dword = 0;
+		if (!ValidateSource(table_source, reason, bad_dword)) {
+			return false;
+		}
+		const auto table_source_index = InternSource(table_source);
+
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		image_source.dwords[0] = table_source.dwords[0];
+		image_source.dwords[1] = table_source.dwords[1];
+		image_source.indirect_image = DescriptorSource::IndirectImage {
+		    .mode            = DescriptorSource::IndirectImage::Mode::DirectAddress,
+		    .material_source = table_source_index,
+		    .heap_source     = table_source_index,
+		    .key_arg         = 0u,
+		    .table_offset    = base_offset,
+		    .table_count     = 32u,
+		};
+
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key    = key;
+		plan.roots  = image_source.dwords;
+		return true;
+	}
+
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
 		for (const auto* block: m_values.blocks) {
 			for (const auto& inst: *block) {
@@ -547,7 +725,13 @@ private:
 		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
 		          image_source.dwords.begin() + 4u);
 		image_source.indirect_image = DescriptorSource::IndirectImage {
-		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
+		    .mode            = DescriptorSource::IndirectImage::Mode::MaterialHeap,
+		    .material_source = material_source_index,
+		    .heap_source     = heap_source_index,
+		    .selector_stride = selector_stride,
+		    .selector_offset = selector_offset,
+		    .key_arg         = 0u,
+		};
 
 		plan.handle = &handle;
 		plan.source = InternSource(image_source);
@@ -581,7 +765,8 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan) ||
+				    TryMakeDirectIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}

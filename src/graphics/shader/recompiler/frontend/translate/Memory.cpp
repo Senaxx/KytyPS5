@@ -313,11 +313,19 @@ bool Translator::TranslateAtomicMemory(const IR::Instruction& inst) {
 	switch (inst.memory.kind) {
 		case IR::ResourceKind::Buffer: {
 			const auto resource = GetBufferResource(inst.memory);
-			const auto address  = ReadBufferAddress(inst, 1);
-			result              = ir.Emit(BufferAtomicOpcode(inst.op),
-			                              {resource, address.index, address.offset, address.soffset,
-			                               ReadU32(inst.src[0]), ir.GetExec()},
-			                              AddMemoryInfo(inst));
+			const bool compare_swap = inst.op == IR::Opcode::AtomicCompareSwapU32;
+			const auto address      = ReadBufferAddress(inst, compare_swap ? 2 : 1);
+			if (compare_swap) {
+				result = ir.Emit(IR::ValueOpcode::BufferAtomicCompareSwap32,
+				                 {resource, address.index, address.offset, address.soffset,
+				                  ReadU32(inst.src[0]), ReadU32(inst.src[1]), ir.GetExec()},
+				                 AddMemoryInfo(inst));
+			} else {
+				result = ir.Emit(BufferAtomicOpcode(inst.op),
+				                 {resource, address.index, address.offset, address.soffset,
+				                  ReadU32(inst.src[0]), ir.GetExec()},
+				                 AddMemoryInfo(inst));
+			}
 			break;
 		}
 		case IR::ResourceKind::Image:
@@ -618,6 +626,7 @@ bool Translator::TranslateMemoryOperation(const IR::Instruction&          inst,
 		case IR::Opcode::BufferStoreDword: return TranslateBufferStore(inst);
 
 		case IR::Opcode::AtomicSwapU32:
+		case IR::Opcode::AtomicCompareSwapU32:
 		case IR::Opcode::AtomicAddU32:
 		case IR::Opcode::AtomicSubU32:
 		case IR::Opcode::AtomicSMinI32:

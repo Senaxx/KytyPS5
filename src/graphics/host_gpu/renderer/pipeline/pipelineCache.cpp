@@ -12,6 +12,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <utility>
@@ -252,7 +254,18 @@ PipelineCache::CreateComputePipeline(ShaderComputeInputInfo&      input_info,
 	}
 
 	auto cached = std::make_unique<ComputePipeline>(p);
+	const bool trace_target = std::getenv("KYTY_DEBUG_SHADER_COMPILE_TRACE") != nullptr &&
+	                          cs_regs.cs_regs.data_addr == 0x00000002089e3700ull;
+	if (trace_target) {
+		std::printf("TargetPipeline begin CS=0x%016" PRIx64 " words=%zu\n",
+		            cs_regs.cs_regs.data_addr, cs_spirv.size());
+		std::fflush(stdout);
+	}
 	CreatePipelineInternal(m_graphics, m_descriptor_cache, *cached, input_info, cs_spirv);
+	if (trace_target) {
+		std::printf("TargetPipeline end CS=0x%016" PRIx64 "\n", cs_regs.cs_regs.data_addr);
+		std::fflush(stdout);
+	}
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);

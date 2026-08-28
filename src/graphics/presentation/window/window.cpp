@@ -40,6 +40,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -193,6 +194,116 @@ constexpr uint32_t KYTY_SDL_BUTTON_X2MASK = SDL_BUTTON_X2MASK; // NOLINT(hicpp-s
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
+std::string                    g_debug_input_file;
+std::string                    g_debug_input_capture_file;
+uint64_t                       g_debug_input_sequence = 0;
+SDL_TimerID                    g_debug_input_timer    = 0;
+
+void AppendDebugInputLog(const char* format, ...) {
+	if (g_debug_input_capture_file.empty()) {
+		return;
+	}
+	auto* file = std::fopen(g_debug_input_capture_file.c_str(), "ab");
+	if (file == nullptr) {
+		return;
+	}
+	va_list args;
+	va_start(args, format);
+	std::vfprintf(file, format, args);
+	va_end(args);
+	std::fclose(file);
+}
+
+uint32_t DebugInputTimer(uint32_t interval, void* /*param*/) {
+	SDL_Event event {};
+	event.type = SDL_USEREVENT;
+	SDL_PushEvent(&event);
+	return interval;
+}
+
+void PushDebugKey(int key_code, bool down) {
+	SDL_Event event {};
+	event.type                = down ? SDL_KEYDOWN : SDL_KEYUP;
+	event.key.type            = event.type;
+	event.key.state           = down ? SDL_PRESSED : SDL_RELEASED;
+	event.key.repeat          = 0;
+	event.key.keysym.scancode = SDL_GetScancodeFromKey(key_code);
+	event.key.keysym.sym      = key_code;
+	SDL_PushEvent(&event);
+}
+
+void PushDebugControllerButton(uint8_t button, bool down) {
+	uint32_t pad_button = 0;
+	switch (button) {
+		case SDL_CONTROLLER_BUTTON_A: pad_button = Controller::PAD_BUTTON_CROSS; break;
+		case SDL_CONTROLLER_BUTTON_B: pad_button = Controller::PAD_BUTTON_CIRCLE; break;
+		case SDL_CONTROLLER_BUTTON_DPAD_UP: pad_button = Controller::PAD_BUTTON_UP; break;
+		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: pad_button = Controller::PAD_BUTTON_DOWN; break;
+		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: pad_button = Controller::PAD_BUTTON_LEFT; break;
+		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: pad_button = Controller::PAD_BUTTON_RIGHT; break;
+		default: break;
+	}
+	if (pad_button != 0) {
+		Controller::ControllerButton(Controller::HOST_INPUT_CONTROLLER_ID, pad_button, down);
+	}
+}
+
+void PollDebugInput() {
+	if (g_debug_input_file.empty()) {
+		return;
+	}
+
+	auto* file = std::fopen(g_debug_input_file.c_str(), "rb");
+	if (file == nullptr) {
+		return;
+	}
+
+	unsigned long long sequence = 0;
+	char               action[32] {};
+	char               value[64] {};
+	const int          fields = std::fscanf(file, "%llu %31s %63s", &sequence, action, value);
+	std::fclose(file);
+	if (fields < 2 || sequence <= g_debug_input_sequence) {
+		return;
+	}
+
+	g_debug_input_sequence = sequence;
+	AppendDebugInputLog("control=%llu action=%s value=%s\n", sequence, action,
+	                    fields == 3 ? value : "");
+
+	if (std::strcmp(action, "keydown") == 0 || std::strcmp(action, "keyup") == 0) {
+		const int key = SDL_GetKeyFromName(value);
+		if (key != SDLK_UNKNOWN) {
+			PushDebugKey(key, std::strcmp(action, "keydown") == 0);
+		}
+	} else if (std::strcmp(action, "pad_down") == 0 || std::strcmp(action, "pad_up") == 0) {
+		int button = SDL_CONTROLLER_BUTTON_INVALID;
+		if (std::strcmp(value, "a") == 0) {
+			button = SDL_CONTROLLER_BUTTON_A;
+		} else if (std::strcmp(value, "b") == 0) {
+			button = SDL_CONTROLLER_BUTTON_B;
+		} else if (std::strcmp(value, "up") == 0) {
+			button = SDL_CONTROLLER_BUTTON_DPAD_UP;
+		} else if (std::strcmp(value, "down") == 0) {
+			button = SDL_CONTROLLER_BUTTON_DPAD_DOWN;
+		} else if (std::strcmp(value, "left") == 0) {
+			button = SDL_CONTROLLER_BUTTON_DPAD_LEFT;
+		} else if (std::strcmp(value, "right") == 0) {
+			button = SDL_CONTROLLER_BUTTON_DPAD_RIGHT;
+		}
+		if (button != SDL_CONTROLLER_BUTTON_INVALID) {
+			PushDebugControllerButton(static_cast<uint8_t>(button),
+			                          std::strcmp(action, "pad_down") == 0);
+		}
+	} else if (std::strcmp(action, "text") == 0 && fields == 3) {
+		SDL_Event event {};
+		event.type = SDL_TEXTINPUT;
+		std::snprintf(event.text.text, sizeof(event.text.text), "%s", value);
+		SDL_PushEvent(&event);
+	} else if (std::strcmp(action, "capture") == 0) {
+		(void)RenderDocRequestCapture();
+	}
+}
 
 } // namespace
 
@@ -510,6 +621,7 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
+	PollDebugInput();
 	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
 	if (ProcessImeInput(*event)) {
 		return;
@@ -816,6 +928,17 @@ static void WindowCreate(WindowContext& context) {
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
 		EXIT("%s\n", SDL_GetError());
 	}
+	if (const auto* input_file = std::getenv("KYTY_DEBUG_INPUT_FILE"); input_file != nullptr) {
+		g_debug_input_file = input_file;
+	}
+	if (const auto* capture_file = std::getenv("KYTY_DEBUG_INPUT_CAPTURE_FILE");
+	    capture_file != nullptr) {
+		g_debug_input_capture_file = capture_file;
+	}
+	if (!g_debug_input_file.empty()) {
+		g_debug_input_timer = SDL_AddTimer(100, DebugInputTimer, nullptr);
+		EXIT_IF(g_debug_input_timer == 0);
+	}
 	HostInputInit();
 	InitializeImeInput();
 
@@ -871,6 +994,10 @@ void WindowRun() {
 void WindowShutdown() {
 	if (g_window != nullptr) {
 		g_window.reset();
+	}
+	if (g_debug_input_timer != 0) {
+		SDL_RemoveTimer(g_debug_input_timer);
+		g_debug_input_timer = 0;
 	}
 }
 
