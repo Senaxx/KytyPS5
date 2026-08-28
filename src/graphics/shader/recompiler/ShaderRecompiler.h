@@ -6,7 +6,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
-#include <optional>
 #include <span>
 #include <vector>
 
@@ -14,15 +13,13 @@ namespace Libs::Graphics::ShaderRecompiler {
 
 struct CompileOptions {
 	ShaderType                  stage           = ShaderType::Compute;
-	ShaderLaneMaskMode          lane_mask_mode  = ShaderLaneMaskMode::NativeWave;
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
 	uint32_t                    user_data_count = 64;
+	uint32_t                    scratch_dwords  = 0;
 	uint64_t                    shader_hash     = 0;
 	uint64_t                    shader_base     = 0;
-	std::optional<uint64_t>     flat_memory_base;
-	uint32_t                    descriptor_set             = 0;
-	uint32_t                    push_constant_offset       = 0;
+	uint32_t                    push_constant_offset      = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
 	const char*                 dump_label                 = nullptr;

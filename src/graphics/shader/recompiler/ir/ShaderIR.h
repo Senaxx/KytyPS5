@@ -6,56 +6,18 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
-#include "graphics/shader/recompiler/ir/opcodes/Opcodes.h"
+#include "graphics/shader/recompiler/ir/Block.h"
+#include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
+#include <bit>
 #include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-
-struct ValueProgram;
-
-enum class RegisterFile { Scalar, Vector, Vcc, Exec, Scc, M0 };
-
-struct Register {
-	RegisterFile file  = RegisterFile::Scalar;
-	uint32_t     index = 0;
-
-	bool operator==(const Register& other) const {
-		return file == other.file && index == other.index;
-	}
-};
-
-enum class OperandKind { Register, ImmediateU32, PcRelativeU32, PcRelativeHighU32, Null };
-
-struct Operand {
-	OperandKind kind = OperandKind::Null;
-	Register    reg;
-	uint32_t    imm                = 0;
-	bool        sext_64            = false;
-	uint32_t    sdwa_sel           = 6;
-	uint32_t    sdwa_dst_unused    = 2;
-	uint32_t    omod               = 0;
-	bool        sdwa_sext          = false;
-	bool        op_sel             = false;
-	bool        op_sel_hi          = false;
-	bool        negate             = false;
-	bool        negate_hi          = false;
-	bool        absolute           = false;
-	bool        clamp              = false;
-	uint32_t    dpp_ctrl           = 0;
-	uint32_t    dpp_row_mask       = 0xf;
-	uint32_t    dpp_bank_mask      = 0xf;
-	bool        dpp_fetch_inactive = false;
-	bool        dpp_bound_ctrl     = false;
-	bool        dpp                = false;
-
-	bool operator==(const Operand& other) const = default;
-};
 
 enum class ResourceKind {
 	None,
@@ -73,6 +35,24 @@ enum class ResourceKind {
 	StorageImageUint,
 	Sampler
 };
+
+[[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
+	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
+	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
+}
+
+[[nodiscard]] constexpr bool ImageResourceKindMatches(ResourceKind       kind,
+                                                      ImageResourceClass resource_class) {
+	switch (resource_class) {
+		case ImageResourceClass::Sampled:
+			return kind == ResourceKind::Image || kind == ResourceKind::ImageUint;
+		case ImageResourceClass::Storage:
+			return kind == ResourceKind::StorageImage || kind == ResourceKind::StorageImageUint;
+		case ImageResourceClass::StorageUint: return kind == ResourceKind::StorageImageUint;
+		case ImageResourceClass::None: return false;
+	}
+	return false;
+}
 
 struct MemoryInfo {
 	ResourceKind            kind                     = ResourceKind::None;
@@ -99,6 +79,7 @@ struct MemoryInfo {
 	bool                    formatted                                             = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_cube                                            = false;
+	bool                    image_r128                                            = false;
 	bool                    glc                                                   = false;
 	bool                    slc                                                   = false;
 	bool                    idxen                                                 = false;
@@ -120,43 +101,6 @@ struct ExportInfo {
 	bool             vm     = false;
 
 	bool operator==(const ExportInfo& other) const = default;
-};
-
-struct InputInfo {
-	uint32_t attr         = 0;
-	uint32_t chan         = 0;
-	uint32_t vertex_index = UINT32_MAX;
-
-	bool operator==(const InputInfo& other) const = default;
-};
-
-enum class SaveexecMode { And, Orn2, Andn1 };
-
-struct Instruction {
-	uint32_t     pc = 0;
-	Opcode       op = Opcode::MoveU32;
-	Operand      dst;
-	Operand      dst2;
-	Operand      src[4];
-	uint32_t     src_count = 0;
-	MemoryInfo   memory;
-	ExportInfo   export_info;
-	InputInfo    input_info;
-	SaveexecMode saveexec_mode = SaveexecMode::And;
-
-	bool operator==(const Instruction& other) const = default;
-};
-
-struct BasicBlock {
-	uint32_t                 id         = 0;
-	uint32_t                 start_pc   = 0;
-	uint32_t                 end_pc     = 0;
-	uint32_t                 inst_begin = 0;
-	uint32_t                 inst_end   = 0;
-	std::vector<uint32_t>    predecessors;
-	std::vector<uint32_t>    successors;
-	CFG::Terminator          terminator;
-	std::vector<Instruction> instructions;
 };
 
 struct DescriptorValue {
@@ -189,7 +133,7 @@ struct BufferResource {
 
 enum class ImageMipMode { None, DynamicStorage };
 
-constexpr uint32_t StorageImageIdentitySwizzle = 0x00000facu;
+constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
@@ -200,12 +144,14 @@ struct ImageResource {
 	Decoder::ImageDimension dimension                 = Decoder::ImageDimension::Unknown;
 	ImageMipMode            mip_mode                  = ImageMipMode::None;
 	uint32_t                mip_count                 = 1;
-	uint32_t                storage_swizzle           = StorageImageIdentitySwizzle;
+	Prospero::BufferFormat  conversion_format         = Prospero::BufferFormat::kInvalid;
+	uint32_t                shader_swizzle            = ShaderImageIdentitySwizzle;
 	bool                    read                      = false;
 	bool                    written                   = false;
 	bool                    atomic                    = false;
 	bool                    depth_compare             = false;
 	bool                    cube                      = false;
+	bool                    r128                      = false;
 	uint32_t                indirect_root             = NoIndirectImage;
 	uint32_t                indirect_mapping_offset   = 0;
 	uint32_t                indirect_mapping_capacity = 0;
@@ -215,8 +161,9 @@ struct ImageResource {
 };
 
 struct SamplerResource {
-	uint32_t source       = 0;
-	uint32_t first_use_pc = 0;
+	uint32_t source                = 0;
+	uint32_t first_use_pc          = 0;
+	bool     force_point_filtering = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -229,25 +176,13 @@ struct SampledResourcePair {
 	bool operator==(const SampledResourcePair& other) const = default;
 };
 
-struct AddressResource {
-	uint32_t     source           = UINT32_MAX;
-	uint32_t     first_use_pc     = 0;
-	ResourceKind kind             = ResourceKind::Flat;
-	int32_t      min_offset       = 0;
-	uint64_t     specialized_base = 0;
-	bool         unbased          = true;
-	bool         read             = false;
-	bool         written          = false;
-	bool         atomic           = false;
-
-	bool operator==(const AddressResource& other) const = default;
-};
-
 enum class StageInputKind {
 	VertexIndex,
 	InstanceIndex,
 	FragCoord,
 	FrontFacing,
+	BaryCoordSmooth,
+	BaryCoordNoPerspective,
 	WorkgroupId,
 	LocalInvocationId,
 	LocalInvocationIndex,
@@ -255,7 +190,70 @@ enum class StageInputKind {
 	Parameter,
 };
 
-enum class StageOutputKind { Position, Parameter, Mrt, Depth, SampleMask };
+enum class StageOutputKind {
+	Position,
+	Parameter,
+	Mrt,
+	Depth,
+	SampleMask,
+	PointSize,
+	ClipDistance,
+	CullDistance,
+	Layer
+};
+
+struct PositionExportComponent {
+	uint32_t clip_distance = UINT32_MAX;
+	uint32_t cull_distance = UINT32_MAX;
+	bool     valid          = false;
+	bool     point_size     = false;
+	bool     layer          = false;
+	bool     viewport       = false;
+};
+
+inline PositionExportComponent DecodePositionExportComponent(uint32_t control,
+	                                                           uint32_t pos_index,
+	                                                           uint32_t component) {
+	PositionExportComponent result;
+	if (pos_index == 0 || component >= 4) {
+		return result;
+	}
+
+	uint32_t slot   = pos_index - 1;
+	uint32_t vector = 3;
+	for (uint32_t i = 0; i < 3; i++) {
+		if ((control & (1u << (21u + i))) != 0) {
+			if (slot == 0) {
+				vector = i;
+				break;
+			}
+			slot--;
+		}
+	}
+	if (vector == 3) {
+		return result;
+	}
+
+	result.valid = true;
+	if (vector == 0) {
+		result.point_size = component == 0 && (control & (1u << 16u)) != 0;
+		result.layer      = component == 2 && (control & (1u << 18u)) != 0;
+		result.viewport   = component == 2 && (control & (1u << 19u)) != 0;
+		return result;
+	}
+
+	const auto scalar = (vector - 1) * 4 + component;
+	const auto lower  = (1u << scalar) - 1u;
+	const auto clip   = control & 0xffu;
+	const auto cull   = (control >> 8u) & 0xffu;
+	if ((clip & (1u << scalar)) != 0) {
+		result.clip_distance = std::popcount(clip & lower);
+	}
+	if ((cull & (1u << scalar)) != 0) {
+		result.cull_distance = std::popcount(cull & lower);
+	}
+	return result;
+}
 
 struct StageInput {
 	StageInputKind kind            = StageInputKind::VertexIndex;
@@ -302,33 +300,117 @@ enum class DescriptorBindingKind {
 	StorageUint2D,
 	StorageUint2DArray,
 	StorageUint3D,
+	StorageAtomic1D,
+	StorageAtomic1DArray,
+	StorageAtomic2D,
+	StorageAtomic2DArray,
+	StorageAtomic3D,
 	Samplers,
 	Gds,
-	AddressMemory,
+	BdaPagetable,
+	FaultBuffer,
 	FlattenedSrt,
 	UserData,
 	Count,
 };
 
+constexpr uint32_t NativePushConstantSize = 128;
+
+[[nodiscard]] constexpr uint32_t NativeBinding(ShaderType stage, DescriptorBindingKind kind) {
+	return static_cast<uint32_t>(kind) +
+	       (stage == ShaderType::Pixel ? static_cast<uint32_t>(DescriptorBindingKind::Count) : 0u);
+}
+
+[[nodiscard]] inline std::optional<DescriptorBindingKind>
+DescriptorBindingForImage(const ImageResource& image) {
+	using Dimension = Decoder::ImageDimension;
+	using Kind      = DescriptorBindingKind;
+
+	switch (image.kind) {
+		case ResourceKind::Image:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::Sampled1D;
+				case Dimension::Dim1DArray: return Kind::Sampled1DArray;
+				case Dimension::Dim2D: return Kind::Sampled2D;
+				case Dimension::Dim2DArray: return Kind::Sampled2DArray;
+				case Dimension::Dim2DMsaa: return Kind::Sampled2DMsaa;
+				case Dimension::Dim2DMsaaArray: return Kind::Sampled2DMsaaArray;
+				case Dimension::Dim3D: return Kind::Sampled3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::ImageUint:
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::SampledUint1D;
+				case Dimension::Dim1DArray: return Kind::SampledUint1DArray;
+				case Dimension::Dim2D: return Kind::SampledUint2D;
+				case Dimension::Dim2DArray: return Kind::SampledUint2DArray;
+				case Dimension::Dim2DMsaa: return Kind::SampledUint2DMsaa;
+				case Dimension::Dim2DMsaaArray: return Kind::SampledUint2DMsaaArray;
+				case Dimension::Dim3D: return Kind::SampledUint3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::StorageImage:
+			if (image.atomic) {
+				return std::nullopt;
+			}
+			switch (image.dimension) {
+				case Dimension::Dim1D: return Kind::Storage1D;
+				case Dimension::Dim1DArray: return Kind::Storage1DArray;
+				case Dimension::Dim2D: return Kind::Storage2D;
+				case Dimension::Dim2DArray: return Kind::Storage2DArray;
+				case Dimension::Dim3D: return Kind::Storage3D;
+				default: return std::nullopt;
+			}
+		case ResourceKind::StorageImageUint:
+			switch (image.dimension) {
+				case Dimension::Dim1D:
+					if (image.atomic) {
+						return Kind::StorageAtomic1D;
+					}
+					return Kind::StorageUint1D;
+				case Dimension::Dim1DArray:
+					if (image.atomic) {
+						return Kind::StorageAtomic1DArray;
+					}
+					return Kind::StorageUint1DArray;
+				case Dimension::Dim2D:
+					if (image.atomic) {
+						return Kind::StorageAtomic2D;
+					}
+					return Kind::StorageUint2D;
+				case Dimension::Dim2DArray:
+					if (image.atomic) {
+						return Kind::StorageAtomic2DArray;
+					}
+					return Kind::StorageUint2DArray;
+				case Dimension::Dim3D:
+					if (image.atomic) {
+						return Kind::StorageAtomic3D;
+					}
+					return Kind::StorageUint3D;
+				default: return std::nullopt;
+			}
+		default: return std::nullopt;
+	}
+}
+
 struct DescriptorBinding {
-	DescriptorBindingKind kind    = DescriptorBindingKind::Buffers;
-	uint32_t              binding = 0;
+	DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
 	std::vector<uint32_t> resources;
 
 	bool operator==(const DescriptorBinding& other) const = default;
 };
 
 struct BindingLayout {
-	uint32_t                       descriptor_set       = 0;
 	uint32_t                       push_constant_offset = 0;
-	uint32_t                       push_constant_size   = 0;
-	uint32_t                       buffer_offset_dword  = 0;
-	uint32_t                       buffer_offset_count  = 0;
+	uint32_t                       push_constant_size  = 0;
+	uint32_t                       memory_offset_dword = 0;
+	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
-		return buffer_offset_dword + (buffer_offset_count + 3u) / 4u;
+		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
 
 	bool operator==(const BindingLayout& other) const = default;
@@ -336,47 +418,99 @@ struct BindingLayout {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 32;
-	static constexpr uint32_t MaxAddresses    = 32;
 	static constexpr uint32_t MaxImages       = 32;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
 	std::vector<BufferResource>      buffers;
-	std::vector<AddressResource>     addresses;
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
+	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
+	bool                             uses_dma           = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
 struct SpirvRequirements {
-	bool requires_exact_subgroup      = false;
 	bool subgroup_ballot              = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 };
 
+struct BlockInfo {
+	uint32_t        id       = 0;
+	uint32_t        start_pc = 0;
+	uint32_t        end_pc   = 0;
+	CFG::Terminator terminator;
+	Value           condition;
+	Value           indirect_target;
+};
+
+struct DescriptorSource {
+	struct IndirectImage {
+		uint32_t material_source = 0;
+		uint32_t heap_source     = 0;
+		uint32_t selector_stride = 0;
+		uint32_t selector_offset = 0;
+		uint32_t key_arg         = 0;
+
+		bool operator==(const IndirectImage& other) const = default;
+	};
+
+	std::array<Value, 8>         dwords {};
+	uint32_t                     dword_count = 0;
+	std::optional<IndirectImage> indirect_image;
+
+	bool operator==(const DescriptorSource& other) const = default;
+};
+
+struct SrtRead {
+	Value    value;
+	uint32_t flat_offset = 0;
+	uint32_t use_pc      = 0;
+
+	bool operator==(const SrtRead& other) const = default;
+};
+
 struct Program {
+	Program() = default;
+	~Program();
+
+	Program(const Program&)            = delete;
+	Program& operator=(const Program&) = delete;
+	Program(Program&&) noexcept         = default;
+	Program& operator=(Program&& other) noexcept;
+
 	ShaderType                    stage               = ShaderType::Unknown;
-	ShaderLaneMaskMode            lane_mask_mode      = ShaderLaneMaskMode::NativeWave;
 	uint64_t                      shader_hash         = 0;
 	uint32_t                      wave_size           = 64;
 	uint32_t                      user_data_base      = 0;
 	uint32_t                      user_data_count     = 64;
+	uint32_t                      scratch_dwords      = 0;
 	bool                          dispatcher_fallback = false;
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
-	std::vector<BasicBlock>       blocks;
-	std::shared_ptr<ValueProgram> values;
+	std::vector<std::unique_ptr<Block>> block_storage;
+	BlockList                           blocks;
+	std::vector<BlockInfo>              block_info;
+	// Decoded MIMG/VMEM metadata carries details such as RDNA2 NSA address registers and
+	// storage-image swizzles. Typed memory instructions carry a dense index into these shader-local
+	// tables until those fields are consumed by emission.
+	std::vector<MemoryInfo>       memory_info;
+	std::vector<ExportInfo>       export_info;
+	std::vector<DescriptorSource> descriptor_sources;
+	std::vector<SrtRead>          srt_reads;
+	std::vector<Value>            dynamic_reads;
 	bool                          srt_plan_complete = false;
 	ShaderInfo                    info;
 	bool                          resource_tracking_complete = false;
@@ -387,14 +521,12 @@ struct Program {
 	std::optional<SpirvRequirements> spirv_requirements;
 };
 
-bool LowerProgram(const Decoder::Program& decoded, const CFG::Graph& cfg, ShaderType stage,
-                  uint32_t wave_size, Program& program, std::string* error);
-
-std::string RegisterToString(Register reg);
-std::string OperandToString(const Operand& operand);
-std::string ExportTargetKindToString(ExportTargetKind kind);
-std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
+
+bool  ValidateProgram(const Program& program, bool require_ssa, std::string* error);
+void  ResolveControlFlowIdentities(Program& program);
+bool  EquivalentValue(const Program& program, Value left, Value right);
+Value ResolveInvariantPhi(const Program& program, Value value);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

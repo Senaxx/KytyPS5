@@ -13,7 +13,6 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptorCache.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -71,8 +70,8 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 	return fail == replace_op || pass == replace_op || depth_fail == replace_op;
 }
 
-[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const RenderCommandBuffer& buffer,
-                                                                 const DepthFormatPolicy&   policy,
+[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
+                                                                 const DepthFormatPolicy& policy,
                                                                  bool     has_stencil,
                                                                  uint32_t samples) {
 	auto&      graphics         = buffer.GetGraphics();
@@ -98,7 +97,7 @@ static bool UsesStencilOpValue(uint8_t fail, uint8_t pass, uint8_t depth_fail) {
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandBuffer& buffer,
+void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer& buffer,
                                               RenderDepthInfo& r) {
 	KYTY_PROFILER_FUNCTION();
 	(void)submit_id;
@@ -177,15 +176,17 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	    z.htile_surface.htile_uses_preload_win != 0 || z.htile_surface.preload != 0 ||
 	    z.htile_surface.prefetch_width != 0 || z.htile_surface.prefetch_height != 0 ||
 	    z.htile_surface.dst_outside_zero_to_one != 0 || z.z_read_base_addr == 0 ||
-	    z.z_write_base_addr != z.z_read_base_addr || (z.z_read_base_addr & 0xffffu) != 0 ||
+	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
+	    (z.z_read_base_addr & 0xffffu) != 0 ||
 	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
 		DepthFatal("unsupported depth register state");
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
 		    z.stencil_read_base_addr == 0 ||
-		    z.stencil_write_base_addr != z.stencil_read_base_addr ||
-		    (z.stencil_read_base_addr & 0xffffu) != 0 || z.depth_view.stencil_write_disable) {
+		    (!z.depth_view.stencil_write_disable &&
+		     z.stencil_write_base_addr != z.stencil_read_base_addr) ||
+		    (z.stencil_read_base_addr & 0xffffu) != 0) {
 			DepthFatal("unsupported stencil attachment state");
 		}
 	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0 ||
@@ -286,18 +287,22 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, RenderCommandB
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();
 	r.depth_max_bounds         = hw.GetDepthBoundsMax();
 
-	r.stencil_clear_enable = has_stencil && rc.stencil_clear_enable;
-	r.stencil_clear_value  = hw.GetStencilClearValue();
-	r.stencil_test_enable  = has_stencil && dc.stencil_enable;
+	r.stencil_clear_enable =
+	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
+	r.stencil_clear_value = hw.GetStencilClearValue();
+	r.stencil_test_enable = has_stencil && dc.stencil_enable;
 	if (r.stencil_test_enable) {
-		const uint8_t front_write_mask = rc.stencil_clear_enable ? 0 : sm.stencil_writemask;
-		const uint8_t back_write_mask  = rc.stencil_clear_enable ? 0 : sm.stencil_writemask_bf;
+		const bool stencil_ops_disabled =
+		    rc.stencil_clear_enable || z.depth_view.stencil_write_disable;
+		const uint8_t front_write_mask = stencil_ops_disabled ? 0 : sm.stencil_writemask;
+		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
 		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
 		    (dc.backface_enable &&
 		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
-		    (UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
+		    (front_write_mask != 0 &&
+		     UsesStencilOpValue(sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail) &&
 		     sm.stencil_opval != sm.stencil_testval) ||
-		    (dc.backface_enable &&
+		    (dc.backface_enable && back_write_mask != 0 &&
 		     UsesStencilOpValue(sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf) &&
 		     sm.stencil_opval_bf != sm.stencil_testval_bf)) {
 			DepthFatal("unsupported stencil compare or replacement state");

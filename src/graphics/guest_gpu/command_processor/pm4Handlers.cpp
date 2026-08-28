@@ -71,19 +71,6 @@ constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
 }
 
-// Indirect Cx descriptors retain their selector. Selector 1 offsets 0..31 address the
-// SPI_PS_INPUT_CNTL register bank; ordinary context-register offsets remain unchanged.
-constexpr uint32_t DecodeIndirectCxRegisterOffset(uint32_t raw_offset) {
-	const auto offset = NormalizeRegisterOffset(raw_offset);
-	return (raw_offset & RegisterSelectorMask) == Pm4::CX_PS_SHADER_USAGE_BASE && offset < 32u
-	           ? Pm4::SPI_PS_INPUT_CNTL_0 + offset
-	           : offset;
-}
-
-static_assert(DecodeIndirectCxRegisterOffset(Pm4::CX_PS_SHADER_USAGE_BASE + 2u) ==
-              Pm4::SPI_PS_INPUT_CNTL_0 + 2u);
-static_assert(DecodeIndirectCxRegisterOffset(Pm4::DB_Z_INFO) == Pm4::DB_Z_INFO);
-
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
 	return eop_event_type != 0x28u ||
 	       (gcr_cntl & (GcrGl2MetadataInvalidate | GcrGl0VectorInvalidate | GcrGl1Invalidate |
@@ -530,22 +517,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetAaMask) {
 	return num_values;
 }
 
-KYTY_HW_CTX_PARSER(HwCtxSetBlendColor) {
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0046900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::CB_BLEND_RED);
-
-	HW::BlendColor r;
-
-	r.red   = *reinterpret_cast<const float*>(&buffer[0]);
-	r.green = *reinterpret_cast<const float*>(&buffer[1]);
-	r.blue  = *reinterpret_cast<const float*>(&buffer[2]);
-	r.alpha = *reinterpret_cast<const float*>(&buffer[3]);
-
-	cp.GetCtx().SetBlendColor(r);
-
-	return 4;
-}
-
 KYTY_HW_CTX_PARSER(HwCtxSetBlendControl) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0016900);
 
@@ -857,20 +828,6 @@ KYTY_HW_CTX_PARSER(HwCtxSetClipRect) {
 	}
 
 	return value_count;
-}
-
-KYTY_HW_CTX_PARSER(HwCtxSetGuardBands) {
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xC0046900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::PA_CL_GB_VERT_CLIP_ADJ);
-
-	auto vert_clip    = *reinterpret_cast<const float*>(&buffer[0]); // PA_CL_GB_VERT_CLIP_ADJ
-	auto vert_discard = *reinterpret_cast<const float*>(&buffer[1]); // PA_CL_GB_VERT_DISC_ADJ
-	auto horz_clip    = *reinterpret_cast<const float*>(&buffer[2]); // PA_CL_GB_HORZ_CLIP_ADJ
-	auto horz_discard = *reinterpret_cast<const float*>(&buffer[3]); // PA_CL_GB_HORZ_DISC_ADJ
-
-	cp.GetCtx().SetGuardBands(horz_clip, vert_clip, horz_discard, vert_discard);
-
-	return 4;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetHardwareScreenOffset) {
@@ -1248,23 +1205,16 @@ KYTY_HW_CTX_PARSER(HwCtxSetStencilInfo) {
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetStencilMask) {
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0026900);
-	EXIT_NOT_IMPLEMENTED(cmd_offset != Pm4::DB_STENCILREFMASK);
+	auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+	EXIT_NOT_IMPLEMENTED(num_values == 0);
+	EXIT_NOT_IMPLEMENTED(cmd_offset < Pm4::DB_STENCILREFMASK);
+	EXIT_NOT_IMPLEMENTED(cmd_offset + num_values - 1u > Pm4::DB_STENCILREFMASK_BF);
 
-	HW::StencilMask r;
+	for (uint32_t i = 0; i < num_values; i++) {
+		g_hw_ctx_indirect_func[(cmd_offset + i) & (Pm4::CX_NUM - 1)](cp, cmd_offset + i, buffer[i]);
+	}
 
-	r.stencil_testval      = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILTESTVAL);
-	r.stencil_mask         = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILMASK);
-	r.stencil_writemask    = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILWRITEMASK);
-	r.stencil_opval        = KYTY_PM4_GET(buffer[0], DB_STENCILREFMASK, STENCILOPVAL);
-	r.stencil_testval_bf   = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILTESTVAL_BF);
-	r.stencil_mask_bf      = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILMASK_BF);
-	r.stencil_writemask_bf = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILWRITEMASK_BF);
-	r.stencil_opval_bf     = KYTY_PM4_GET(buffer[1], DB_STENCILREFMASK_BF, STENCILOPVAL_BF);
-
-	cp.GetCtx().SetStencilMask(r);
-
-	return 2;
+	return num_values;
 }
 
 KYTY_HW_CTX_PARSER(HwCtxSetViewportScaleOffset) {
@@ -1367,10 +1317,6 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                         Pm4::COMPUTE_PGM_RSRC1_BULKY_MASK) != 0u;
 			cs_regs.threadgroup_configuration = ((value >> Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_SHIFT) &
 			                                     Pm4::COMPUTE_PGM_RSRC1_WGP_MODE_MASK) != 0u;
-			cs_regs.wave_size                 = (((value >> Pm4::COMPUTE_PGM_RSRC1_W32_EN_SHIFT) &
-			                                      Pm4::COMPUTE_PGM_RSRC1_W32_EN_MASK) != 0u)
-			                                        ? 32u
-			                                        : 64u;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC2:
 			cs_regs.scratch_en     = ((value >> Pm4::COMPUTE_PGM_RSRC2_SCRATCH_EN_SHIFT) &
@@ -1913,11 +1859,11 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	uint64_t reference   = buffer[5] | (static_cast<uint64_t>(buffer[6]) << 32u);
 	uint32_t mode        = buffer[0] & 0x3u;
 	uint32_t function    = (buffer[0] >> 8u) & 0x7u;
-	auto*    then_buffer = reinterpret_cast<uint32_t*>((buffer[7] & 0xfffffffcu) |
-	                                                   (static_cast<uint64_t>(buffer[8]) << 32u));
+	auto*    then_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[7] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[8]) << 32u));
 	uint32_t then_num_dw = buffer[9] & 0xfffffu;
-	auto*    else_buffer = reinterpret_cast<uint32_t*>((buffer[10] & 0xfffffffcu) |
-	                                                   (static_cast<uint64_t>(buffer[11]) << 32u));
+	auto*    else_buffer = reinterpret_cast<const uint32_t*>(
+	    (buffer[10] & 0xfffffffcu) | (static_cast<uint64_t>(buffer[11]) << 32u));
 	uint32_t else_num_dw = buffer[12] & 0xfffffu;
 
 	EXIT_NOT_IMPLEMENTED(compare_addr == nullptr);
@@ -1931,10 +1877,10 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
 
 	if (take_then) {
-		cp.ProcessIndirectBuffer(then_buffer, then_num_dw);
+		cp.ProcessIndirectBuffer({then_buffer, then_num_dw});
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
-		cp.ProcessIndirectBuffer(else_buffer, else_num_dw);
+		cp.ProcessIndirectBuffer({else_buffer, else_num_dw});
 	}
 
 	return payload_dw;
@@ -2201,12 +2147,19 @@ KYTY_CP_OP_PARSER(CpOpEventWrite) {
 
 	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != Pm4::IT_EVENT_WRITE);
 
-	uint32_t event_index = (buffer[0] >> 8u) & 0x7u;
-	uint32_t event_type  = (buffer[0]) & 0x3fu;
+	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
+	uint32_t   event_index    = (buffer[0] >> 8u) & 0x7u;
+	uint32_t   event_type     = (buffer[0]) & 0x3fu;
+	uint64_t   event_address  = 0;
 
-	cp.TriggerEvent(event_type, event_index);
+	if (event_type == 0x39u) {
+		EXIT_NOT_IMPLEMENTED(packet_size_dw != 4u);
+		event_address = buffer[1] | (static_cast<uint64_t>(buffer[2]) << 32u);
+	}
 
-	return KYTY_PM4_LEN(cmd_id) - 1u;
+	cp.TriggerEvent(event_type, event_index, event_address);
+
+	return packet_size_dw - 1u;
 }
 
 KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
@@ -2368,7 +2321,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 	}
 
 	auto* indirect_buffer =
-	    reinterpret_cast<uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
+	    reinterpret_cast<const uint32_t*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
 	uint32_t                     indirect_num_dw = control & 0xfffffu;
 	static std::atomic<uint32_t> indirect_log_count {0};
 	if (indirect_log_count.fetch_add(1) < 128) {
@@ -2388,7 +2341,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectBuffer) {
 
 	GraphicsDbgDumpDcb("ci", indirect_num_dw, indirect_buffer);
 
-	cp.ProcessIndirectBuffer(indirect_buffer, indirect_num_dw);
+	cp.ProcessIndirectBuffer({indirect_buffer, indirect_num_dw});
 
 	return 3;
 }
@@ -2411,10 +2364,10 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		// Keep the encoded offset for packet control values, and use the decoded offset only
-		// for register dispatch.
+		// Keep the encoded offset for packet control values, and use the normalized offset
+		// only for register dispatch.
 		auto raw_cmd_offset = indirect_buffer[0];
-		auto cmd_offset     = DecodeIndirectCxRegisterOffset(raw_cmd_offset);
+		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 		auto value          = indirect_buffer[1];
 
 		if (HwCtxTrySetFakeRegister(cmd_offset, value)) {
@@ -2864,6 +2817,20 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	auto pfunc = g_hw_sh_func[cmd_offset];
 
 	if (pfunc == nullptr) {
+		auto num_values = KYTY_PM4_LEN(cmd_id) - 2u;
+		bool handled    = num_values != 0;
+		for (uint32_t i = 0; i < num_values; i++) {
+			if (cmd_offset + i >= Pm4::SH_NUM || g_hw_sh_indirect_func[cmd_offset + i] == nullptr) {
+				handled = false;
+				break;
+			}
+		}
+		if (handled) {
+			for (uint32_t i = 0; i < num_values; i++) {
+				g_hw_sh_indirect_func[cmd_offset + i](cp, cmd_offset + i, buffer[1 + i]);
+			}
+			return num_values + 1u;
+		}
 		EXIT("unknown shader register\n\t%05" PRIx32 ":\n\tcmd_id = %08" PRIx32
 		     "\n\tcmd_offset = %08" PRIx32 "\n",
 		     num_dw - dw, cmd_id, cmd_offset);
@@ -2876,6 +2843,10 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
+
+	if (Gen5::AgcIsInternalDataPacket(cmd_id, buffer)) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
 
 	auto raw_cmd_offset = buffer[0];
 	auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
@@ -2967,19 +2938,21 @@ template <typename T>
 static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
-	constexpr auto value_dw   = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
+	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
 	constexpr auto payload_dw = 4u + value_dw * 2u;
 	constexpr auto packet_dw  = payload_dw + 1u;
-	constexpr auto register_id =
-	    (sizeof(T) == sizeof(uint32_t) ? Pm4::R_WAIT_MEM_32 : Pm4::R_WAIT_MEM_64);
+	constexpr auto opcode =
+	    (sizeof(T) == sizeof(uint32_t) ? Pm4::IT_WAIT_REG_MEM : Pm4::IT_WAIT_REG_MEM_64);
 
-	EXIT_NOT_IMPLEMENTED(KYTY_PM4_R(cmd_id) != register_id);
+	EXIT_NOT_IMPLEMENTED(((cmd_id >> 8u) & 0xffu) != opcode || KYTY_PM4_R(cmd_id) != 0u);
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
 
-	auto* addr = reinterpret_cast<const T*>(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 2u);
-	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 2u + value_dw);
-	auto  ctrl = buffer[2u + value_dw * 2u];
+	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
+	auto  ctrl = buffer[0];
+	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
+	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
+	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
+	auto  mask = CpOpWaitRegMemReadValue<T>(buffer + 3u + value_dw);
 	auto  poll = buffer[3u + value_dw * 2u];
 
 	EXIT_NOT_IMPLEMENTED((ctrl & 0x10u) == 0);

@@ -47,6 +47,7 @@ enum class Opcode {
 	S_FF1_I32_B64,
 	S_FLBIT_I32_B64,
 	S_BITREPLICATE_B64_B32,
+	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
 	S_AND_SAVEEXEC_B32,
@@ -298,6 +299,8 @@ enum class Opcode {
 	V_LSHRREV_B32,
 	V_ASHR_I32,
 	V_ASHRREV_I32,
+	V_LSHLREV_B64,
+	V_LSHRREV_B64,
 	V_LSHLREV_B16,
 	V_LSHRREV_B16,
 	V_ASHRREV_I16,
@@ -363,6 +366,7 @@ enum class Opcode {
 	V_CMPX_LE_F16,
 	V_CMPX_GT_F16,
 	V_CMPX_GE_F16,
+	V_CMPX_NGT_F16,
 	V_CMPX_NEQ_F16,
 	V_CMPX_NLT_F16,
 	V_CMPX_LT_I32,
@@ -375,6 +379,7 @@ enum class Opcode {
 	V_CMP_EQ_U16,
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
+	V_CMPX_GT_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,
@@ -388,6 +393,8 @@ enum class Opcode {
 	V_CMP_EQ_I64,
 	V_CMP_GT_U64,
 	V_CMP_NE_U64,
+	V_CMPX_NE_I64,
+	V_CMPX_NE_U64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
 	V_CMPX_LE_U32,
@@ -490,7 +497,9 @@ enum class Opcode {
 	DS_READ_U8,
 	DS_READ_I16,
 	DS_READ_U16,
+	DS_READ_U16_D16,
 	DS_READ2_B32,
+	DS_READ2ST64_B32,
 	DS_READ_B32,
 	DS_READ_B64,
 	DS_READ2_B64,
@@ -585,6 +594,7 @@ enum ImageSampleFlag : uint32_t {
 	ImageSampleFlagA16              = 1u << 7u,
 	ImageSampleFlagCd               = 1u << 8u,
 	ImageSampleFlagGatherHorizontal = 1u << 9u,
+	ImageSampleFlagAdjust           = 1u << 10u,
 };
 
 enum class ImageDimension : uint32_t {
@@ -646,6 +656,7 @@ struct Instruction {
 	uint32_t       offset                                       = 0;
 	uint32_t       secondary_offset                             = 0;
 	uint32_t       dmask                                        = 0;
+	uint32_t       data_components                              = 0;
 	uint32_t       data_dwords                                  = 1;
 	uint32_t       data_bits                                    = 32;
 	uint32_t       data_format                                  = 0;
@@ -664,6 +675,7 @@ struct Instruction {
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
+	bool           image_r128                                   = false;
 	int32_t        branch_offset                                = 0;
 	uint32_t       branch_target                                = 0;
 	struct {

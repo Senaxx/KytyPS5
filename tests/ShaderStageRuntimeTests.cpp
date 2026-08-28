@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
@@ -23,12 +23,11 @@ bool RejectSpecializationRead(void *userdata, uint64_t, uint32_t *) {
 Libs::Graphics::ShaderRecompiler::IR::Block &
 AddValueBlock(Libs::Graphics::ShaderRecompiler::IR::Program &program) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  program.values = std::make_shared<ValueProgram>();
   auto block = std::make_unique<Block>();
   auto *result = block.get();
-  program.values->blocks.push_back(result);
-  program.values->block_info.push_back({.id = 0});
-  program.values->block_storage.push_back(std::move(block));
+  program.blocks.push_back(result);
+  program.block_info.push_back({.id = 0});
+  program.block_storage.push_back(std::move(block));
   return *result;
 }
 
@@ -44,7 +43,7 @@ SrtProgram(uint64_t address) {
   MemoryInfo memory;
   memory.kind = ResourceKind::ScalarAddress;
   memory.planning_only = true;
-  program.values->memory_info.push_back(memory);
+  program.memory_info.push_back(memory);
   const auto low = Value(static_cast<uint32_t>(address));
   const auto high = Value(static_cast<uint32_t>(address >> 32u));
   auto &handle =
@@ -53,7 +52,7 @@ SrtProgram(uint64_t address) {
       ValueOpcode::LoadAddressU32,
       {Value(&handle), Value(0u), Value(0u), Value(true)});
   raw.SetFlags(MemoryFlags{.index = 0, .pc = 0x40});
-  program.values->srt_reads.push_back({Value(&raw), 0, 0x40});
+  program.srt_reads.push_back({Value(&raw), 0, 0x40});
 
   auto &srt = value_block.AppendNewInst(ValueOpcode::GetSrtResource);
   auto &flat = value_block.AppendNewInst(ValueOpcode::ReadConst,
@@ -62,7 +61,7 @@ SrtProgram(uint64_t address) {
   source.dwords[0] = Value(&flat);
   source.dwords[1] = Value(0u);
   source.dword_count = 2;
-  program.values->descriptor_sources.push_back(source);
+  program.descriptor_sources.push_back(source);
   return std::make_shared<const Program>(std::move(program));
 }
 
@@ -74,12 +73,7 @@ UnbasedFlatProgram() {
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   AddValueBlock(program);
-  AddressResource address;
-  address.source = UINT32_MAX;
-  address.first_use_pc = 0x80;
-  address.kind = ResourceKind::Flat;
-  address.unbased = true;
-  program.info.addresses.push_back(address);
+  program.info.uses_dma = true;
   return std::make_shared<const Program>(std::move(program));
 }
 
@@ -103,7 +97,7 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
-void TestUnbasedFlatCacheHitFailsClosed() {
+void TestUnbasedFlatCacheHitMaterializes() {
   using namespace Libs::Graphics;
   auto cached_program = UnbasedFlatProgram();
   auto prior_program = std::make_shared<const ShaderRecompiler::IR::Program>();
@@ -111,12 +105,9 @@ void TestUnbasedFlatCacheHitFailsClosed() {
       std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>();
   ShaderStageRuntime stage{prior_program, prior_resources};
   std::string error;
-  Check(!ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error) &&
-            error.find("requires runtime guest-address translation") !=
-                std::string::npos,
-        "unbased FLAT cache hit did not fail without a runtime translator");
-  Check(stage.program == prior_program && stage.resources == prior_resources,
-        "unbased FLAT cache rejection replaced the prior stage snapshot");
+  Check(ShaderMaterializeStageRuntime(cached_program, {}, 0, stage, &error), error.c_str());
+  Check(stage.program == cached_program && stage.resources != prior_resources,
+        "unbased FLAT cache hit did not publish its BDA stage snapshot");
 }
 
 } // namespace
@@ -131,7 +122,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
-  TestUnbasedFlatCacheHitFailsClosed();
+  TestUnbasedFlatCacheHitMaterializes();
   std::puts("ShaderStageRuntimeTests: all cases passed");
   return 0;
 }
@@ -141,5 +132,5 @@ int main() {
 #include "graphics/shader/recompiler/ir/Block.cpp"
 #include "graphics/shader/recompiler/ir/Type.cpp"
 #include "graphics/shader/recompiler/ir/Value.cpp"
-#include "graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "graphics/shader/recompiler/ir/Program.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"

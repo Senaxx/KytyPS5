@@ -7,7 +7,6 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
@@ -15,6 +14,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
@@ -46,7 +46,9 @@ std::string MakeIrDump(const CFG::Graph& cfg, const IR::Program& ir) {
 	std::string dump = "CFG:\n";
 	dump += CFG::GraphToString(cfg);
 	dump += "\nIR:\n";
-	dump += ir.values != nullptr ? IR::ValueProgramToString(*ir.values) : IR::ProgramToString(ir);
+	dump += fmt::format("mode={} scratch_dwords={}\n",
+	                    ir.dispatcher_fallback ? "dispatcher" : "structured", ir.scratch_dwords);
+	dump += IR::ProgramToString(ir);
 	return dump;
 }
 
@@ -75,85 +77,6 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(predecessors), static_cast<uint64_t>(successors),
 	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
 	     static_cast<uint64_t>(cfg.back_edges.size()), reason.c_str());
-}
-
-bool InstructionMaySplitSpirvBlock(const IR::Instruction& inst) {
-	switch (inst.op) {
-		case IR::Opcode::SLoadDword:
-		case IR::Opcode::SBufferLoadDword:
-		case IR::Opcode::BufferLoadUbyte:
-		case IR::Opcode::BufferLoadSbyte:
-		case IR::Opcode::BufferLoadUshort:
-		case IR::Opcode::BufferLoadSshort:
-		case IR::Opcode::BufferLoadDword:
-		case IR::Opcode::BufferStoreByte:
-		case IR::Opcode::BufferStoreShort:
-		case IR::Opcode::BufferStoreDword:
-		case IR::Opcode::AtomicSwapU32:
-		case IR::Opcode::AtomicAddU32:
-		case IR::Opcode::AtomicSubU32:
-		case IR::Opcode::AtomicSMinI32:
-		case IR::Opcode::AtomicUMinU32:
-		case IR::Opcode::AtomicSMaxI32:
-		case IR::Opcode::AtomicUMaxU32:
-		case IR::Opcode::AtomicAndU32:
-		case IR::Opcode::AtomicOrU32:
-		case IR::Opcode::AtomicXorU32:
-		case IR::Opcode::AtomicFMinF32:
-		case IR::Opcode::AtomicFMaxF32:
-		case IR::Opcode::FlatLoadUbyte:
-		case IR::Opcode::FlatLoadSbyte:
-		case IR::Opcode::FlatLoadUshort:
-		case IR::Opcode::FlatLoadSshort:
-		case IR::Opcode::FlatLoadDword:
-		case IR::Opcode::FlatStoreByte:
-		case IR::Opcode::FlatStoreShort:
-		case IR::Opcode::FlatStoreDword:
-		case IR::Opcode::DsReadUbyte:
-		case IR::Opcode::DsReadSbyte:
-		case IR::Opcode::DsReadUshort:
-		case IR::Opcode::DsReadSshort:
-		case IR::Opcode::DsReadB32:
-		case IR::Opcode::DsMinF32:
-		case IR::Opcode::DsMaxF32:
-		case IR::Opcode::DsWriteByte:
-		case IR::Opcode::DsWriteShort:
-		case IR::Opcode::DsWriteB32:
-		case IR::Opcode::DsWriteAddtidB32:
-		case IR::Opcode::DsReadAddtidB32:
-		case IR::Opcode::DsAppend:
-		case IR::Opcode::DsConsume:
-		case IR::Opcode::ImageLoad:
-		case IR::Opcode::ImageStore:
-		case IR::Opcode::ImageSample:
-		case IR::Opcode::ImageGather4:
-		case IR::Opcode::Export: return true;
-		default: return false;
-	}
-}
-
-bool NeedsDispatcherForStructuredLoopHeader(const IR::Program& ir, uint32_t* failure_block,
-                                            std::string* reason) {
-	for (const auto& block: ir.blocks) {
-		if (!block.terminator.loop_header) {
-			continue;
-		}
-		for (const auto& inst: block.instructions) {
-			if (!InstructionMaySplitSpirvBlock(inst)) {
-				continue;
-			}
-			if (reason != nullptr) {
-				*reason = fmt::format("loop header block {} contains an instruction whose SPIR-V "
-				                      "lowering emits internal control flow: {}",
-				                      block.id, IR::InstructionToString(inst).c_str());
-			}
-			if (failure_block != nullptr) {
-				*failure_block = block.id;
-			}
-			return true;
-		}
-	}
-	return false;
 }
 
 enum class EmbeddedFetchValueType {
@@ -193,17 +116,8 @@ void ClearEmbeddedFetchVectorLanes(EmbeddedFetchVectorLanes* lanes, uint32_t reg
 	lanes->erase(first, last);
 }
 
-struct EmbeddedFetchLoad {
-	uint32_t              pc         = 0;
-	int                   attrib_id  = -1;
-	uint32_t              components = 0;
-	std::vector<uint32_t> prolog_loads;
-};
-
-struct EmbeddedFetchData {
-	std::vector<EmbeddedFetchLoad> loads;
-	int32_t                        vertex_offset_sgpr = -1;
-};
+using EmbeddedFetchLoad = Frontend::EmbeddedFetchLoad;
+using EmbeddedFetchData = Frontend::EmbeddedFetchPlan;
 
 bool IsDecodedSgpr(const Decoder::Operand& op) {
 	return op.kind == Decoder::OperandKind::Sgpr || op.kind == Decoder::OperandKind::VccLo ||
@@ -320,15 +234,6 @@ bool IsEmbeddedFetchAttribPropagationAlu(const Decoder::Instruction& inst) {
 
 int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
-}
-
-void AppendUniquePcs(std::vector<uint32_t>& dst, const std::vector<uint32_t>& src) {
-	dst.reserve(dst.size() + src.size());
-	for (auto pc: src) {
-		if (std::find(dst.begin(), dst.end(), pc) == dst.end()) {
-			dst.push_back(pc);
-		}
-	}
 }
 
 EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded,
@@ -565,101 +470,6 @@ EmbeddedFetchData DetectEmbeddedVertexFetch(const Decoder::Program&      decoded
 	return data;
 }
 
-const EmbeddedFetchLoad* FindEmbeddedFetchLoad(const std::vector<EmbeddedFetchLoad>& loads,
-                                               uint32_t                              pc) {
-	for (const auto& load: loads) {
-		if (load.pc == pc) {
-			return &load;
-		}
-	}
-	return nullptr;
-}
-
-bool EmbeddedFetchPcInList(const std::vector<uint32_t>& pcs, uint32_t pc) {
-	return std::find(pcs.begin(), pcs.end(), pc) != pcs.end();
-}
-
-bool IsIrFetchPrologLoad(const IR::Instruction& inst) {
-	return inst.op == IR::Opcode::SLoadDword || inst.op == IR::Opcode::SBufferLoadDword;
-}
-
-int ResolveEmbeddedFetchResource(const ShaderVertexInputInfo* input_info,
-                                 const EmbeddedFetchLoad&     load) {
-	if (load.attrib_id >= 0 && load.attrib_id < input_info->resources_num &&
-	    input_info->resources_dst[load.attrib_id].attr_id == load.attrib_id) {
-		return load.attrib_id;
-	}
-	for (int i = 0; i < input_info->resources_num; i++) {
-		const auto& dst = input_info->resources_dst[i];
-		if (dst.attr_id == load.attrib_id &&
-		    load.components <= static_cast<uint32_t>(std::max(dst.registers_num, 1))) {
-			return i;
-		}
-	}
-	for (int i = 0; i < input_info->resources_num; i++) {
-		if (input_info->resources_dst[i].attr_id == load.attrib_id) {
-			return i;
-		}
-	}
-	return -1;
-}
-
-uint32_t RewriteEmbeddedVertexFetches(IR::Program& ir, const ShaderVertexInputInfo* input_info,
-                                      const std::vector<EmbeddedFetchLoad>& loads) {
-	if (loads.empty()) {
-		return 0;
-	}
-
-	std::vector<uint32_t> prolog_pcs;
-	prolog_pcs.reserve(loads.size());
-	for (const auto& load: loads) {
-		AppendUniquePcs(prolog_pcs, load.prolog_loads);
-	}
-
-	auto*    mutable_input_info = const_cast<ShaderVertexInputInfo*>(input_info);
-	uint32_t rewritten          = 0;
-	for (auto& block: ir.blocks) {
-		for (auto& inst: block.instructions) {
-			if (IsIrFetchPrologLoad(inst) && EmbeddedFetchPcInList(prolog_pcs, inst.pc)) {
-				auto pc = inst.pc;
-				inst    = {};
-				inst.pc = pc;
-				inst.op = IR::Opcode::ControlNop;
-				continue;
-			}
-
-			if (inst.op != IR::Opcode::BufferLoadDword) {
-				continue;
-			}
-			const auto* load = FindEmbeddedFetchLoad(loads, inst.pc);
-			if (load == nullptr || inst.memory.component_index >= load->components) {
-				continue;
-			}
-
-			const auto resource_id = ResolveEmbeddedFetchResource(input_info, *load);
-			if (resource_id < 0 || resource_id >= input_info->resources_num) {
-				LOGF("ShaderRecompiler VS embedded fetch remap failed: pc=0x%08" PRIx32
-				     " attrib=%d resources=%d\n",
-				     inst.pc, load->attrib_id, input_info->resources_num);
-				continue;
-			}
-
-			inst.op              = IR::Opcode::LoadInputF32;
-			inst.input_info.attr = static_cast<uint32_t>(resource_id);
-			inst.input_info.chan = inst.memory.component_index;
-			inst.memory          = {};
-			inst.src_count       = 0;
-
-			mutable_input_info->resource_fetch_components[resource_id] =
-			    std::max(mutable_input_info->resource_fetch_components[resource_id],
-			             static_cast<int>(inst.input_info.chan + 1u));
-			rewritten++;
-		}
-	}
-
-	return rewritten;
-}
-
 } // namespace
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
@@ -676,17 +486,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			*error = "shader recompiler supports compute, vertex, and pixel stages";
 		}
 		return false;
-	}
-	if (const char* raw_path = std::getenv("KYTY_DEBUG_SHADER_WORD_COUNT_RAW_DUMP");
-	    raw_path != nullptr && raw_path[0] != '\0') {
-		const char* words_text = std::getenv("KYTY_DEBUG_SHADER_WORD_COUNT");
-		if (words_text != nullptr && words_text[0] != '\0' &&
-		    std::strtoull(words_text, nullptr, 0) == code.size()) {
-			if (auto* file = std::fopen(raw_path, "wb"); file != nullptr) {
-				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
-				std::fclose(file);
-			}
-		}
 	}
 
 	const auto compile_begin = std::chrono::steady_clock::now();
@@ -762,90 +561,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 
 	IR::Program ir;
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR LowerProgram\n", GetDumpLabel(options),
-	     StageName(options.stage), options.shader_hash);
-	const auto lower_program = [&](IR::Program& output) {
-		output = {};
-		if (!IR::LowerProgram(decoded, cfg, options.stage, options.wave_size, output, error)) {
-			return false;
-		}
-		output.lane_mask_mode  = options.lane_mask_mode;
-		output.shader_hash     = options.shader_hash;
-		output.user_data_base  = options.user_data_base;
-		output.user_data_count = options.user_data_count;
-		return true;
-	};
-	if (!lower_program(ir)) {
-		return false;
-	}
-
-	if (!dispatcher_fallback) {
-		const auto select_dispatcher = [&](uint32_t failure_block, const std::string& reason,
-		                                   const CFG::Graph& diagnostic_cfg) {
-			dispatcher_fallback    = true;
-			dispatcher_reason      = reason;
-			cfg.failure_kind       = CFG::FailureKind::StructuredControlFlow;
-			cfg.failure_block      = failure_block;
-			cfg.unsupported_reason = reason;
-			ir.cfg_failure_kind    = CFG::FailureKind::StructuredControlFlow;
-			ir.fallback_reason     = reason;
-			LogDispatcherFallback(options, diagnostic_cfg, "emit", reason);
-		};
-		const auto retry_budget = cfg.natural_loops.size();
-		for (size_t retry = 0;; retry++) {
-			std::string emitter_reason;
-			uint32_t    failure_block = UINT32_MAX;
-			if (!NeedsDispatcherForStructuredLoopHeader(ir, &failure_block, &emitter_reason)) {
-				break;
-			}
-			if (retry >= retry_budget) {
-				select_dispatcher(failure_block,
-				                  emitter_reason + "; no-clone loop-header isolation exhausted",
-				                  cfg);
-				break;
-			}
-
-			const auto* source_block = cfg.FindBlock(failure_block);
-			const auto  source_pc = source_block != nullptr ? source_block->start_pc : UINT32_MAX;
-			const auto  previous_cfg  = cfg;
-			const auto  blocks_before = cfg.blocks.size();
-			std::string isolation_error;
-			if (!CFG::IsolateLoopHeader(cfg, failure_block, &isolation_error)) {
-				const auto failed_cfg = cfg;
-				cfg                   = previous_cfg;
-				select_dispatcher(failure_block,
-				                  fmt::format("{}; no-clone loop-header isolation failed: {}",
-				                              emitter_reason, isolation_error),
-				                  failed_cfg);
-				break;
-			}
-
-			IR::Program isolated_ir;
-			if (!lower_program(isolated_ir)) {
-				const auto lower_error = error != nullptr ? *error : "IR lowering failed";
-				if (error != nullptr) {
-					error->clear();
-				}
-				cfg = previous_cfg;
-				select_dispatcher(failure_block,
-				                  fmt::format("{}; isolated loop-header lowering failed: {}",
-				                              emitter_reason, lower_error),
-				                  cfg);
-				break;
-			}
-			ir = std::move(isolated_ir);
-			LOGF("%s CFG isolated semantic loop header: stage=%s hash=0x%016" PRIx64
-			     " source_block=%" PRIu32 " pc=0x%08" PRIx32 " blocks=%" PRIu64 "->%" PRIu64
-			     " reason=%s\n",
-			     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-			     failure_block, source_pc, static_cast<uint64_t>(blocks_before),
-			     static_cast<uint64_t>(cfg.blocks.size()), emitter_reason.c_str());
-		}
-	}
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR LowerProgram blocks=%" PRIu64
-	     " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
 	const ShaderComputeInputInfo* compute = nullptr;
@@ -857,40 +572,59 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 	EmbeddedFetchData embedded_fetch;
 	if (options.stage == ShaderType::Vertex && vertex->fetch_embedded) {
-		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, ir.user_data_base,
-		                                           ir.user_data_count, options.wave_size);
-		auto rewritten = RewriteEmbeddedVertexFetches(ir, vertex, embedded_fetch.loads);
-		if (rewritten > 0 || !embedded_fetch.loads.empty()) {
-			LOGF("%s embedded vertex fetch rewrite: detected=%" PRIu64 " rewritten=%" PRIu32 "\n",
-			     GetDumpLabel(options), static_cast<uint64_t>(embedded_fetch.loads.size()),
-			     rewritten);
+		embedded_fetch = DetectEmbeddedVertexFetch(decoded, vertex, options.user_data_base,
+		                                           options.user_data_count, options.wave_size);
+		if (!embedded_fetch.loads.empty()) {
+			LOGF("%s embedded vertex fetch plan: detected=%" PRIu64 "\n", GetDumpLabel(options),
+			     static_cast<uint64_t>(embedded_fetch.loads.size()));
 		}
 	}
-	ir.dispatcher_fallback = dispatcher_fallback;
-	if (!dispatcher_reason.empty()) {
-		ir.fallback_reason = dispatcher_reason;
-	}
-
-	ir.values = std::make_shared<IR::ValueProgram>();
-	if (!Frontend::TranslateProgram(ir, *ir.values, vertex, pixel, compute, error)) {
+	Frontend::TranslateOptions translate_options {
+	    .stage               = options.stage,
+	    .wave_size           = options.wave_size,
+	    .shader_hash         = options.shader_hash,
+	    .user_data_base      = options.user_data_base,
+	    .user_data_count     = options.user_data_count,
+	    .scratch_dwords      = options.scratch_dwords,
+	    .dispatcher_fallback = dispatcher_fallback,
+	    .cfg_failure_kind    = cfg.failure_kind,
+	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
+	                                                    : dispatcher_reason,
+	    .vertex              = vertex,
+	    .pixel               = pixel,
+	    .compute             = compute,
+	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	};
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+	if (!Frontend::TranslateProgram(decoded, cfg, translate_options, ir, error)) {
 		return false;
 	}
-	ir.blocks.clear();
-	IR::RewriteToSsa(ir.values->blocks);
-	IR::ConstantPropagationPass(ir.values->blocks);
-	for (auto& info: ir.values->block_info) {
-		info.condition       = info.condition.Resolve();
-		info.indirect_target = info.indirect_target.Resolve();
-	}
-	IR::RemoveIdentities(ir.values->blocks);
-	IR::EliminateDeadCode(ir.values->blocks);
-	const auto read_lane_stats = IR::EliminateReadLane(*ir.values, ir.wave_size);
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
+	     " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	IR::RewriteToSsa(ir.blocks);
+	IR::ConstantPropagationPass(ir.blocks);
+	IR::ResolveControlFlowIdentities(ir);
+	IR::RemoveIdentities(ir.blocks);
+	IR::EliminateDeadCode(ir.blocks);
+	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
 		     read_lane_stats.rewritten_reads);
-		IR::ConstantPropagationPass(ir.values->blocks);
-		IR::RemoveIdentities(ir.values->blocks);
-		IR::EliminateDeadCode(ir.values->blocks);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (options.stage == ShaderType::Compute) {
+		const auto lds_barriers =
+		    IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *compute);
+		if (lds_barriers.inserted_barriers != 0) {
+			LOGF("%s wave64 LDS synchronization: barriers=%" PRIu32 "\n", GetDumpLabel(options),
+			     lds_barriers.inserted_barriers);
+		}
 	}
 	std::string srt_error;
 	if (!IR::BuildSrtPlan(ir, &srt_error)) {
@@ -900,38 +634,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		}
 		return false;
 	}
-	IR::EliminateDeadCode(ir.values->blocks);
-	if (const char* dump_path = std::getenv("KYTY_DEBUG_SHADER_VALUE_IR_DUMP");
-	    dump_path != nullptr && dump_path[0] != '\0') {
-		const char* hash_text = std::getenv("KYTY_DEBUG_SHADER_VALUE_IR_HASH");
-		if (hash_text == nullptr || hash_text[0] == '\0' ||
-		    std::strtoull(hash_text, nullptr, 0) == options.shader_hash) {
-			if (auto* file = std::fopen(dump_path, "wb"); file != nullptr) {
-				const auto dump = IR::ValueProgramToString(*ir.values);
-				std::fwrite(dump.data(), 1, dump.size(), file);
-				std::fclose(file);
-			}
-		}
-	}
+	IR::EliminateDeadCode(ir.blocks);
 	if (!IR::TrackResources(ir, error)) {
-		if (const char* raw_path = std::getenv("KYTY_DEBUG_SHADER_FAILURE_RAW_DUMP");
-		    raw_path != nullptr && raw_path[0] != '\0') {
-			if (auto* file = std::fopen(raw_path, "wb"); file != nullptr) {
-				std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
-				std::fclose(file);
-			}
-		}
-		if (const char* dump_path = std::getenv("KYTY_DEBUG_SHADER_VALUE_IR_DUMP");
-		    dump_path != nullptr && dump_path[0] != '\0') {
-			if (auto* file = std::fopen(dump_path, "wb"); file != nullptr) {
-				const auto dump = IR::ValueProgramToString(*ir.values);
-				std::fwrite(dump.data(), 1, dump.size(), file);
-				std::fclose(file);
-			}
-		}
 		return false;
 	}
-	IR::EliminateDeadCode(ir.values->blocks);
+	IR::EliminateDeadCode(ir.blocks);
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
@@ -958,7 +665,6 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 			runtime.read_memory = ReadZeroMemory;
 		}
 		runtime.userdata         = options.read_memory_data;
-		runtime.flat_memory_base = options.flat_memory_base;
 		if (!IR::MaterializeResources(ir, runtime, resources, error)) {
 			return false;
 		}
@@ -974,13 +680,12 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	if (!IR::CollectShaderInfo(ir, info_options, error)) {
 		return false;
 	}
-	IR::BindingLayoutOptions layout_options;
-	layout_options.descriptor_set       = options.descriptor_set;
-	layout_options.push_constant_offset = options.push_constant_offset;
-	if (!IR::AllocateBindings(ir, layout_options, error)) {
+	if (!IR::AllocateBindings(ir, options.push_constant_offset, error)) {
 		return false;
 	}
-	ir.spirv_requirements = Spirv::GetProgramRequirements(ir);
+	if (!Spirv::AnalyzeProgramRequirements(ir, error)) {
+		return false;
+	}
 	std::string ir_dump;
 	if (options.dump_ir) {
 		ir_dump = MakeIrDump(cfg, ir);

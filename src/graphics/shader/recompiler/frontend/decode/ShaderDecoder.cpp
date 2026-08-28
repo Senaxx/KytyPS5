@@ -140,6 +140,7 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 	AppendFlag(&text, &first, flags, ImageSampleFlagA16, "a16");
 	AppendFlag(&text, &first, flags, ImageSampleFlagCd, "cd");
 	AppendFlag(&text, &first, flags, ImageSampleFlagGatherHorizontal, "gather_horizontal");
+	AppendFlag(&text, &first, flags, ImageSampleFlagAdjust, "adjust");
 	return text;
 }
 
@@ -153,6 +154,12 @@ std::string FormatMimg(const Instruction& inst) {
 	                OperandToString(inst.dst).c_str(), OperandToString(inst.src0).c_str(),
 	                OperandToString(inst.src1).c_str(), OperandToString(inst.src2).c_str(),
 	                inst.dmask, ImageDimensionToString(inst.image_dimension));
+	if (inst.data_bits == 16u) {
+		text += " d16=1";
+	}
+	if (inst.image_r128) {
+		text += " r128=1";
+	}
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_GATHER4_LZ:
@@ -498,6 +505,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_FF1_I32_B64:
 		case Opcode::S_NOT_B64:
 		case Opcode::S_WQM_B64:
+		case Opcode::S_QUADMASK_B64:
 		case Opcode::S_AND_SAVEEXEC_B32:
 		case Opcode::S_ANDN1_SAVEEXEC_B32:
 		case Opcode::S_AND_SAVEEXEC_B64:
@@ -659,6 +667,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_I16:
 		case Opcode::DS_READ_U16:
 		case Opcode::DS_READ2_B32:
+		case Opcode::DS_READ2ST64_B32:
 		case Opcode::DS_READ_B32:
 		case Opcode::DS_READ_B64:
 		case Opcode::DS_READ2_B64:

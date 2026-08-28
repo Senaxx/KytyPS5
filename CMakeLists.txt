@@ -254,7 +254,7 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.0 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -263,6 +263,22 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
+
+set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
+set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")
+set(fault_buffer_shader_header "${gpu_tiler_generated_dir}/fault_buffer_process_spv.h")
+add_custom_command(
+	OUTPUT "${fault_buffer_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -DCACHING_PAGEBITS=14 -DMAX_PAGE_FAULTS=1024
+	        -o "${fault_buffer_shader_spv}" "${fault_buffer_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${fault_buffer_shader_spv} -DOUTPUT=${fault_buffer_shader_header}
+	        -DSYMBOL=FAULT_BUFFER_PROCESS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${fault_buffer_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -278,7 +294,7 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	add_custom_command(
 		OUTPUT "${shader_header}"
 		COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_blit_generated_dir}"
-		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.0 -Os
+		COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
@@ -430,6 +446,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ResourceTrackingTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
@@ -483,7 +500,7 @@ set(gpu_test_ms_depth_header
 add_custom_command(
 	OUTPUT "${gpu_test_ms_depth_header}"
 	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_test_generated_dir}"
-	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.0 -Os
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
 	        -o "${gpu_test_ms_depth_spv}" "${gpu_test_ms_depth_source}"
 	COMMAND ${CMAKE_COMMAND} -DINPUT=${gpu_test_ms_depth_spv}
 	        -DOUTPUT=${gpu_test_ms_depth_header} -DSYMBOL=GPU_TEST_MS_DEPTH_SPV

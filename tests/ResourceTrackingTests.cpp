@@ -1,5 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
-#include "graphics/shader/recompiler/ir/ValueProgram.h"
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -35,7 +35,6 @@ struct Fixture {
 
   explicit Fixture(ShaderType stage = ShaderType::Compute) {
     program.stage = stage;
-    program.values = std::make_shared<ValueProgram>();
     program.user_data_count = 64;
     block = AddBlock();
   }
@@ -43,10 +42,10 @@ struct Fixture {
   Block *AddBlock() {
     auto storage = std::make_unique<Block>();
     auto *result = storage.get();
-    program.values->block_storage.push_back(std::move(storage));
-    program.values->blocks.push_back(result);
-    program.values->block_info.push_back(
-        {.id = static_cast<uint32_t>(program.values->block_info.size())});
+    program.block_storage.push_back(std::move(storage));
+    program.blocks.push_back(result);
+    program.block_info.push_back(
+        {.id = static_cast<uint32_t>(program.block_info.size())});
     return result;
   }
 
@@ -77,8 +76,8 @@ struct Fixture {
 
   MemoryFlags AddMemory(MemoryInfo memory, uint32_t pc) {
     const auto index =
-        static_cast<uint32_t>(program.values->memory_info.size());
-    program.values->memory_info.push_back(memory);
+        static_cast<uint32_t>(program.memory_info.size());
+    program.memory_info.push_back(memory);
     return {index, pc};
   }
 
@@ -241,23 +240,23 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
-  EliminateDeadCode(fixture->program.values->blocks);
+  EliminateDeadCode(fixture->program.blocks);
   std::string validation_error;
   Check(
-      ValidateValueProgram(*fixture->program.values, true, &validation_error),
+      ValidateProgram(fixture->program, true, &validation_error),
       "post-tracking dead-code elimination invalidated descriptor provenance");
 
   Check(fixture->program.info.buffers.size() == 1 &&
             fixture->program.info.images.size() == 1 &&
-            fixture->program.values->dynamic_reads.size() == 1,
+            fixture->program.dynamic_reads.size() == 1,
         "indirect image key was not retained as a scalar-buffer read");
   const auto source = fixture->program.info.images[0].source;
-  Check(source < fixture->program.values->descriptor_sources.size() &&
-            fixture->program.values->descriptor_sources[source]
+  Check(source < fixture->program.descriptor_sources.size() &&
+            fixture->program.descriptor_sources[source]
                 .indirect_image.has_value(),
         "indirect image source was not retained for runtime proof");
-  const auto image_handle = std::ranges::find_if(
-      *fixture->block, [](const Inst &inst) {
+  const auto image_handle =
+      std::ranges::find_if(*fixture->block, [](const Inst &inst) {
         return inst.GetOpcode() == ValueOpcode::GetImageResource;
       });
   Check(image_handle != fixture->block->end() &&
@@ -296,7 +295,7 @@ void TestInvariantIndirectImageMaterialization() {
   const auto same_snapshot = [](const ResourceSnapshot &lhs,
                                 const ResourceSnapshot &rhs) {
     return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
-           lhs.samplers == rhs.samplers && lhs.addresses == rhs.addresses &&
+           lhs.samplers == rhs.samplers &&
            lhs.flattened_srt == rhs.flattened_srt &&
            lhs.user_data == rhs.user_data &&
            lhs.indirect_images.empty() == rhs.indirect_images.empty();
@@ -315,17 +314,6 @@ void TestInvariantIndirectImageMaterialization() {
         "rejected planning memory read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
 
-  user_data[2] = 4u;
-  memory.fail_address = 0x11c4u;
-  ResourceSnapshot bounded_snapshot;
-  Check(MaterializeResources(fixture->program, runtime, bounded_snapshot, &error) &&
-            bounded_snapshot.images.size() == 1 &&
-            std::equal(image_descriptor.begin(), image_descriptor.end(),
-                       bounded_snapshot.images[0].dwords.begin()),
-        "mapped indirect image selector prefix did not materialize");
-  user_data[2] = 2u;
-  memory.fail_address = UINT64_MAX;
-
   memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] = 0u;
@@ -337,11 +325,12 @@ void TestInvariantIndirectImageMaterialization() {
   memory.words[(0x2020u - memory.base) / 4u + 3u] =
       image_descriptor[3] ^ (1u << 28u);
   ResourceSnapshot null_snapshot;
-  Check(MaterializeResources(fixture->program, runtime, null_snapshot, &error) &&
-            null_snapshot.indirect_images.empty() &&
-            std::ranges::all_of(null_snapshot.images[0].dwords,
-                                [](uint32_t dword) { return dword == 0u; }),
-        "stale typed null image descriptors were not canonicalized");
+  Check(
+      MaterializeResources(fixture->program, runtime, null_snapshot, &error) &&
+          null_snapshot.indirect_images.empty() &&
+          std::ranges::all_of(null_snapshot.images[0].dwords,
+                              [](uint32_t dword) { return dword == 0u; }),
+      "stale typed null image descriptors were not canonicalized");
 
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
@@ -391,11 +380,12 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSnapshot capacity_snapshot;
   for (const uint32_t records : {1u, 3u}) {
     user_data[2] = records;
-    Check(MaterializeResources(fixture->program, runtime, capacity_snapshot,
-                               &error) &&
-              ValidateResourceSpecialization(fixture->program,
-                                             capacity_snapshot, &error),
-          "runtime indirect key mapping rejected a fitting material-table size");
+    Check(
+        MaterializeResources(fixture->program, runtime, capacity_snapshot,
+                             &error) &&
+            ValidateResourceSpecialization(fixture->program, capacity_snapshot,
+                                           &error),
+        "runtime indirect key mapping rejected a fitting material-table size");
   }
   user_data[2] = 2u;
   memory.words[(0x2020u - memory.base) / 4u] =
@@ -407,15 +397,16 @@ void TestInvariantIndirectImageMaterialization() {
         image_descriptor[dword];
   }
   memory.words[(0x1000u - memory.base + 68u) / 4u] = 2u;
-  Check(!MaterializeResources(fixture->program, runtime, rebound_snapshot,
-                              &error) &&
-            error.find("candidate topology") != std::string::npos &&
-            same_snapshot(rebound_snapshot, collapsed_snapshot),
-        "larger indirect candidate topology reused or mutated a cached snapshot");
+  Check(
+      !MaterializeResources(fixture->program, runtime, rebound_snapshot,
+                            &error) &&
+          error.find("candidate topology") != std::string::npos &&
+          same_snapshot(rebound_snapshot, collapsed_snapshot),
+      "larger indirect candidate topology reused or mutated a cached snapshot");
 
   auto memory_backed = MakeIndirectImageFixture(false, 0u, true);
   memory_backed->PlanAndTrack();
-  EliminateDeadCode(memory_backed->program.values->blocks);
+  EliminateDeadCode(memory_backed->program.blocks);
   std::array<uint32_t, 11> memory_backed_user_data{0x1000u, 224u << 16u, 2u, 0u,
                                                    0x2000u, 16u << 16u,  4u, 0u,
                                                    7u,      0x3100u,     0u};
@@ -439,7 +430,7 @@ void TestInvariantIndirectImageMaterialization() {
             error.find("ReadFirstLane") != std::string::npos &&
             !malformed->program.resource_tracking_complete &&
             malformed->program.info.images.empty() &&
-            malformed->program.values->descriptor_sources.empty(),
+            malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
   auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
@@ -492,7 +483,7 @@ void TestDenseBufferTracking() {
 
   Check(fixture.program.info.buffers.size() == 2,
         "typed buffer sources were not densely interned");
-  Check(fixture.program.values->descriptor_sources.size() == 2,
+  Check(fixture.program.descriptor_sources.size() == 2,
         "descriptor source table did not match dense topology");
   const auto &resource = fixture.program.info.buffers[0];
   Check(resource.read && resource.written && resource.atomic &&
@@ -502,10 +493,10 @@ void TestDenseBufferTracking() {
   Check(first.Instruction()->Flags<uint32_t>() == 0 &&
             second.Instruction()->Flags<uint32_t>() == 1,
         "typed handles were not assigned dense indices");
-  Check(fixture.program.values->memory_info[load_flags.index].resource == 0 &&
-            fixture.program.values->memory_info[store_flags.index].resource ==
+  Check(fixture.program.memory_info[load_flags.index].resource == 0 &&
+            fixture.program.memory_info[store_flags.index].resource ==
                 0 &&
-            fixture.program.values->memory_info[other_flags.index].resource ==
+            fixture.program.memory_info[other_flags.index].resource ==
                 1,
         "typed memory metadata was not patched to dense indices");
 
@@ -539,8 +530,8 @@ void TestScalarAndVectorBufferAlias() {
   Check(fixture.program.info.buffers.size() == 1 &&
             fixture.program.info.buffers[0].scalar,
         "typed scalar and vector uses of one descriptor were split");
-  Check(fixture.program.values->memory_info[scalar_flags.index].resource == 0 &&
-            fixture.program.values->memory_info[vector_flags.index].resource ==
+  Check(fixture.program.memory_info[scalar_flags.index].resource == 0 &&
+            fixture.program.memory_info[vector_flags.index].resource ==
                 0,
         "scalar/vector alias did not share a dense index");
 }
@@ -575,275 +566,6 @@ void TestRuntimeUnsignedMinDescriptor() {
       "runtime descriptor unsigned minimum did not preserve its first operand");
 }
 
-void TestRuntimeFindLsbDescriptor() {
-  Fixture fixture;
-  const auto word0 =
-      fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(0)});
-  const auto descriptor = fixture.Image(
-      {word0, Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
-       Value(0u), Value(0u)},
-      0x118);
-  MemoryInfo memory;
-  memory.kind = ResourceKind::Image;
-  memory.image_dimension = Decoder::ImageDimension::Dim2D;
-  fixture.Emit(ValueOpcode::ImageRead,
-               {descriptor, fixture.ImageAddress(), Value(true)},
-               fixture.AddMemory(memory, 0x118));
-  fixture.PlanAndTrack();
-
-  std::array<uint32_t, 1> user_data{0x01000100u};
-  SrtRuntime runtime{.user_data = user_data};
-  DescriptorValue value;
-  std::string error;
-  const auto source = fixture.program.info.images[0].source;
-  Check(EvaluateDescriptorSource(fixture.program, source, 0x118, runtime, value,
-                                 &error) &&
-            value.dwords[0] == 8u,
-        "runtime descriptor FindILsb32 did not return the least-set-bit index");
-  user_data[0] = 0u;
-  Check(EvaluateDescriptorSource(fixture.program, source, 0x118, runtime, value,
-                                 &error) &&
-            value.dwords[0] == UINT32_MAX,
-        "runtime descriptor FindILsb32 did not preserve the all-zero sentinel");
-}
-
-void TestDirectAddressIndirectImageMaterialization() {
-  Fixture fixture(ShaderType::Pixel);
-  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 0x118);
-  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(2)});
-  const auto shifted = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
-  const auto first = fixture.Emit(ValueOpcode::IAdd32, {shifted, Value(0x158u)});
-  const auto second = fixture.Emit(ValueOpcode::IAdd32, {first, Value(16u)});
-  std::array<Value, 8> image_words;
-  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
-    MemoryInfo scalar;
-    scalar.kind = ResourceKind::ScalarAddress;
-    scalar.offset = (dword & 3u) * sizeof(uint32_t);
-    image_words[dword] = fixture.Emit(
-        ValueOpcode::LoadAddressU32,
-        {table, dword < 4u ? first : second, Value(0u), Value(true)},
-        fixture.AddMemory(scalar, 0x118));
-  }
-  const auto image = fixture.Image(image_words, 0x118);
-  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x118);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
-                                    {image, sampler, fixture.ImageAddress()},
-                                    fixture.AddMemory(sample, 0x118));
-  fixture.Emit(ValueOpcode::ReferenceU32,
-               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
-  fixture.PlanAndTrack();
-
-  Check(fixture.program.info.images.size() == 1,
-        "direct address image table was not tracked");
-  const auto source = fixture.program.info.images[0].source;
-  Check(source < fixture.program.values->descriptor_sources.size() &&
-            fixture.program.values->descriptor_sources[source].indirect_image.has_value() &&
-            fixture.program.values->descriptor_sources[source].indirect_image->mode ==
-                DescriptorSource::IndirectImage::Mode::DirectAddress &&
-            fixture.program.values->descriptor_sources[source].indirect_image->table_offset ==
-                0x158u &&
-            fixture.program.values->descriptor_sources[source].indirect_image->table_count ==
-                32u,
-        "direct address image-table proof lost its bounded metadata");
-
-  std::array<uint32_t, 3> user_data{0x1000u, 0u, 8u};
-  LinearTestMemory memory;
-  std::array<uint32_t, 8> descriptor{};
-  descriptor[0] = 0x20u;
-  descriptor[1] = static_cast<uint32_t>(
-                          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
-                      << 20u;
-  descriptor[2] = 3u | (3u << 14u);
-  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
-                  (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
-                   << 28u);
-  for (uint32_t entry = 0; entry < 32u; entry++) {
-    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
-      memory.words[(0x1158u - memory.base) / 4u + entry * 8u + dword] = descriptor[dword];
-    }
-  }
-  memory.words[(0x1158u - memory.base) / 4u + 7u * 8u] ^= 1u;
-  memory.words[(0x1158u - memory.base) / 4u + 8u * 8u + 3u] |= 1u << 12u;
-  SrtRuntime runtime{.user_data = user_data,
-                     .userdata = &memory,
-                     .read_specialization_memory = ReadLinearTestMemory};
-  ResourceSnapshot snapshot;
-  std::string error;
-  Check(MaterializeResources(fixture.program, runtime, snapshot, &error) &&
-            snapshot.images.size() == 1 && snapshot.indirect_images.size() == 1 &&
-            snapshot.indirect_images[0].keys.size() == 8u &&
-            snapshot.indirect_images[0].descriptors.size() == 2u &&
-            SpecializeResources(fixture.program, snapshot, &error) &&
-            fixture.program.info.images.size() == 2u &&
-            fixture.program.info.images[0].indirect_mapping_capacity == 32u,
-        "direct address image table did not materialize and specialize");
-}
-
-std::unique_ptr<Fixture> MakeDirectAddressInductionPhiImageFixture(uint32_t step) {
-  auto fixture = std::make_unique<Fixture>(ShaderType::Vertex);
-  auto *entry = fixture->block;
-  auto *loop = fixture->AddBlock();
-  entry->AddBranch(loop);
-  loop->AddBranch(loop);
-
-  const auto table = fixture->Address(fixture->UserData(0), fixture->UserData(1), 0x29c);
-  auto &key = loop->AppendNewInst(ValueOpcode::Phi, {},
-                                  static_cast<uint64_t>(Type::U32));
-  const auto next = fixture->Emit(ValueOpcode::IAdd32,
-                                  {Value(&key), Value(step)}, 0, loop);
-  key.AddPhiOperand(entry, Value(0u));
-  key.AddPhiOperand(loop, next);
-  const auto shifted = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
-                                     {Value(&key), Value(5u)}, 0, loop);
-  const auto first = fixture->Emit(ValueOpcode::IAdd32,
-                                   {shifted, Value(0x6b0u)}, 0, loop);
-  const auto second = fixture->Emit(ValueOpcode::IAdd32,
-                                    {first, Value(16u)}, 0, loop);
-
-  std::array<Value, 8> image_words;
-  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
-    MemoryInfo scalar;
-    scalar.kind = ResourceKind::ScalarAddress;
-    scalar.offset = (dword & 3u) * sizeof(uint32_t);
-    image_words[dword] = fixture->Emit(
-        ValueOpcode::LoadAddressU32,
-        {table, dword < 4u ? first : second, Value(0u), Value(true)},
-        fixture->AddMemory(scalar, 0x29c), loop);
-  }
-  const auto image = fixture->Emit(
-      ValueOpcode::GetImageResource,
-      {image_words[0], image_words[1], image_words[2], image_words[3],
-       image_words[4], image_words[5], image_words[6], image_words[7]},
-      MemoryFlags{0, 0x29c}, loop);
-  const auto sampler = fixture->Emit(
-      ValueOpcode::GetSamplerResource,
-      {Value(0u), Value(0u), Value(0u), Value(0u)},
-      MemoryFlags{0, 0x29c}, loop);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(
-      ValueOpcode::ImageSampleRaw,
-      {image, sampler, fixture->ImageAddress()},
-      fixture->AddMemory(sample, 0x29c), loop);
-  fixture->Emit(ValueOpcode::ReferenceU32,
-                {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
-                               {sampled, Value(0u)}, 0, loop)},
-                0, loop);
-  return fixture;
-}
-
-void TestDirectAddressInductionPhiImage() {
-  auto fixture = MakeDirectAddressInductionPhiImageFixture(1u);
-  fixture->PlanAndTrack();
-  Check(fixture->program.info.images.size() == 1,
-        "induction-phi image table was not tracked");
-  const auto source = fixture->program.info.images[0].source;
-  Check(source < fixture->program.values->descriptor_sources.size() &&
-            fixture->program.values->descriptor_sources[source]
-                .indirect_image.has_value() &&
-            fixture->program.values->descriptor_sources[source]
-                    .indirect_image->mode ==
-                DescriptorSource::IndirectImage::Mode::DirectAddress &&
-            fixture->program.values->descriptor_sources[source]
-                    .indirect_image->table_offset == 0x6b0u,
-        "induction-phi image table lost its direct-address provenance");
-
-  auto rejected = MakeDirectAddressInductionPhiImageFixture(2u);
-  std::string error;
-  Check(BuildSrtPlan(rejected->program, &error) &&
-            !TrackResources(rejected->program, &error) &&
-            error.find("control-dependent phi") != std::string::npos &&
-            !rejected->program.resource_tracking_complete &&
-            rejected->program.info.images.empty(),
-        "non-unit induction phi was accepted as a direct image table key");
-}
-
-std::unique_ptr<Fixture> MakeDirectAddressReadLaneImageFixture(bool bounded_selector) {
-  auto fixture = std::make_unique<Fixture>(ShaderType::Compute);
-  const auto table = fixture->Address(fixture->UserData(0), fixture->UserData(1), 0x1aec);
-  const auto selector = bounded_selector
-                            ? fixture->Emit(ValueOpcode::BitwiseAnd32,
-                                            {fixture->UserData(3), Value(31u)})
-                            : fixture->UserData(3);
-  const auto key = fixture->Emit(ValueOpcode::ReadLane,
-                                 {fixture->UserData(2), selector});
-  const auto shifted = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
-                                     {key, Value(5u)});
-  const auto first = fixture->Emit(ValueOpcode::IAdd32,
-                                   {shifted, Value(0x20e0u)});
-  const auto second = fixture->Emit(ValueOpcode::IAdd32,
-                                    {first, Value(16u)});
-
-  std::array<Value, 8> image_words;
-  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
-    MemoryInfo scalar;
-    scalar.kind = ResourceKind::ScalarAddress;
-    scalar.offset = (dword & 3u) * sizeof(uint32_t);
-    image_words[dword] = fixture->Emit(
-        ValueOpcode::LoadAddressU32,
-        {table, dword < 4u ? first : second, Value(0u), Value(true)},
-        fixture->AddMemory(scalar, 0x1aec));
-  }
-  const auto image = fixture->Image(image_words, 0x1aec);
-  const auto sampler = fixture->Sampler(
-      {Value(0u), Value(0u), Value(0u), Value(0u)}, 0x1aec);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(
-      ValueOpcode::ImageSampleRaw,
-      {image, sampler, fixture->ImageAddress()},
-      fixture->AddMemory(sample, 0x1aec));
-  fixture->Emit(ValueOpcode::ReferenceU32,
-                {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
-                               {sampled, Value(0u)})});
-  return fixture;
-}
-
-void TestDirectAddressReadLaneImage() {
-  auto fixture = MakeDirectAddressReadLaneImageFixture(true);
-  fixture->PlanAndTrack();
-  Check(fixture->program.info.images.size() == 1,
-        "bounded ReadLane image table was not tracked");
-  const auto source = fixture->program.info.images[0].source;
-  Check(source < fixture->program.values->descriptor_sources.size() &&
-            fixture->program.values->descriptor_sources[source]
-                .indirect_image.has_value() &&
-            fixture->program.values->descriptor_sources[source]
-                    .indirect_image->mode ==
-                DescriptorSource::IndirectImage::Mode::DirectAddress &&
-            fixture->program.values->descriptor_sources[source]
-                    .indirect_image->table_offset == 0x20e0u,
-        "bounded ReadLane image table lost its direct-address provenance");
-  bool retained_runtime_key = false;
-  for (const auto* block : fixture->program.values->blocks) {
-    for (const auto& inst : *block) {
-      if (inst.GetOpcode() != ValueOpcode::GetImageResource ||
-          inst.NumArgs() == 0u) {
-        continue;
-      }
-      const auto* key = inst.Arg(0).Resolve().TryInstruction();
-      retained_runtime_key = key != nullptr &&
-                             key->GetOpcode() == ValueOpcode::ReadLane;
-    }
-  }
-  Check(retained_runtime_key,
-        "bounded ReadLane image table did not retain its runtime selection key");
-
-  auto rejected = MakeDirectAddressReadLaneImageFixture(false);
-  std::string error;
-  Check(BuildSrtPlan(rejected->program, &error) &&
-            !TrackResources(rejected->program, &error) &&
-            error.find("ReadLane") != std::string::npos &&
-            !rejected->program.resource_tracking_complete &&
-            rejected->program.info.images.empty(),
-        "unbounded ReadLane selector was accepted as a direct image table key");
-}
-
 void TestImagesSamplersAndAliases() {
   Fixture fixture;
   std::array<Value, 8> image_words;
@@ -874,7 +596,7 @@ void TestImagesSamplersAndAliases() {
 
   const auto storage = fixture.Image(image_words, 16);
   MemoryInfo storage_memory;
-  storage_memory.kind = ResourceKind::StorageImage;
+  storage_memory.kind = ResourceKind::StorageImageUint;
   storage_memory.image_dimension = Decoder::ImageDimension::Dim2D;
   fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
                {storage, image_address, Value(1u), Value(true)},
@@ -902,12 +624,96 @@ void TestImagesSamplersAndAliases() {
             repeated.second.Instruction()->Flags<uint32_t>() == 0,
         "unused sampler border colors prevented source interning");
   const auto sampler_source = fixture.program.info.samplers[0].source;
-  Check(fixture.program.values->descriptor_sources[sampler_source]
+  Check(fixture.program.descriptor_sources[sampler_source]
                 .dwords[3]
                 .U32() == 0,
         "unused sampler border color was not canonicalized");
   Check(fixture.program.info.buffers[0].image_alias == 0,
         "buffer/image descriptor alias was not linked");
+}
+
+void TestSampleAdjustSamplerScratch() {
+  Fixture fixture(ShaderType::Pixel);
+  const auto active = fixture.Emit(ValueOpcode::WqmMask, {Value(true)});
+  const auto lane =
+      fixture.Emit(ValueOpcode::SelectU32, {active, Value(1u), Value(0u)});
+  const auto low =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(0xffu)});
+  const auto high =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(0xffu)});
+  const auto quads = fixture.Emit(
+      ValueOpcode::BitwiseOr32,
+      {low, fixture.Emit(ValueOpcode::ShiftLeftLogical32, {high, Value(8u)})});
+  const auto scratch =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {quads, Value(12u)});
+  const auto word3 =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {fixture.UserData(3), scratch});
+  const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
+                                    Value(0u), Value(0u), Value(0u), Value(0u)},
+                                   0x1ec);
+  const auto sampler = fixture.Sampler(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), word3},
+      0x1ec);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  memory.image_sample_flags = Decoder::ImageSampleFlagAdjust;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 0x1ec));
+  fixture.PlanAndTrack();
+
+  const auto source = fixture.program.info.samplers[0].source;
+  const auto stored = fixture.program.descriptor_sources[source]
+                          .dwords[3]
+                          .Resolve()
+                          .TryInstruction();
+  Check(stored != nullptr && stored->GetOpcode() == ValueOpcode::GetUserData,
+        "SampleAdjust reserved scratch remained in sampler identity");
+  std::array<uint32_t, 4> user_data{4u, 1u, 2u, 0x80000abcu};
+  SrtRuntime runtime{.user_data = user_data};
+  DescriptorValue descriptor;
+  std::string error;
+  Check(EvaluateDescriptorSource(fixture.program, source, 0x1ec, runtime,
+                                 descriptor, &error) &&
+            descriptor.dwords[3] == 0x80000abcu,
+        "SampleAdjust canonicalization lost sampler border fields");
+
+  const auto CheckRejected = [](uint32_t flags, uint32_t shift,
+                                const char *message) {
+    Fixture rejected(ShaderType::Pixel);
+    const auto condition = rejected.Emit(ValueOpcode::WqmMask, {Value(true)});
+    const auto bit = rejected.Emit(ValueOpcode::SelectU32,
+                                   {condition, Value(1u), Value(0u)});
+    const auto dynamic =
+        rejected.Emit(ValueOpcode::ShiftLeftLogical32, {bit, Value(shift)});
+    const auto dynamic_word3 = rejected.Emit(ValueOpcode::BitwiseOr32,
+                                             {rejected.UserData(3), dynamic});
+    const auto rejected_image =
+        rejected.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                        Value(0u), Value(0u), Value(0u)},
+                       0x200);
+    const auto rejected_sampler =
+        rejected.Sampler({rejected.UserData(0), rejected.UserData(1),
+                          rejected.UserData(2), dynamic_word3},
+                         0x200);
+    MemoryInfo rejected_memory;
+    rejected_memory.kind = ResourceKind::Image;
+    rejected_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    rejected_memory.image_sample_flags = flags;
+    rejected.Emit(ValueOpcode::ImageSampleRaw,
+                  {rejected_image, rejected_sampler, rejected.ImageAddress()},
+                  rejected.AddMemory(rejected_memory, 0x200));
+    std::string rejected_error;
+    Check(BuildSrtPlan(rejected.program, &rejected_error) &&
+              !TrackResources(rejected.program, &rejected_error) &&
+              rejected_error.find("WqmMask") != std::string::npos,
+          message);
+  };
+  CheckRejected(0u, 12u,
+                "ordinary sampling accepted SampleAdjust reserved scratch");
+  CheckRejected(Decoder::ImageSampleFlagAdjust, 30u,
+                "SampleAdjust canonicalization discarded border-mode bits");
 }
 
 void TestDynamicStorageMipTracking() {
@@ -951,10 +757,10 @@ void TestDynamicStorageMipTracking() {
             mip1.first.Instruction()->Flags<uint32_t>() == 1 &&
             mip2.first.Instruction()->Flags<uint32_t>() == 1 &&
             dynamic.first.Instruction()->Flags<uint32_t>() == 1 &&
-            fixture.program.values->memory_info[plain.second].resource == 0 &&
-            fixture.program.values->memory_info[mip1.second].resource == 1 &&
-            fixture.program.values->memory_info[mip2.second].resource == 1 &&
-            fixture.program.values->memory_info[dynamic.second].resource == 1,
+            fixture.program.memory_info[plain.second].resource == 0 &&
+            fixture.program.memory_info[mip1.second].resource == 1 &&
+            fixture.program.memory_info[mip2.second].resource == 1 &&
+            fixture.program.memory_info[dynamic.second].resource == 1,
         "dynamic storage mip handles and memory metadata were not patched");
 
   DescriptorValue descriptor{};
@@ -979,7 +785,7 @@ void TestDynamicStorageMipTracking() {
         "base-1 through last-3 dynamic storage range was not specialized");
   ShaderComputeInputInfo compute{};
   Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
-            AllocateBindings(fixture.program, {}, &error),
+            AllocateBindings(fixture.program, 0, &error),
         "dynamic storage mip bindings were not allocated");
   const auto *storage_binding =
       FindBinding(fixture.program.bindings, DescriptorBindingKind::Storage2D);
@@ -988,7 +794,6 @@ void TestDynamicStorageMipTracking() {
         "dynamic storage mip descriptors were not expanded consecutively");
 
   Program null_program;
-  null_program.values = std::make_shared<ValueProgram>();
   null_program.resource_tracking_complete = true;
   ImageResource null_image;
   null_image.kind = ResourceKind::StorageImage;
@@ -1040,12 +845,12 @@ void TestSrtFlatteningAndRuntimeMemoization() {
                fixture.AddMemory(buffer, 16));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.values->srt_reads.size() == 1,
+  Check(fixture.program.srt_reads.size() == 1,
         "shared typed scalar read did not receive one flat SRT slot");
   Check(fixture.program.info.buffers.size() == 1 &&
-            fixture.program.info.addresses.empty(),
+            !fixture.program.info.uses_dma,
         "planning-only scalar reads leaked into resource topology");
-  Check(fixture.program.values->memory_info[0].planning_only,
+  Check(fixture.program.memory_info[0].planning_only,
         "canonical runtime scalar read was not marked planning-only");
 
   std::array<uint32_t, 2> user_data{0x1000u, 0u};
@@ -1078,7 +883,7 @@ void TestSrtFlatteningAndRuntimeMemoization() {
 
   ShaderComputeInputInfo compute{};
   Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
-            AllocateBindings(fixture.program, {}, &error) &&
+            AllocateBindings(fixture.program, 0, &error) &&
             FindBinding(fixture.program.bindings,
                         DescriptorBindingKind::FlattenedSrt) != nullptr,
         "flattened typed SRT reads did not receive a binding");
@@ -1103,9 +908,9 @@ void TestDynamicSrtReadRemainsExplicit() {
                fixture.AddMemory(buffer, 8));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.values->srt_reads.empty() &&
-            fixture.program.values->dynamic_reads.size() == 1 &&
-            fixture.program.info.addresses.size() == 1,
+  Check(fixture.program.srt_reads.empty() &&
+            fixture.program.dynamic_reads.size() == 1 &&
+            fixture.program.info.uses_dma,
         "dynamic scalar read was incorrectly flattened or lost");
   std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
   TestMemory memory;
@@ -1123,12 +928,20 @@ void TestDynamicSrtReadRemainsExplicit() {
 
   ShaderComputeInputInfo compute{};
   Check(CollectShaderInfo(fixture.program, {.compute = &compute}, &error) &&
-            AllocateBindings(fixture.program, {}, &error) &&
+            AllocateBindings(fixture.program, 0, &error) &&
             FindBinding(fixture.program.bindings,
                         DescriptorBindingKind::FlattenedSrt) == nullptr &&
             FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::AddressMemory) != nullptr,
+                        DescriptorBindingKind::BdaPagetable) != nullptr &&
+            FindBinding(fixture.program.bindings,
+                        DescriptorBindingKind::FaultBuffer) != nullptr,
         "dynamic scalar read received the wrong resource bindings");
+  Check(fixture.program.bindings.memory_offset_dword ==
+                fixture.program.bindings.user_data_registers.size() &&
+            fixture.program.bindings.memory_offset_count == 1u &&
+            fixture.program.bindings.ShaderDataDwords() ==
+                fixture.program.bindings.memory_offset_dword + 1u,
+        "unified memory-offset layout is inconsistent");
 }
 
 void TestPhiValidation() {
@@ -1160,7 +973,7 @@ void TestPhiValidation() {
             error.find("control-dependent phi") != std::string::npos &&
             !fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.values->descriptor_sources.empty(),
+            fixture.program.descriptor_sources.empty(),
         "control-dependent descriptor phi was not rejected transactionally");
 }
 
@@ -1218,7 +1031,7 @@ void TestInvariantLoopPhi() {
         "loop-invariant descriptor phi was not evaluated through typed SSA");
 }
 
-void TestAddressMaterializationAndSpecialization() {
+void TestDmaAddressMaterialization() {
   Fixture fixture;
   const auto based =
       fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
@@ -1239,40 +1052,30 @@ void TestAddressMaterializationAndSpecialization() {
                fixture.AddMemory(flat, 8));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.info.addresses.size() == 2 &&
-            !fixture.program.info.addresses[0].unbased &&
-            fixture.program.info.addresses[0].min_offset == -8 &&
-            fixture.program.info.addresses[1].unbased,
-        "typed based and unbased addresses were classified incorrectly");
+  Check(fixture.program.info.uses_dma,
+        "typed address operations did not enable DMA");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
-  SrtRuntime runtime{.user_data = user_data, .flat_memory_base = 0x9000u};
+  SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   std::string error;
   Check(MaterializeResources(fixture.program, runtime, snapshot, &error),
-        "address resources did not materialize");
-  Check(snapshot.addresses.size() == 2 &&
-            snapshot.addresses[0].guest_base == 0x2008u &&
-            snapshot.addresses[0].binding_base == 0x2000u &&
-            snapshot.addresses[1].binding_base == 0x9000u,
-        "materialized address windows are incorrect");
-  Check(SpecializeResources(fixture.program, snapshot, &error) &&
-            fixture.program.info.addresses[0].specialized_base == 8u &&
-            fixture.program.info.addresses[1].specialized_base == 0x9000u,
-        "typed address specialization was not applied");
+        "DMA shader resources did not materialize");
+  Check(SpecializeResources(fixture.program, snapshot, &error),
+        "DMA shader resources were not specialized");
 }
 
-void TestExecMaskedFlatAddressProvenance() {
+void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
   const auto high_root = fixture.UserData(1);
-  const auto active = fixture.Emit(
-      ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
+  const auto active =
+      fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(2), Value(0u)});
   const auto inactive_low = fixture.Emit(ValueOpcode::UndefU32);
   const auto inactive_high = fixture.Emit(ValueOpcode::UndefU32);
-  const auto low = fixture.Emit(ValueOpcode::SelectU32,
-                                {active, low_root, inactive_low});
-  const auto high = fixture.Emit(ValueOpcode::SelectU32,
-                                 {active, high_root, inactive_high});
+  const auto low =
+      fixture.Emit(ValueOpcode::SelectU32, {active, low_root, inactive_low});
+  const auto high =
+      fixture.Emit(ValueOpcode::SelectU32, {active, high_root, inactive_high});
   const auto address = fixture.Address(low, high, 0xa4);
   MemoryInfo flat;
   flat.kind = ResourceKind::Flat;
@@ -1281,40 +1084,34 @@ void TestExecMaskedFlatAddressProvenance() {
                fixture.AddMemory(flat, 0xa4));
   fixture.PlanAndTrack();
 
-  Check(fixture.program.info.addresses.size() == 1 &&
-            !fixture.program.info.addresses[0].unbased,
-        "exec-masked FLAT address lost its active user-data root");
+  Check(fixture.program.info.uses_dma,
+        "exec-masked FLAT address did not enable DMA");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
   std::string error;
-  Check(MaterializeResources(fixture.program, runtime, snapshot, &error) &&
-            snapshot.addresses.size() == 1 &&
-            snapshot.addresses[0].guest_base == 0x0000000123456780ull &&
-            snapshot.addresses[0].binding_base == 0x0000000123450000ull,
-        "exec-masked FLAT address materialized the wrong user-data root");
+  Check(MaterializeResources(fixture.program, runtime, snapshot, &error),
+        "exec-masked FLAT shader resources did not materialize");
 
   Fixture mismatch;
-  const auto mismatch_active = mismatch.Emit(
-      ValueOpcode::INotEqual32, {mismatch.UserData(2), Value(0u)});
-  const auto other_active = mismatch.Emit(ValueOpcode::LogicalNot,
-                                          {mismatch_active});
+  const auto mismatch_active = mismatch.Emit(ValueOpcode::INotEqual32,
+                                             {mismatch.UserData(2), Value(0u)});
+  const auto other_active =
+      mismatch.Emit(ValueOpcode::LogicalNot, {mismatch_active});
   const auto mismatch_low = mismatch.Emit(
-      ValueOpcode::SelectU32,
-      {mismatch_active, mismatch.UserData(0),
-       mismatch.Emit(ValueOpcode::UndefU32)});
+      ValueOpcode::SelectU32, {mismatch_active, mismatch.UserData(0),
+                               mismatch.Emit(ValueOpcode::UndefU32)});
   const auto mismatch_high = mismatch.Emit(
-      ValueOpcode::SelectU32,
-      {mismatch_active, mismatch.UserData(1),
-       mismatch.Emit(ValueOpcode::UndefU32)});
-  const auto mismatch_address = mismatch.Address(mismatch_low, mismatch_high, 0xa4);
+      ValueOpcode::SelectU32, {mismatch_active, mismatch.UserData(1),
+                               mismatch.Emit(ValueOpcode::UndefU32)});
+  const auto mismatch_address =
+      mismatch.Address(mismatch_low, mismatch_high, 0xa4);
   mismatch.Emit(ValueOpcode::LoadAddressU8,
                 {mismatch_address, mismatch_low, mismatch_high, other_active},
                 mismatch.AddMemory(flat, 0xa4));
   mismatch.PlanAndTrack();
-  Check(mismatch.program.info.addresses.size() == 1 &&
-            mismatch.program.info.addresses[0].unbased,
-        "FLAT address used a select arm guarded by a different active mask");
+  Check(mismatch.program.info.uses_dma,
+        "dynamic FLAT address did not enable DMA");
 }
 
 void TestBufferSwizzleSpecialization() {
@@ -1366,9 +1163,10 @@ void TestShaderInfoAndBindingLayout() {
       {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)),
        Value(2u)});
   fixture.Emit(ValueOpcode::BitwiseXor32, {Value(1u), Value(2u)});
-  const auto gds = fixture.Emit(ValueOpcode::GetGdsResource);
-  fixture.Emit(ValueOpcode::WriteGdsU32,
-               {gds, Value(0u), Value(1u), Value(true)});
+  MemoryInfo gds;
+  gds.kind = ResourceKind::Gds;
+  fixture.Emit(ValueOpcode::WriteSharedU32, {Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(gds, 8));
   fixture.PlanAndTrack();
 
   ShaderComputeInputInfo compute{};
@@ -1382,22 +1180,85 @@ void TestShaderInfoAndBindingLayout() {
                 StageInputKind::GlobalInvocationId,
         "typed shader values were not reflected in shader info");
 
-  BindingLayoutOptions options;
-  options.descriptor_set = 2;
-  options.max_push_dwords = 1;
-  Check(AllocateBindings(fixture.program, options, &error),
+  Check(AllocateBindings(fixture.program, 0, &error),
         "typed binding allocation failed");
-  Check(fixture.program.bindings.descriptor_set == 2 &&
-            FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::Buffers) != nullptr &&
+  Check(FindBinding(fixture.program.bindings, DescriptorBindingKind::Buffers) !=
+                nullptr &&
             FindBinding(fixture.program.bindings, DescriptorBindingKind::Gds) !=
                 nullptr &&
             FindBinding(fixture.program.bindings,
-                        DescriptorBindingKind::UserData) != nullptr,
+                        DescriptorBindingKind::UserData) == nullptr &&
+            fixture.program.bindings.push_constant_size ==
+                fixture.program.bindings.ShaderDataDwords() * sizeof(uint32_t),
         "typed resources were not assigned native bindings");
+  Check(NativeBinding(ShaderType::Compute, DescriptorBindingKind::Buffers) ==
+                static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
+            NativeBinding(ShaderType::Vertex, DescriptorBindingKind::Buffers) ==
+                static_cast<uint32_t>(DescriptorBindingKind::Buffers) &&
+            NativeBinding(ShaderType::Pixel, DescriptorBindingKind::Buffers) ==
+                static_cast<uint32_t>(DescriptorBindingKind::Count) +
+                    static_cast<uint32_t>(DescriptorBindingKind::Buffers),
+        "fixed stage binding ranges are inconsistent");
   Check(fixture.program.bindings.user_data_registers ==
             std::vector<uint32_t>({3u, 4u}),
         "binding layout did not collect live typed user-data values");
+}
+
+void TestGraphicsPushConstantLayout() {
+  const auto AddUserData = [](Fixture &fixture, uint32_t count) {
+    for (uint32_t index = 0; index < count; index++) {
+      fixture.Emit(ValueOpcode::ReferenceU32, {fixture.UserData(index)});
+    }
+    fixture.program.shader_info_complete = true;
+  };
+
+  std::string error;
+  Fixture vertex(ShaderType::Vertex);
+  AddUserData(vertex, 9);
+  Check(AllocateBindings(vertex.program, 0, &error) &&
+            vertex.program.bindings.push_constant_offset == 0 &&
+            vertex.program.bindings.push_constant_size == 9 * sizeof(uint32_t),
+        "vertex shader was not placed at the start of the graphics push bank");
+
+  const auto pixel_offset = vertex.program.bindings.push_constant_size;
+  Fixture pixel(ShaderType::Pixel);
+  AddUserData(pixel, 4);
+  Check(AllocateBindings(pixel.program, pixel_offset, &error) &&
+            pixel.program.bindings.push_constant_offset == pixel_offset &&
+            pixel.program.bindings.push_constant_size == 4 * sizeof(uint32_t) &&
+            FindBinding(pixel.program.bindings, DescriptorBindingKind::UserData) ==
+                nullptr,
+        "pixel shader did not follow the vertex data in the graphics push bank");
+
+  Fixture edge(ShaderType::Pixel);
+  AddUserData(edge, 1);
+  Check(AllocateBindings(edge.program, NativePushConstantSize - sizeof(uint32_t),
+                         &error) &&
+            edge.program.bindings.push_constant_size == sizeof(uint32_t),
+        "last aligned push-constant dword did not fit in the graphics bank");
+
+  Fixture spill(ShaderType::Pixel);
+  AddUserData(spill, 32);
+  Check(AllocateBindings(spill.program, pixel_offset, &error) &&
+            spill.program.bindings.push_constant_size == 0 &&
+            FindBinding(spill.program.bindings, DescriptorBindingKind::UserData) !=
+                nullptr,
+        "pixel shader overlapping the vertex push data did not spill to storage");
+
+  Fixture full(ShaderType::Pixel);
+  AddUserData(full, 1);
+  Check(AllocateBindings(full.program, NativePushConstantSize, &error) &&
+            full.program.bindings.push_constant_size == 0 &&
+            FindBinding(full.program.bindings, DescriptorBindingKind::UserData) !=
+                nullptr,
+        "full graphics push bank did not spill pixel user data to storage");
+
+  Fixture invalid(ShaderType::Pixel);
+  AddUserData(invalid, 1);
+  Check(!AllocateBindings(invalid.program,
+                          NativePushConstantSize + sizeof(uint32_t), &error) &&
+            !invalid.program.binding_layout_complete,
+        "push-constant placement beyond the graphics bank was accepted");
 }
 
 void TestResourceLimitIsTransactional() {
@@ -1419,8 +1280,81 @@ void TestResourceLimitIsTransactional() {
             error.find("buffer resource limit exceeded") != std::string::npos &&
             !fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.values->descriptor_sources.empty(),
+            fixture.program.descriptor_sources.empty(),
         "resource-limit failure partially mutated typed resource state");
+}
+
+void TestMalformedMemoryKindsRejected() {
+  {
+    Fixture fixture;
+    const auto address = fixture.Address(Value(0u), Value(0u), 4);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreAddressU32,
+                 {address, Value(0u), Value(0u), Value(1u), Value(true)},
+                 fixture.AddMemory(memory, 4));
+    std::string error;
+    Check(BuildSrtPlan(fixture.program, &error) &&
+              !TrackResources(fixture.program, &error) &&
+              error.find("address operation has invalid resource kind") !=
+                  std::string::npos,
+          "resource tracking accepted an address opcode with buffer metadata");
+  }
+  {
+    Fixture fixture;
+    const auto image =
+        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                       Value(0u), Value(0u), Value(0u)},
+                      8);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Flat;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {image, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 8));
+    std::string error;
+    Check(BuildSrtPlan(fixture.program, &error) &&
+              !TrackResources(fixture.program, &error) &&
+              error.find("image operation has invalid resource kind") !=
+                  std::string::npos,
+          "resource tracking accepted an image opcode with address metadata");
+  }
+  {
+    Fixture fixture;
+    const auto image =
+        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                       Value(0u), Value(0u), Value(0u)},
+                      12);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    fixture.Emit(ValueOpcode::ImageRead,
+                 {image, fixture.ImageAddress(), Value(true)},
+                 fixture.AddMemory(memory, 12));
+    std::string error;
+    Check(BuildSrtPlan(fixture.program, &error) &&
+              !TrackResources(fixture.program, &error) &&
+              error.find("image operation has invalid resource kind") !=
+                  std::string::npos,
+          "resource tracking accepted a sampled read with storage metadata");
+  }
+  {
+    Fixture fixture;
+    const auto image =
+        fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+                       Value(0u), Value(0u), Value(0u)},
+                      16);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::StorageImage;
+    fixture.Emit(ValueOpcode::ImageAtomicIAdd32,
+                 {image, fixture.ImageAddress(), Value(1u), Value(true)},
+                 fixture.AddMemory(memory, 16));
+    std::string error;
+    Check(
+        BuildSrtPlan(fixture.program, &error) &&
+            !TrackResources(fixture.program, &error) &&
+            error.find("image operation has invalid resource kind") !=
+                std::string::npos,
+        "resource tracking accepted a uint atomic with float storage metadata");
+  }
 }
 
 } // namespace
@@ -1437,11 +1371,8 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
-    Run("runtime find-lsb", TestRuntimeFindLsbDescriptor);
-    Run("direct address indirect images", TestDirectAddressIndirectImageMaterialization);
-    Run("direct address induction-phi images", TestDirectAddressInductionPhiImage);
-    Run("direct address bounded ReadLane images", TestDirectAddressReadLaneImage);
     Run("images and samplers", TestImagesSamplersAndAliases);
+    Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
@@ -1449,11 +1380,13 @@ int main() {
     Run("phi validation", TestPhiValidation);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
-    Run("address materialization", TestAddressMaterializationAndSpecialization);
-    Run("exec-masked FLAT address", TestExecMaskedFlatAddressProvenance);
+    Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
+    Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
+    Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;
@@ -1464,10 +1397,15 @@ int main() {
 
 // The full emulator supplies these assertion hooks through common. This focused
 // target links only fmt; keep assertion failures observable without widening
-// its legacy build manifest.
+// its focused build manifest.
 namespace Common {
 int DbgExitIfHandler(const char *expression, const char *file, int line) {
   throw std::runtime_error(std::string("typed IR assertion: ") + expression +
+                           " at " + file + ':' + std::to_string(line));
+}
+
+int DbgNotImplementedHandler(const char *expression, const char *file, int line) {
+  throw std::runtime_error(std::string("typed IR not implemented: ") + expression +
                            " at " + file + ':' + std::to_string(line));
 }
 
@@ -1479,6 +1417,6 @@ void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 #include "graphics/shader/recompiler/ir/Block.cpp"
 #include "graphics/shader/recompiler/ir/Type.cpp"
 #include "graphics/shader/recompiler/ir/Value.cpp"
-#include "graphics/shader/recompiler/ir/ValueProgram.cpp"
+#include "graphics/shader/recompiler/ir/Program.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
