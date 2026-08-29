@@ -646,41 +646,62 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                              integer && !dref, false, mem, true));
 			return true;
 		}
-		const bool explicit_lod = HasFlag(mem, Decoder::ImageSampleFlagDerivative) ||
-		                          HasFlag(mem, Decoder::ImageSampleFlagLod) ||
-		                          HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-		                          state.stage != ShaderType::Pixel;
-		const auto opcode = explicit_lod
-		                        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
-		                        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
 		const auto result_type =
 		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
-		const auto dref_value =
-		    dref ? (layout.dref != NoImageComponent ? AddressF32(ctx, mem, *address, layout.dref)
-		                                            : ZeroF32(state))
-		         : 0u;
-		uint32_t              operand_mask = 0;
-		std::vector<uint32_t> operands;
-		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
-			operand_mask |= ImageOperandsGradMask;
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, ImageViewSpatialComponents(view)));
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, ImageViewSpatialComponents(view)));
-		} else if (explicit_lod) {
-			operand_mask |= ImageOperandsLodMask;
-			operands.push_back(HasFlag(mem, Decoder::ImageSampleFlagLod) &&
-			                           layout.lod != NoImageComponent
-			                       ? AddressF32(ctx, mem, *address, layout.lod)
-			                       : ZeroF32(state));
-		} else if (layout.bias != NoImageComponent) {
-			operand_mask |= ImageOperandsBiasMask;
-			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
-		}
 		const auto EmitSample = [&](uint32_t resource) {
-			const auto            sampled = MakeSampledImage(state, mem, pc, view, resource);
+			auto candidate_mem = mem;
+			if (resource < state.program.info.images.size()) {
+				const auto& candidate = state.program.info.images[resource];
+				candidate_mem.kind            = candidate.kind;
+				candidate_mem.image_dimension = candidate.dimension;
+				candidate_mem.image_cube      = candidate.cube;
+			}
+			const auto candidate_view = SampledImageViewKind(state, candidate_mem, pc);
+			const auto candidate_layout = Layout(candidate_mem, candidate_view);
+			const auto candidate_coord =
+			    CoordF32(ctx, candidate_mem, *address, candidate_layout.coord,
+			             ImageViewCoordinateComponents(candidate_view));
+			const bool explicit_lod =
+			    HasFlag(candidate_mem, Decoder::ImageSampleFlagDerivative) ||
+			    HasFlag(candidate_mem, Decoder::ImageSampleFlagLod) ||
+			    HasFlag(candidate_mem, Decoder::ImageSampleFlagLevelZero) ||
+			    state.stage != ShaderType::Pixel;
+			const auto opcode =
+			    explicit_lod
+			        ? (dref ? OpImageSampleDrefExplicitLod : OpImageSampleExplicitLod)
+			        : (dref ? OpImageSampleDrefImplicitLod : OpImageSampleImplicitLod);
+			const auto dref_value =
+			    dref ? (candidate_layout.dref != NoImageComponent
+			                ? AddressF32(ctx, candidate_mem, *address, candidate_layout.dref)
+			                : ZeroF32(state))
+			         : 0u;
+			uint32_t              operand_mask = 0;
+			std::vector<uint32_t> operands;
+			if (HasFlag(candidate_mem, Decoder::ImageSampleFlagDerivative)) {
+				operand_mask |= ImageOperandsGradMask;
+				operands.push_back(CoordF32(ctx, candidate_mem, *address,
+				                            candidate_layout.grad_x,
+				                            ImageViewSpatialComponents(candidate_view)));
+				operands.push_back(CoordF32(ctx, candidate_mem, *address,
+				                            candidate_layout.grad_y,
+				                            ImageViewSpatialComponents(candidate_view)));
+			} else if (explicit_lod) {
+				operand_mask |= ImageOperandsLodMask;
+				operands.push_back(HasFlag(candidate_mem, Decoder::ImageSampleFlagLod) &&
+				                           candidate_layout.lod != NoImageComponent
+				                       ? AddressF32(ctx, candidate_mem, *address,
+				                                    candidate_layout.lod)
+				                       : ZeroF32(state));
+			} else if (candidate_layout.bias != NoImageComponent) {
+				operand_mask |= ImageOperandsBiasMask;
+				operands.push_back(AddressF32(ctx, candidate_mem, *address,
+				                              candidate_layout.bias));
+			}
+			const auto sampled =
+			    MakeSampledImage(state, candidate_mem, pc, candidate_view, resource);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words {opcode, result_type, sample, sampled, coord};
+			std::vector<uint32_t> words {opcode, result_type, sample, sampled,
+			                             candidate_coord};
 			if (dref) {
 				words.push_back(dref_value);
 			}

@@ -842,13 +842,11 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
-			    image.mip_mode != image_class.mip_mode ||
+			if (image.kind != image_class.kind || image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.depth_compare != image_class.depth_compare ||
-			    image.cube != image_class.cube) {
+			    image.depth_compare != image_class.depth_compare) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "indirect image table at pc 0x{:08x} has incompatible candidates",

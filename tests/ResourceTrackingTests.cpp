@@ -355,6 +355,25 @@ void TestInvariantIndirectImageMaterialization() {
             dynamic_snapshot.indirect_images.empty(),
         "dynamic indirect image table was not specialized transactionally");
 
+  auto mixed_fixture = MakeIndirectImageFixture(false);
+  mixed_fixture->PlanAndTrack();
+  memory.words[(0x2020u - memory.base) / 4u + 2u] = 3u;
+  memory.words[(0x2020u - memory.base) / 4u + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor1D)
+       << 28u);
+  ResourceSnapshot mixed_snapshot;
+  Check(MaterializeResources(mixed_fixture->program, runtime, mixed_snapshot,
+                             &error) &&
+            SpecializeResources(mixed_fixture->program, mixed_snapshot,
+                                &error) &&
+            mixed_fixture->program.info.images.size() == 2 &&
+            mixed_fixture->program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            mixed_fixture->program.info.images[1].dimension ==
+                Decoder::ImageDimension::Dim1D,
+        "mixed indirect image dimensions were not specialized");
+
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
         image_descriptor[dword];
