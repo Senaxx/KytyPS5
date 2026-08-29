@@ -331,11 +331,7 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 	const auto base = (static_cast<uint64_t>(table_value.dwords[0]) |
 	                   static_cast<uint64_t>(table_value.dwords[1]) << 32u) &
 	                  AddressMask;
-	// Keep one typed null descriptor when the loop is empty; no shader invocation can select it.
-	const auto materialized_count = std::max(table_count, 1u);
-	const auto bytes = static_cast<uint64_t>(materialized_count) * 8u * sizeof(uint32_t);
-	if (base == 0u || indirect.table_offset > AddressMask - base ||
-	    bytes > AddressMask - (base + indirect.table_offset)) {
+	if (base == 0u || indirect.table_offset > AddressMask - base) {
 		if (error != nullptr) {
 			*error = fmt::format(
 			    "direct image table at pc 0x{:08x} exceeds the 48-bit address space", use_pc);
@@ -344,13 +340,61 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 	}
 
 	ResourceSnapshot::IndirectImage next;
-	next.capacity = materialized_count;
-	next.keys.reserve(materialized_count);
-	next.candidates.reserve(materialized_count);
-	for (uint32_t key = 0; key < materialized_count; key++) {
+	std::vector<uint32_t> keys;
+	if (indirect.direct_key_count != 0u) {
+		std::unordered_set<uint32_t> seen;
+		for (uint32_t entry = 0; entry < indirect.direct_key_count; entry++) {
+			const auto key_offset = static_cast<uint64_t>(indirect.direct_key_offset) +
+			                        static_cast<uint64_t>(entry) * indirect.direct_key_stride;
+			if (key_offset > AddressMask - base) {
+				if (error != nullptr) {
+					*error = fmt::format("direct image key table at pc 0x{:08x} exceeds the "
+					                     "48-bit address space",
+					                     use_pc);
+				}
+				return false;
+			}
+			uint32_t key = 0;
+			if (!ReadSpecializationWord(runtime, base + key_offset, key)) {
+				if (error != nullptr) {
+					*error = fmt::format("direct image key table at pc 0x{:08x} read failed at "
+					                     "0x{:016x}",
+					                     use_pc, base + key_offset);
+				}
+				return false;
+			}
+			if (static_cast<int32_t>(key) >= 0 && seen.insert(key).second) {
+				keys.push_back(key);
+			}
+		}
+		next.capacity = indirect.direct_key_count;
+	} else {
+		// Keep one typed null descriptor when the loop is empty; no invocation can select it.
+		table_count = std::max(table_count, 1u);
+		keys.resize(table_count);
+		std::iota(keys.begin(), keys.end(), 0u);
+		next.capacity = table_count;
+	}
+	if (keys.empty()) {
+		keys.push_back(0u);
+		next.capacity = std::max(next.capacity, 1u);
+	}
+	next.keys.reserve(keys.size());
+	next.candidates.reserve(keys.size());
+	for (const auto key: keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
-		const auto address    = base + indirect.table_offset + static_cast<uint64_t>(key) * 32u;
+		const auto entry_offset = static_cast<uint64_t>(indirect.table_offset) +
+		                          static_cast<uint64_t>(key) * 32u;
+		if (entry_offset > AddressMask - base ||
+		    entry_offset + (candidate.dword_count - 1u) * sizeof(uint32_t) > AddressMask - base) {
+			if (error != nullptr) {
+				*error = fmt::format(
+				    "direct image table at pc 0x{:08x} exceeds the 48-bit address space", use_pc);
+			}
+			return false;
+		}
+		const auto address = base + entry_offset;
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 			if (!ReadSpecializationWord(runtime, address + dword * sizeof(uint32_t),
 			                            candidate.dwords[dword])) {
@@ -363,14 +407,17 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 			}
 		}
 		if (!NullImageDescriptor(candidate) && !ValidDirectImageDescriptor(candidate)) {
-			if (key == 0u) {
+			if (indirect.direct_key_count == 0u && key == 0u) {
 				if (error != nullptr) {
 					*error = fmt::format("direct image table at pc 0x{:08x} has no valid entries",
 					                     use_pc);
 				}
 				return false;
 			}
-			break;
+			if (indirect.direct_key_count == 0u) {
+				break;
+			}
+			candidate.dwords.fill(0u);
 		}
 		if (NullImageDescriptor(candidate)) {
 			candidate.dwords.fill(0u);

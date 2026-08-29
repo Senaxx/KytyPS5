@@ -237,6 +237,155 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
+std::unique_ptr<Fixture>
+MakeReadLaneDirectImageFixture(bool malformed_lane = false,
+                               bool grouped = true) {
+  auto fixture = std::make_unique<Fixture>();
+  fixture->program.wave_size = 64u;
+  const auto table =
+      fixture->Address(fixture->UserData(0), fixture->UserData(1), 0x104u);
+  const auto active = fixture->Emit(
+      ValueOpcode::IEqual32, {fixture->UserData(7), Value(1u)});
+  const auto scaled16 = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
+                                      {fixture->UserData(6), Value(4u)});
+  const auto selected16 = fixture->Emit(
+      ValueOpcode::SelectU32, {active, scaled16, fixture->UserData(4)});
+  const auto scaled8 = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
+                                     {selected16, Value(3u)});
+  const auto record =
+      fixture->Emit(ValueOpcode::IAdd32, {scaled8, selected16});
+  const auto selected_record = fixture->Emit(
+      ValueOpcode::SelectU32, {active, record, selected16});
+  const auto based_record = fixture->Emit(
+      ValueOpcode::IAdd32, {Value(0xc00u), selected_record});
+  const auto material_offset = fixture->Emit(
+      ValueOpcode::SelectU32, {active, based_record, selected_record});
+  MemoryInfo material_memory;
+  material_memory.kind = ResourceKind::ScalarAddress;
+  const auto material = fixture->Emit(
+      ValueOpcode::LoadAddressU32,
+      {table, material_offset, Value(0u), Value(true)},
+      fixture->AddMemory(material_memory, 0x108u));
+  const auto lane = fixture->Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture->UserData(5), Value(malformed_lane ? 0xffu : 0x3fu)});
+  const auto key =
+      fixture->Emit(ValueOpcode::ReadLane, {material, lane});
+  if (grouped) {
+    const auto matching =
+        fixture->Emit(ValueOpcode::IEqual32, {key, material});
+    fixture->Emit(ValueOpcode::Reference, {matching});
+  }
+  const auto scaled =
+      fixture->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  const auto first =
+      fixture->Emit(ValueOpcode::IAdd32, {scaled, Value(0x158u)});
+  const auto second =
+      fixture->Emit(ValueOpcode::IAdd32, {first, Value(0x10u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = (dword & 3u) * sizeof(uint32_t);
+    image_words[dword] = fixture->Emit(
+        ValueOpcode::LoadAddressU32,
+        {table, dword < 4u ? first : second, Value(0u), Value(true)},
+        fixture->AddMemory(scalar, 0x118u));
+  }
+  const auto image = fixture->Image(image_words, 0x118u);
+  const auto sampler = fixture->Sampler(
+      {Value(0u), Value(0u), Value(0u), Value(0u)}, 0x118u);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2DArray;
+  const auto sampled = fixture->Emit(
+      ValueOpcode::ImageSampleRaw,
+      {image, sampler, fixture->ImageAddress()},
+      fixture->AddMemory(sample, 0x118u));
+  fixture->Emit(
+      ValueOpcode::ReferenceU32,
+      {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                     {sampled, Value(0u)})});
+  return fixture;
+}
+
+void TestReadLaneDirectImageMaterialization() {
+  auto fixture = MakeReadLaneDirectImageFixture();
+  fixture->PlanAndTrack();
+  const auto source_index = fixture->program.info.images[0].source;
+  const auto &source = fixture->program.descriptor_sources[source_index];
+  Check(source.indirect_image.has_value(),
+        "grouped wave64 material keys did not produce an indirect image table");
+  Check(source.indirect_image->mode ==
+            DescriptorSource::IndirectImage::Mode::DirectAddress,
+        "grouped wave64 material keys did not produce a direct image table");
+  Check(source.indirect_image->table_offset == 0x158u,
+        "grouped wave64 material keys changed the descriptor table offset");
+  Check(source.indirect_image->direct_key_stride == 144u,
+        "wave64 material record stride was not retained");
+  Check(source.indirect_image->direct_key_offset == 0xc00u,
+        "wave64 material record offset was not retained");
+  Check(source.indirect_image->direct_key_count == 64u,
+        "wave64 material record count was not retained");
+
+  auto malformed = MakeReadLaneDirectImageFixture(true);
+  std::string error;
+  Check(BuildSrtPlan(malformed->program, &error) &&
+            !TrackResources(malformed->program, &error) &&
+            error.find("ReadLane") != std::string::npos,
+        "an out-of-range ReadLane selector was accepted");
+  auto ungrouped = MakeReadLaneDirectImageFixture(false, false);
+  error.clear();
+  Check(BuildSrtPlan(ungrouped->program, &error) &&
+            !TrackResources(ungrouped->program, &error) &&
+            error.find("ReadLane") != std::string::npos,
+        "an ungrouped ReadLane selector was accepted");
+
+  LinearTestMemory memory;
+  memory.words.resize(0x3000u / sizeof(uint32_t));
+  for (uint32_t entry = 0; entry < 64u; entry++) {
+    memory.words[(0xc00u + entry * 144u) / 4u] = UINT32_MAX;
+  }
+  memory.words[0xc00u / 4u] = 5u;
+  memory.words[(0xc00u + 144u) / 4u] = 17u;
+  memory.words[(0xc00u + 288u) / 4u] = 63u;
+
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+                      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                  << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(
+           Libs::Graphics::Prospero::ImageType::kColor2DArray)
+       << 28u);
+  for (const auto key_value : {5u, 17u, 63u}) {
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[(0x158u + key_value * 32u) / 4u + dword] =
+          descriptor[dword];
+    }
+  }
+  memory.words[(0x158u + 17u * 32u) / 4u] ^= 1u;
+
+  std::array<uint32_t, 8> user_data{
+      static_cast<uint32_t>(memory.base), 0u, 1u, 2u, 5u, 0u, 0u, 1u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  error.clear();
+  Check(MaterializeResources(fixture->program, runtime, snapshot, &error) &&
+            snapshot.indirect_images.size() == 1u &&
+            snapshot.indirect_images[0].capacity == 64u &&
+            snapshot.indirect_images[0].keys ==
+                std::vector<uint32_t>({5u, 17u, 63u}) &&
+            snapshot.indirect_images[0].descriptors.size() == 2u,
+        error.empty() ? "wave64 material keys did not materialize"
+                      : error.c_str());
+}
+
 void TestDirectAddressIndirectImageMaterialization() {
   Fixture fixture(ShaderType::Pixel);
   const auto table =
@@ -1702,6 +1851,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("direct address indirect images",
         TestDirectAddressIndirectImageMaterialization);
+    Run("ReadLane direct images", TestReadLaneDirectImageMaterialization);
     Run("loop-indexed direct images",
         TestLoopIndexedDirectImageMaterialization);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);

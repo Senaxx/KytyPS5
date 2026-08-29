@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <span>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 
@@ -489,6 +490,168 @@ private:
 		return false;
 	}
 
+	bool MatchReadLaneImageSelector(const Inst& read_lane, const Inst& scale) const {
+		if (read_lane.GetOpcode() != ValueOpcode::ReadLane || read_lane.NumArgs() != 2u ||
+		    (m_program.wave_size != 32u && m_program.wave_size != 64u)) {
+			return false;
+		}
+		const auto source = read_lane.Arg(0).Resolve();
+		const auto lane   = read_lane.Arg(1).Resolve();
+		if (source.GetType() != Type::U32 || lane.GetType() != Type::U32 ||
+		    (PossibleU32Bits(lane) & ~(m_program.wave_size - 1u)) != 0u) {
+			return false;
+		}
+
+		bool scaled  = false;
+		bool grouped = false;
+		for (const auto& use: read_lane.Uses()) {
+			const auto* user = use.user;
+			if (user == &scale) {
+				scaled = true;
+				continue;
+			}
+			if (user == nullptr || user->GetOpcode() != ValueOpcode::IEqual32 ||
+			    user->NumArgs() != 2u) {
+				return false;
+			}
+			const auto other = user->Arg(use.operand == 0u ? 1u : 0u).Resolve();
+			if (!EquivalentValue(m_program, other, source)) {
+				return false;
+			}
+			grouped = true;
+		}
+
+		// AGC material loops broadcast one lane's material id, compare it with every lane and
+		// execute the sample only for the matching group. That broadcast value is a valid
+		// descriptor-table key; unrelated ReadLane expressions remain rejected.
+		return scaled && grouped;
+	}
+
+	struct AffineOffset {
+		Value    index;
+		uint32_t stride = 0;
+		uint32_t offset = 0;
+	};
+
+	std::vector<AffineOffset> AffineOffsets(Value value, uint32_t depth = 0u) const {
+		value = value.Resolve();
+		if (depth >= 16u) {
+			return {};
+		}
+		if (value.IsImmediate() && value.GetType() == Type::U32) {
+			return {{.offset = value.U32()}};
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return {};
+		}
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+			auto result = AffineOffsets(inst->Arg(1), depth + 1u);
+			auto other  = AffineOffsets(inst->Arg(2), depth + 1u);
+			result.insert(result.end(), other.begin(), other.end());
+			return result;
+		}
+		if (inst->GetOpcode() == ValueOpcode::IAdd32 && inst->NumArgs() == 2u) {
+			const auto left  = AffineOffsets(inst->Arg(0), depth + 1u);
+			const auto right = AffineOffsets(inst->Arg(1), depth + 1u);
+			std::vector<AffineOffset> result;
+			for (const auto& lhs: left) {
+				for (const auto& rhs: right) {
+					if (!lhs.index.IsEmpty() && !rhs.index.IsEmpty() &&
+					    !EquivalentValue(m_program, lhs.index, rhs.index)) {
+						continue;
+					}
+					result.push_back({.index  = lhs.index.IsEmpty() ? rhs.index : lhs.index,
+					                  .stride = lhs.stride + rhs.stride,
+					                  .offset = lhs.offset + rhs.offset});
+				}
+			}
+			return result;
+		}
+		if ((inst->GetOpcode() == ValueOpcode::IMul32 ||
+		     inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32) &&
+		    inst->NumArgs() == 2u) {
+			uint32_t factor = 0;
+			Value    source;
+			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+				uint32_t shift = 0;
+				if (!ImmediateU32(inst->Arg(1), shift) || shift >= 32u) {
+					return {};
+				}
+				factor = uint32_t {1} << shift;
+				source = inst->Arg(0);
+			} else if (ImmediateU32(inst->Arg(0), factor)) {
+				source = inst->Arg(1);
+			} else if (ImmediateU32(inst->Arg(1), factor)) {
+				source = inst->Arg(0);
+			} else {
+				return {};
+			}
+			auto result = AffineOffsets(source, depth + 1u);
+			for (auto& affine: result) {
+				affine.stride *= factor;
+				affine.offset *= factor;
+			}
+			return result;
+		}
+		return {{.index = value, .stride = 1u}};
+	}
+
+	const Inst* FindDirectMaterialRead(Value value, Inst& table_handle,
+	                                   std::unordered_set<const Inst*>& visited) const {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
+			return nullptr;
+		}
+		if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 && inst->NumArgs() == 4u) {
+			const auto* handle = inst->Arg(0).ResolveInstruction();
+			return handle != nullptr &&
+			               (handle == &table_handle ||
+			                EquivalentValue(m_program, Value(handle), Value(&table_handle)))
+			           ? inst
+			           : nullptr;
+		}
+		if (inst->GetOpcode() != ValueOpcode::SelectU32 || inst->NumArgs() != 3u) {
+			return nullptr;
+		}
+		if (const auto* read = FindDirectMaterialRead(inst->Arg(1), table_handle, visited);
+		    read != nullptr) {
+			return read;
+		}
+		return FindDirectMaterialRead(inst->Arg(2), table_handle, visited);
+	}
+
+	bool MatchDirectMaterialKeys(const Inst& read_lane, Inst& table_handle, uint32_t& stride,
+	                             uint32_t& offset, uint32_t& count) const {
+		std::unordered_set<const Inst*> visited;
+		const auto* material_read = FindDirectMaterialRead(read_lane.Arg(0), table_handle, visited);
+		if (material_read == nullptr) {
+			return false;
+		}
+		uint32_t    memory_index = 0;
+		const auto* memory       = ScalarAddressReadMemory(*material_read, memory_index);
+		if (memory == nullptr) {
+			return false;
+		}
+
+		auto candidates = AffineOffsets(material_read->Arg(1));
+		for (auto& candidate: candidates) {
+			candidate.offset += memory->offset;
+		}
+		const auto found = std::ranges::max_element(candidates, [](const auto& lhs, const auto& rhs) {
+			return std::tie(lhs.offset, lhs.stride) < std::tie(rhs.offset, rhs.stride);
+		});
+		if (found == candidates.end() || found->index.IsEmpty() || found->stride < sizeof(uint32_t) ||
+		    (found->stride & 3u) != 0u) {
+			return false;
+		}
+		stride = found->stride;
+		offset = found->offset;
+		count  = m_program.wave_size;
+		return count == 32u || count == 64u;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -630,6 +793,10 @@ private:
 			entry_count = {};
 			return true;
 		}
+		if (key_inst != nullptr && MatchReadLaneImageSelector(*key_inst, *shift)) {
+			entry_count = {};
+			return true;
+		}
 		return MatchLoopInductionSelector(key, use_block, entry_count);
 	}
 
@@ -697,6 +864,9 @@ private:
 		const auto table_source_index = InternSource(table_source);
 		uint32_t   entry_count_source = DescriptorSource::IndirectImage::NoEntryCountSource;
 		uint32_t   static_entry_count = ShaderInfo::MaxImages;
+		uint32_t   direct_key_stride  = 0u;
+		uint32_t   direct_key_offset  = 0u;
+		uint32_t   direct_key_count   = 0u;
 		if (!entry_count.IsEmpty()) {
 			DescriptorSource count_source;
 			count_source.dword_count = 1u;
@@ -707,6 +877,14 @@ private:
 			}
 			entry_count_source = InternSource(count_source);
 			static_entry_count = 0u;
+		}
+		const auto* key_inst = key.Resolve().TryInstruction();
+		if (entry_count.IsEmpty() && key_inst != nullptr &&
+		    key_inst->GetOpcode() == ValueOpcode::ReadLane) {
+			if (!MatchDirectMaterialKeys(*key_inst, *table_handle, direct_key_stride,
+			                             direct_key_offset, direct_key_count)) {
+				return false;
+			}
 		}
 
 		DescriptorSource image_source;
@@ -722,6 +900,9 @@ private:
 		    .key_arg            = 0u,
 		    .table_offset       = base_offset,
 		    .table_count        = static_entry_count,
+		    .direct_key_stride  = direct_key_stride,
+		    .direct_key_offset  = direct_key_offset,
+		    .direct_key_count   = direct_key_count,
 		};
 
 		plan.handle         = &handle;
