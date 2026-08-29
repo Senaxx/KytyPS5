@@ -4344,6 +4344,50 @@ public:
               "full-volume synchronization was "
               "rejected, or ownership changed");
 
+      constexpr uint64_t depth_layout_merge_offset = 0x2780000;
+      const std::array<uint32_t, 4> depth_layout_merge_values{
+          0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+      std::memcpy(memory + depth_layout_merge_offset,
+                  depth_layout_merge_values.data(),
+                  sizeof(depth_layout_merge_values));
+      auto mip_color = MakeLinearDesc(
+          base + depth_layout_merge_offset, 3 * sizeof(uint32_t),
+          vk::Format::eR32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 1, sizeof(uint32_t), 1);
+      mip_color.info.resources = {2, 1};
+      mip_color.info.mip_layout[0] = {0, 2 * sizeof(uint32_t), 2, 1};
+      mip_color.info.mip_layout[1] = {2 * sizeof(uint32_t), sizeof(uint32_t), 1,
+                                      1};
+      mip_color.view_info.level_count = 2;
+      const auto mip_color_image = texture_cache.FindImage(mip_color);
+      (void)texture_cache.FindTexture(mip_color_image, mip_color);
+
+      auto topology_depth = MakeLinearDesc(
+          base + depth_layout_merge_offset, sizeof(depth_layout_merge_values),
+          vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+          Prospero::ImageType::kColor2D, {2, 1, 1}, 2, sizeof(uint32_t), 1);
+      topology_depth.type = BindingType::DepthTarget;
+      topology_depth.view_info.format = vk::Format::eD32Sfloat;
+      topology_depth.view_info.type = vk::ImageViewType::e2DArray;
+      topology_depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      topology_depth.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto topology_depth_image = texture_cache.FindImage(topology_depth);
+      const auto *topology_depth_owner =
+          TextureCacheTestAccess::Owner(texture_cache, topology_depth_image);
+      Require(name, "depth overlap keeps one coherent layout",
+              topology_depth_image && topology_depth_image != mip_color_image &&
+                  !TextureCacheTestAccess::Contains(texture_cache,
+                                                    mip_color_image) &&
+                  topology_depth_owner != nullptr &&
+                  topology_depth_owner->info.data == topology_depth.info.data &&
+                  topology_depth_owner->info.resources ==
+                      ImageSubresources{1, 2} &&
+                  topology_depth_owner->info.mip_layout ==
+                      topology_depth.info.mip_layout,
+              "depth/color replacement mixed the guest range and mip layout "
+              "with cached subresource counts");
+
       constexpr uint64_t depth_containment_offset = 0x27c0000;
       constexpr std::array<float, 3> depth_containment_values{0.25f, 0.75f,
                                                               0.5f};
