@@ -13,7 +13,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint32_t SamplerBorderClampMask = (1u << 2u) | (1u << 5u) | (1u << 8u);
+constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
 uint32_t PossibleU32Bits(Value value) {
@@ -188,7 +188,7 @@ public:
 				return std::ranges::find(plan.reads, inst) != plan.reads.end();
 			});
 		});
-		m_program.descriptor_sources          = std::move(m_sources);
+		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
 		return true;
@@ -236,8 +236,7 @@ private:
 		}
 		if (sampler) {
 			for (uint32_t i = 0; i < width; i++) {
-				descriptor.dwords[i] =
-				    ResolveOptionalSamplerPhi(m_program, descriptor.dwords[i]);
+				descriptor.dwords[i] = ResolveOptionalSamplerPhi(m_program, descriptor.dwords[i]);
 			}
 		}
 		if (sample_adjust) {
@@ -398,6 +397,98 @@ private:
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
 	}
 
+	bool Reaches(const Block* source, const Block* target) const {
+		if (source == nullptr || target == nullptr) {
+			return false;
+		}
+		std::vector<const Block*>        pending {source};
+		std::unordered_set<const Block*> visited;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == target) {
+				return true;
+			}
+			if (!visited.insert(block).second) {
+				continue;
+			}
+			for (const auto* successor: block->ImmSuccessors()) {
+				pending.push_back(successor);
+			}
+		}
+		return false;
+	}
+
+	bool MatchLoopInductionSelector(Value selector, const Block* use_block,
+	                                Value& entry_count) const {
+		selector        = selector.Resolve();
+		const auto* phi = selector.TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->NumArgs() != 2u ||
+		    phi->Parent() == nullptr || use_block == nullptr) {
+			return false;
+		}
+
+		size_t initial        = 0;
+		size_t backedge       = 0;
+		bool   found_initial  = false;
+		bool   found_backedge = false;
+		for (size_t index = 0; index < phi->NumArgs(); index++) {
+			uint32_t immediate = 0;
+			if (ImmediateU32(phi->Arg(index), immediate) && immediate == 0u) {
+				initial       = index;
+				found_initial = true;
+				continue;
+			}
+			const auto* increment = phi->Arg(index).ResolveInstruction();
+			if (increment == nullptr || increment->GetOpcode() != ValueOpcode::IAdd32 ||
+			    increment->NumArgs() != 2u) {
+				continue;
+			}
+			uint32_t   step = 0;
+			const bool canonical =
+			    (increment->Arg(0).Resolve() == selector &&
+			     ImmediateU32(increment->Arg(1), step)) ||
+			    (increment->Arg(1).Resolve() == selector && ImmediateU32(increment->Arg(0), step));
+			if (canonical && step == 1u) {
+				backedge       = index;
+				found_backedge = true;
+			}
+		}
+		if (!found_initial || !found_backedge || initial == backedge ||
+		    Reaches(phi->Parent(), phi->PhiBlock(initial)) ||
+		    !Reaches(phi->Parent(), phi->PhiBlock(backedge))) {
+			return false;
+		}
+
+		for (const auto& use: phi->Uses()) {
+			const auto* compare       = use.user;
+			const auto* compare_block = compare != nullptr ? compare->Parent() : nullptr;
+			if (compare_block == nullptr || compare->NumArgs() != 2u ||
+			    !Reaches(phi->Parent(), compare_block) || !Reaches(compare_block, use_block) ||
+			    !Reaches(use_block, phi->Parent())) {
+				continue;
+			}
+			Value candidate;
+			if ((compare->GetOpcode() == ValueOpcode::SLessThan32 ||
+			     compare->GetOpcode() == ValueOpcode::ULessThan32) &&
+			    use.operand == 0u) {
+				candidate = compare->Arg(1).Resolve();
+			} else if ((compare->GetOpcode() == ValueOpcode::SGreaterThan32 ||
+			            compare->GetOpcode() == ValueOpcode::UGreaterThan32) &&
+			           use.operand == 1u) {
+				candidate = compare->Arg(0).Resolve();
+			} else {
+				continue;
+			}
+			std::string reason;
+			if (ValidateRuntimeValue(m_program, candidate, reason)) {
+				entry_count = candidate;
+				return true;
+			}
+		}
+		return false;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -507,14 +598,13 @@ private:
 		return true;
 	}
 
-	bool MatchDirectTableOffset(Value value, uint32_t immediate_offset, Value& key,
-	                            uint32_t& table_offset) const {
+	bool MatchDirectTableOffset(Value value, uint32_t immediate_offset, const Block* use_block,
+	                            Value& key, Value& entry_count, uint32_t& table_offset) const {
 		value        = value.Resolve();
 		table_offset = immediate_offset;
 		for (;;) {
 			const auto* add = value.TryInstruction();
-			if (add == nullptr || add->GetOpcode() != ValueOpcode::IAdd32 ||
-			    add->NumArgs() != 2u) {
+			if (add == nullptr || add->GetOpcode() != ValueOpcode::IAdd32 || add->NumArgs() != 2u) {
 				break;
 			}
 			uint32_t immediate = 0;
@@ -536,7 +626,11 @@ private:
 		}
 		key                  = shift->Arg(0).Resolve();
 		const auto* key_inst = key.TryInstruction();
-		return key_inst != nullptr && key_inst->GetOpcode() == ValueOpcode::FindILsb32;
+		if (key_inst != nullptr && key_inst->GetOpcode() == ValueOpcode::FindILsb32) {
+			entry_count = {};
+			return true;
+		}
+		return MatchLoopInductionSelector(key, use_block, entry_count);
 	}
 
 	bool TryMakeDirectIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
@@ -544,9 +638,10 @@ private:
 			return false;
 		}
 
-		Inst*    table_handle = nullptr;
-		Value    key;
-		uint32_t base_offset = 0;
+		Inst*                            table_handle = nullptr;
+		Value                            key;
+		Value                            entry_count;
+		uint32_t                         base_offset = 0;
 		const std::array<const Inst*, 1> image_users {&handle};
 		for (uint32_t dword = 0; dword < plan.reads.size(); dword++) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
@@ -567,16 +662,21 @@ private:
 				return false;
 			}
 			Value    current_key;
+			Value    current_entry_count;
 			uint32_t current_offset = 0;
-			if (!MatchDirectTableOffset(read->Arg(1), memory->offset, current_key,
-			                            current_offset)) {
+			if (!MatchDirectTableOffset(read->Arg(1), memory->offset, read->Parent(), current_key,
+			                            current_entry_count, current_offset)) {
 				return false;
 			}
 			if (dword == 0u) {
 				table_handle = current_handle;
 				key          = current_key;
+				entry_count  = current_entry_count;
 				base_offset  = current_offset;
 			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           (entry_count.IsEmpty() != current_entry_count.IsEmpty()) ||
+			           (!entry_count.IsEmpty() &&
+			            entry_count.Resolve() != current_entry_count.Resolve()) ||
 			           current_offset != base_offset + dword * sizeof(uint32_t)) {
 				return false;
 			}
@@ -595,19 +695,33 @@ private:
 			return false;
 		}
 		const auto table_source_index = InternSource(table_source);
+		uint32_t   entry_count_source = DescriptorSource::IndirectImage::NoEntryCountSource;
+		uint32_t   static_entry_count = ShaderInfo::MaxImages;
+		if (!entry_count.IsEmpty()) {
+			DescriptorSource count_source;
+			count_source.dword_count = 1u;
+			count_source.dwords.fill(Value(0u));
+			count_source.dwords[0] = entry_count;
+			if (!ValidateSource(count_source, reason, bad_dword)) {
+				return false;
+			}
+			entry_count_source = InternSource(count_source);
+			static_entry_count = 0u;
+		}
 
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
 		image_source.dwords.fill(Value(0u));
-		image_source.dwords[0] = table_source.dwords[0];
-		image_source.dwords[1] = table_source.dwords[1];
+		image_source.dwords[0]      = table_source.dwords[0];
+		image_source.dwords[1]      = table_source.dwords[1];
 		image_source.indirect_image = DescriptorSource::IndirectImage {
-		    .mode            = DescriptorSource::IndirectImage::Mode::DirectAddress,
-		    .material_source = table_source_index,
-		    .heap_source     = table_source_index,
-		    .key_arg         = 0u,
-		    .table_offset    = base_offset,
-		    .table_count     = ShaderInfo::MaxImages,
+		    .mode               = DescriptorSource::IndirectImage::Mode::DirectAddress,
+		    .material_source    = table_source_index,
+		    .heap_source        = table_source_index,
+		    .entry_count_source = entry_count_source,
+		    .key_arg            = 0u,
+		    .table_offset       = base_offset,
+		    .table_count        = static_entry_count,
 		};
 
 		plan.handle         = &handle;
@@ -716,14 +830,14 @@ private:
 		resource.atomic          = resource.atomic || atomic;
 		resource.formatted       = resource.formatted || memory.formatted;
 		resource.scalar          = resource.scalar || op == ValueOpcode::ReadConstBuffer ||
-		                           memory.kind == ResourceKind::ScalarBuffer;
+		                  memory.kind == ResourceKind::ScalarBuffer;
 	}
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		const auto mip   = MipMode(memory);
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
-			auto& image = m_info.images[i];
+			auto&      image           = m_info.images[i];
 			const bool compatible_kind = image.kind == memory.kind || (IsStorageImage(image.kind) &&
 			                                                           IsStorageImage(memory.kind));
 			if (image.source == source && compatible_kind &&
@@ -906,8 +1020,8 @@ private:
 			if (inst.NumArgs() < 2) {
 				return Fail(flags.pc, error, "sampled image operation has no sampler handle");
 			}
-			Inst*    sampler_handle = nullptr;
-			uint32_t sampler_source = 0;
+			Inst*      sampler_handle = nullptr;
+			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
 			if (!GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,

@@ -205,15 +205,14 @@ enum class StageOutputKind {
 struct PositionExportComponent {
 	uint32_t clip_distance = UINT32_MAX;
 	uint32_t cull_distance = UINT32_MAX;
-	bool     valid          = false;
-	bool     point_size     = false;
-	bool     layer          = false;
-	bool     viewport       = false;
+	bool     valid         = false;
+	bool     point_size    = false;
+	bool     layer         = false;
+	bool     viewport      = false;
 };
 
-inline PositionExportComponent DecodePositionExportComponent(uint32_t control,
-	                                                           uint32_t pos_index,
-	                                                           uint32_t component) {
+inline PositionExportComponent DecodePositionExportComponent(uint32_t control, uint32_t pos_index,
+                                                             uint32_t component) {
 	PositionExportComponent result;
 	if (pos_index == 0 || component >= 4) {
 		return result;
@@ -403,9 +402,9 @@ struct DescriptorBinding {
 
 struct BindingLayout {
 	uint32_t                       push_constant_offset = 0;
-	uint32_t                       push_constant_size  = 0;
-	uint32_t                       memory_offset_dword = 0;
-	uint32_t                       memory_offset_count = 0;
+	uint32_t                       push_constant_size   = 0;
+	uint32_t                       memory_offset_dword  = 0;
+	uint32_t                       memory_offset_count  = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
@@ -459,15 +458,17 @@ struct BlockInfo {
 struct DescriptorSource {
 	struct IndirectImage {
 		enum class Mode { MaterialHeap, DirectAddress };
+		static constexpr uint32_t NoEntryCountSource = UINT32_MAX;
 
-		Mode     mode            = Mode::MaterialHeap;
-		uint32_t material_source = 0;
-		uint32_t heap_source     = 0;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
-		uint32_t key_arg         = 0;
-		uint32_t table_offset    = 0;
-		uint32_t table_count     = 0;
+		Mode     mode               = Mode::MaterialHeap;
+		uint32_t material_source    = 0;
+		uint32_t heap_source        = 0;
+		uint32_t entry_count_source = NoEntryCountSource;
+		uint32_t selector_stride    = 0;
+		uint32_t selector_offset    = 0;
+		uint32_t key_arg            = 0;
+		uint32_t table_offset       = 0;
+		uint32_t table_count        = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
@@ -493,18 +494,18 @@ struct Program {
 
 	Program(const Program&)            = delete;
 	Program& operator=(const Program&) = delete;
-	Program(Program&&) noexcept         = default;
+	Program(Program&&) noexcept        = default;
 	Program& operator=(Program&& other) noexcept;
 
-	ShaderType                    stage               = ShaderType::Unknown;
-	uint64_t                      shader_hash         = 0;
-	uint32_t                      wave_size           = 64;
-	uint32_t                      user_data_base      = 0;
-	uint32_t                      user_data_count     = 64;
-	uint32_t                      scratch_dwords      = 0;
-	bool                          dispatcher_fallback = false;
-	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
-	std::string                   fallback_reason;
+	ShaderType                          stage               = ShaderType::Unknown;
+	uint64_t                            shader_hash         = 0;
+	uint32_t                            wave_size           = 64;
+	uint32_t                            user_data_base      = 0;
+	uint32_t                            user_data_count     = 64;
+	uint32_t                            scratch_dwords      = 0;
+	bool                                dispatcher_fallback = false;
+	CFG::FailureKind                    cfg_failure_kind    = CFG::FailureKind::None;
+	std::string                         fallback_reason;
 	std::vector<std::unique_ptr<Block>> block_storage;
 	BlockList                           blocks;
 	std::vector<BlockInfo>              block_info;

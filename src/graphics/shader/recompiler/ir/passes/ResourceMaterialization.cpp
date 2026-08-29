@@ -89,16 +89,15 @@ bool ValidDirectImageDescriptor(const DescriptorValue& descriptor) {
 	}
 	const auto depth      = descriptor.dwords[4] & 0x1fffu;
 	const auto base_array = (descriptor.dwords[4] >> 16u) & 0x1fffu;
-	const bool is_array   = type == Prospero::ImageType::kColor1DArray ||
-	                        type == Prospero::ImageType::kColor2DArray;
+	const bool is_array =
+	    type == Prospero::ImageType::kColor1DArray || type == Prospero::ImageType::kColor2DArray;
 	if (is_array) {
 		return base_array <= depth;
 	}
 	if (type == Prospero::ImageType::kCube) {
 		const auto width  = (descriptor.dwords[2] & 0x3fffu) + 1u;
 		const auto height = ((descriptor.dwords[2] >> 14u) & 0x3fffu) + 1u;
-		return width == height && base_array <= depth &&
-		       (depth - base_array + 1u) % 6u == 0u;
+		return width == height && base_array <= depth && (depth - base_array + 1u) % 6u == 0u;
 	}
 	return base_array == 0u;
 }
@@ -109,7 +108,7 @@ uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 
 Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	return Prospero::RemapTextureFormat(format) != format ? format
-	                                                     : Prospero::BufferFormat::kInvalid;
+	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
@@ -257,7 +256,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	std::unordered_set<uint32_t> seen {0u};
 	uint32_t                     successful_probes = 0u;
 	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
-		uint32_t key = 0;
+		uint32_t    key = 0;
 		std::string read_error;
 		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key,
 		                          &read_error, use_pc)) {
@@ -307,12 +306,23 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 }
 
 bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indirect,
-	                                const DescriptorValue& table_value,
-	                                const SrtRuntime& runtime,
-	                                ResourceSnapshot::IndirectImage& result, std::string* error,
-	                                uint32_t use_pc) {
-	if (table_value.dword_count != 2u || indirect.table_count == 0u ||
-	    indirect.table_count > ShaderInfo::MaxImages) {
+                                    const DescriptorValue&                 table_value,
+                                    const DescriptorValue*                 entry_count_value,
+                                    const SrtRuntime&                      runtime,
+                                    ResourceSnapshot::IndirectImage& result, std::string* error,
+                                    uint32_t use_pc) {
+	uint32_t table_count = indirect.table_count;
+	if (indirect.entry_count_source != DescriptorSource::IndirectImage::NoEntryCountSource) {
+		if (entry_count_value == nullptr || entry_count_value->dword_count != 1u) {
+			if (error != nullptr) {
+				*error = fmt::format("direct image table at pc 0x{:08x} has no runtime entry count",
+				                     use_pc);
+			}
+			return false;
+		}
+		table_count = entry_count_value->dwords[0];
+	}
+	if (table_value.dword_count != 2u || table_count > ShaderInfo::MaxImages) {
 		if (error != nullptr) {
 			*error = fmt::format("direct image table at pc 0x{:08x} has invalid metadata", use_pc);
 		}
@@ -321,24 +331,26 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 	const auto base = (static_cast<uint64_t>(table_value.dwords[0]) |
 	                   static_cast<uint64_t>(table_value.dwords[1]) << 32u) &
 	                  AddressMask;
-	const auto bytes = static_cast<uint64_t>(indirect.table_count) * 8u * sizeof(uint32_t);
+	// Keep one typed null descriptor when the loop is empty; no shader invocation can select it.
+	const auto materialized_count = std::max(table_count, 1u);
+	const auto bytes = static_cast<uint64_t>(materialized_count) * 8u * sizeof(uint32_t);
 	if (base == 0u || indirect.table_offset > AddressMask - base ||
 	    bytes > AddressMask - (base + indirect.table_offset)) {
 		if (error != nullptr) {
-			*error = fmt::format("direct image table at pc 0x{:08x} exceeds the 48-bit address space",
-			                     use_pc);
+			*error = fmt::format(
+			    "direct image table at pc 0x{:08x} exceeds the 48-bit address space", use_pc);
 		}
 		return false;
 	}
 
 	ResourceSnapshot::IndirectImage next;
-	next.capacity = indirect.table_count;
-	next.keys.reserve(indirect.table_count);
-	next.candidates.reserve(indirect.table_count);
-	for (uint32_t key = 0; key < indirect.table_count; key++) {
+	next.capacity = materialized_count;
+	next.keys.reserve(materialized_count);
+	next.candidates.reserve(materialized_count);
+	for (uint32_t key = 0; key < materialized_count; key++) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
-		const auto address = base + indirect.table_offset + static_cast<uint64_t>(key) * 32u;
+		const auto address    = base + indirect.table_offset + static_cast<uint64_t>(key) * 32u;
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 			if (!ReadSpecializationWord(runtime, address + dword * sizeof(uint32_t),
 			                            candidate.dwords[dword])) {
@@ -571,9 +583,9 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 			    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
 			if (image.atomic && format != Prospero::BufferFormat::k32UInt) {
 				if (error != nullptr) {
-					*error = fmt::format(
-					    "atomic image descriptor {} changed to unsupported format {}", i,
-					    static_cast<uint32_t>(format));
+					*error =
+					    fmt::format("atomic image descriptor {} changed to unsupported format {}",
+					                i, static_cast<uint32_t>(format));
 				}
 				return false;
 			}
@@ -591,12 +603,10 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				}
 				return false;
 			}
-			const bool raw_sint_storage =
-			    storage && format == Prospero::BufferFormat::k32SInt && image.written &&
-			    !image.read && !image.atomic;
-			const bool uint_descriptor =
-			    Prospero::IsUintTextureFormat(format) || raw_sint_storage;
-			const auto uint_program = image.kind == ResourceKind::ImageUint ||
+			const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
+			                              image.written && !image.read && !image.atomic;
+			const bool uint_descriptor = Prospero::IsUintTextureFormat(format) || raw_sint_storage;
+			const auto uint_program    = image.kind == ResourceKind::ImageUint ||
 			                          image.kind == ResourceKind::StorageImageUint;
 			if (uint_descriptor != uint_program && !(image.atomic && uint_program)) {
 				if (error != nullptr) {
@@ -649,6 +659,12 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			}
 			MarkCleanFlatSlots(program, Source(program, source->indirect_image->material_source),
 			                   clean_flat_slots);
+			if (source->indirect_image->entry_count_source !=
+			    DescriptorSource::IndirectImage::NoEntryCountSource) {
+				MarkCleanFlatSlots(program,
+				                   Source(program, source->indirect_image->entry_count_source),
+				                   clean_flat_slots);
+			}
 			if (source->indirect_image->mode ==
 			    DescriptorSource::IndirectImage::Mode::MaterialHeap) {
 				MarkCleanFlatSlots(program, Source(program, source->indirect_image->heap_source),
@@ -692,8 +708,16 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			}
 			std::vector<DescriptorSourceRequest> requests {
 			    {source->indirect_image->material_source, image.first_use_pc}};
-			if (source->indirect_image->mode ==
-			    DescriptorSource::IndirectImage::Mode::MaterialHeap) {
+			const bool dynamic_direct_count =
+			    source->indirect_image->mode ==
+			        DescriptorSource::IndirectImage::Mode::DirectAddress &&
+			    source->indirect_image->entry_count_source !=
+			        DescriptorSource::IndirectImage::NoEntryCountSource;
+			if (dynamic_direct_count) {
+				requests.push_back(
+				    {source->indirect_image->entry_count_source, image.first_use_pc});
+			} else if (source->indirect_image->mode ==
+			           DescriptorSource::IndirectImage::Mode::MaterialHeap) {
 				requests.push_back({source->indirect_image->heap_source, image.first_use_pc});
 			}
 			SrtRuntime clean_runtime  = runtime;
@@ -703,13 +727,13 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 				return false;
 			}
 			ResourceSnapshot::IndirectImage table;
-			const bool materialized =
-			    source->indirect_image->mode ==
-			            DescriptorSource::IndirectImage::Mode::DirectAddress
-			        ? MaterializeDirectIndirectImage(*source->indirect_image, tables[0], runtime, table,
-			                                         error, image.first_use_pc)
-			        : MaterializeIndirectImage(*source->indirect_image, tables[0], tables[1], runtime,
-			                                   table, error, image.first_use_pc);
+			const bool                      materialized =
+                source->indirect_image->mode == DescriptorSource::IndirectImage::Mode::DirectAddress
+			                             ? MaterializeDirectIndirectImage(*source->indirect_image, tables[0],
+                                                     dynamic_direct_count ? &tables[1] : nullptr,
+			                                                              runtime, table, error, image.first_use_pc)
+			                             : MaterializeIndirectImage(*source->indirect_image, tables[0], tables[1],
+			                                                        runtime, table, error, image.first_use_pc);
 			if (!materialized) {
 				return false;
 			}
@@ -760,10 +784,9 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 						}
 						const auto  resource  = image.indirect_resources[slot];
 						const auto& candidate = program.info.images[resource];
-						if (!is_null &&
-						    (DescriptorDimension(descriptor, candidate.dimension) !=
-						         candidate.dimension ||
-						     DescriptorIsCube(descriptor) != candidate.cube)) {
+						if (!is_null && (DescriptorDimension(descriptor, candidate.dimension) !=
+						                     candidate.dimension ||
+						                 DescriptorIsCube(descriptor) != candidate.cube)) {
 							continue;
 						}
 						descriptor_slots[descriptor_index] = slot;
@@ -1100,9 +1123,9 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 			memory.image_cube      = image.cube;
 		}
 	}
-	program.info                = std::move(next);
+	program.info        = std::move(next);
 	program.memory_info = std::move(memory_info);
-	snapshot                    = std::move(next_snapshot);
+	snapshot            = std::move(next_snapshot);
 	return true;
 }
 
