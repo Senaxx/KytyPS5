@@ -401,6 +401,19 @@ void TestInvariantIndirectImageMaterialization() {
         "rejected planning memory read mutated the snapshot");
   memory.fail_address = UINT64_MAX;
 
+  // The allocation can be larger than its mapped selector tail. Once a valid prefix was read,
+  // the first unavailable tail record terminates enumeration without hiding first-read failures.
+  user_data[2] = 4u;
+  memory.fail_address = 0x11c4u;
+  ResourceSnapshot bounded_snapshot;
+  Check(MaterializeResources(fixture->program, runtime, bounded_snapshot, &error) &&
+            bounded_snapshot.images.size() == 1 &&
+            std::equal(image_descriptor.begin(), image_descriptor.end(),
+                       bounded_snapshot.images[0].dwords.begin()),
+        "mapped indirect image selector prefix did not materialize");
+  user_data[2] = 2u;
+  memory.fail_address = UINT64_MAX;
+
   memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] = 0u;

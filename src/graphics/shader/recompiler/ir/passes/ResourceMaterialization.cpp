@@ -255,12 +255,21 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 
 	std::vector<uint32_t>        keys {0u};
 	std::unordered_set<uint32_t> seen {0u};
+	uint32_t                     successful_probes = 0u;
 	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
 		uint32_t key = 0;
-		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key, error,
-		                          use_pc)) {
-			return false;
+		std::string read_error;
+		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key,
+		                          &read_error, use_pc)) {
+			if (successful_probes == 0u) {
+				if (error != nullptr) {
+					*error = std::move(read_error);
+				}
+				return false;
+			}
+			break;
 		}
+		successful_probes++;
 		if (seen.insert(key).second) {
 			keys.push_back(key);
 		}
@@ -270,7 +279,7 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	}
 
 	ResourceSnapshot::IndirectImage next;
-	next.capacity = static_cast<uint32_t>(probe_count + 1u);
+	next.capacity = successful_probes + 1u;
 	next.keys     = std::move(keys);
 	for (const auto key: next.keys) {
 		DescriptorValue candidate;
