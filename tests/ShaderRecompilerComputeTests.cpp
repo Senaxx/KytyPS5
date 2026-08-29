@@ -11986,6 +11986,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::TBUFFER_STORE_FORMAT_XYZ:
   case Opcode::TBUFFER_STORE_FORMAT_XYZW:
   case Opcode::BUFFER_ATOMIC_SWAP:
+  case Opcode::BUFFER_ATOMIC_CMPSWAP:
   case Opcode::BUFFER_ATOMIC_ADD:
   case Opcode::BUFFER_ATOMIC_SUB:
   case Opcode::BUFFER_ATOMIC_SMIN:
@@ -18779,6 +18780,42 @@ TestCase BufferAtomicGlc0DoesNotReturnOldValue() {
       {O::V_MOV_B32, O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase BufferAtomicCompareSwapExactRaw() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 4, 0);
+  AppendVMovU32(&code, 1, 99); // replacement
+  AppendVMovU32(&code, 2, 10); // comparator
+  code.push_back(0xe0c46000u);
+  code.push_back(
+      0x80080104u); // buffer_atomic_cmpswap v[1:2], v4, s[32:35] idxen glc
+  AppendStoreVgpr(&code, 1, 2);
+
+  AppendVMovU32(&code, 4, 1);
+  AppendVMovU32(&code, 1, 77); // replacement
+  AppendVMovU32(&code, 2, 30); // comparator; does not match memory[1]
+  code.push_back(EncodeMubuf0(0x31u, 0, true, false, true));
+  code.push_back(EncodeMubuf1(1, 8, 4));
+  AppendStoreVgpr(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferAtomicCompareSwapExactRaw";
+  test.code = std::move(code);
+  test.initial = {10, 20, 0, 0};
+  test.expected = {99, 20, 10, 20};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_ATOMIC_CMPSWAP, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  const auto descriptor = MakeStructuredStorageBufferData(
+      sizeof(u32), static_cast<u32>(test.initial.size()));
+  std::copy_n(descriptor.begin(), 4, test.user_data.begin() + 32);
+  test.user_data[50] = 1u << 20u;
+  test.has_user_data = true;
+  test.required_spirv = {"OpAtomicCompareExchange"};
+  return test;
+}
+
 TestCase BufferAtomicFMinExactRawGlcModes() {
   using O = ShaderOpcode;
 
@@ -20931,6 +20968,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsBpermuteWave64UsesIndependentHalves);
   AddCase(BufferAtomicVariants);
   AddCase(BufferAtomicGlc0DoesNotReturnOldValue);
+  AddCase(BufferAtomicCompareSwapExactRaw);
   AddCase(BufferAtomicFMinExactRawGlcModes);
   AddCase(BufferAtomicFMinSpecialValues);
   AddCase(BufferAtomicFMinContendedWorkgroup);

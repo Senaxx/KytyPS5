@@ -672,6 +672,27 @@ uint32_t EmitAtomic(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 	return return_value ? result : ConstantU32(ctx.state, 0);
 }
 
+uint32_t EmitAtomicCompareSwap(ValueEmitContext& ctx, const IR::Inst& inst,
+                               const IR::MemoryInfo& mem) {
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    const auto replacement = ctx.Arg(inst, inst.NumArgs() - 3);
+			    const auto comparator  = ctx.Arg(inst, inst.NumArgs() - 2);
+			    const auto old         = ctx.state.builder.AllocateId();
+			    ctx.state.builder.AddFunction(
+			        {OpAtomicCompareExchange, TypeU32(ctx.state), old,
+			         EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			         ConstantU32(ctx.state, ScopeDevice),
+			         ConstantU32(ctx.state, MemorySemanticsNone),
+			         ConstantU32(ctx.state, MemorySemanticsNone), replacement, comparator});
+			    EmitDeviceAtomicMemoryBarrier(ctx.state);
+			    return old;
+		    });
+	});
+}
+
 uint32_t FloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                 bool max_value) {
 	struct OrderedBits {
@@ -1179,6 +1200,10 @@ bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto atomic_opcode = AtomicOpcode(op);
 	if (atomic_opcode != 0) {
 		ctx.Define(inst, EmitAtomic(ctx, inst, ctx.Memory(inst), true));
+		return true;
+	}
+	if (op == IR::ValueOpcode::BufferAtomicCompareSwap32) {
+		ctx.Define(inst, EmitAtomicCompareSwap(ctx, inst, ctx.Memory(inst)));
 		return true;
 	}
 	if (op == IR::ValueOpcode::BufferAtomicFMin32 || op == IR::ValueOpcode::BufferAtomicFMax32) {

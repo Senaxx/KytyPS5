@@ -532,13 +532,24 @@ bool Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 }
 
 bool Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
-	const auto memory   = MemoryInfoFromDecoded(inst);
+	auto       memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetBufferResource(memory);
 	const auto address  = ReadBufferAddress(inst, 1);
-	const auto result   = ir.Emit(opcode,
-	                              {resource, address.index, address.offset, address.soffset,
-	                               ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	                              AddMemoryInfo(memory, inst.pc));
+	IR::Value  result;
+	if (opcode == IR::ValueOpcode::BufferAtomicCompareSwap32) {
+		memory.data_dwords     = 1u;
+		memory.component_count = 1u;
+		const auto data        = MemorySourceAt(inst, 0);
+		result = ir.Emit(opcode,
+		                 {resource, address.index, address.offset, address.soffset, ReadU32(data),
+		                  ReadU32(OffsetOperand(data, 1u)), ir.GetExec()},
+		                 AddMemoryInfo(memory, inst.pc));
+	} else {
+		result = ir.Emit(opcode,
+		                 {resource, address.index, address.offset, address.soffset,
+		                  ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
+		                 AddMemoryInfo(memory, inst.pc));
+	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
 	}
@@ -932,6 +943,8 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 
 		case Decoder::Opcode::BUFFER_ATOMIC_SWAP:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicSwap32);
+		case Decoder::Opcode::BUFFER_ATOMIC_CMPSWAP:
+			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicCompareSwap32);
 		case Decoder::Opcode::BUFFER_ATOMIC_ADD:
 			return BUFFER_ATOMIC(inst, IR::ValueOpcode::BufferAtomicIAdd32);
 		case Decoder::Opcode::BUFFER_ATOMIC_SUB:
