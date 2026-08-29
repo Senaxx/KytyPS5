@@ -73,6 +73,36 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	return true;
 }
 
+bool ValidDirectImageDescriptor(const DescriptorValue& descriptor) {
+	if (descriptor.dword_count != 8u || !ValidImageDescriptor(descriptor)) {
+		return false;
+	}
+	const auto type = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
+	if (type > Prospero::ImageType::kColor2DMsaaArray) {
+		return false;
+	}
+	const auto base_level = (descriptor.dwords[3] >> 12u) & 0xfu;
+	const auto last_level = (descriptor.dwords[3] >> 16u) & 0xfu;
+	const auto max_mip    = (descriptor.dwords[5] >> 4u) & 0xfu;
+	if (base_level > last_level || last_level > max_mip) {
+		return false;
+	}
+	const auto depth      = descriptor.dwords[4] & 0x1fffu;
+	const auto base_array = (descriptor.dwords[4] >> 16u) & 0x1fffu;
+	const bool is_array   = type == Prospero::ImageType::kColor1DArray ||
+	                        type == Prospero::ImageType::kColor2DArray;
+	if (is_array) {
+		return base_array <= depth;
+	}
+	if (type == Prospero::ImageType::kCube) {
+		const auto width  = (descriptor.dwords[2] & 0x3fffu) + 1u;
+		const auto height = ((descriptor.dwords[2] >> 14u) & 0x3fffu) + 1u;
+		return width == height && base_array <= depth &&
+		       (depth - base_array + 1u) % 6u == 0u;
+	}
+	return base_array == 0u;
+}
+
 uint32_t DescriptorImageSwizzle(const DescriptorValue& descriptor) {
 	return descriptor.dwords[3] & 0xfffu;
 }
@@ -262,6 +292,76 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		} else {
 			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
 		}
+	}
+	result = std::move(next);
+	return true;
+}
+
+bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indirect,
+	                                const DescriptorValue& table_value,
+	                                const SrtRuntime& runtime,
+	                                ResourceSnapshot::IndirectImage& result, std::string* error,
+	                                uint32_t use_pc) {
+	if (table_value.dword_count != 2u || indirect.table_count == 0u ||
+	    indirect.table_count > ShaderInfo::MaxImages) {
+		if (error != nullptr) {
+			*error = fmt::format("direct image table at pc 0x{:08x} has invalid metadata", use_pc);
+		}
+		return false;
+	}
+	const auto base = (static_cast<uint64_t>(table_value.dwords[0]) |
+	                   static_cast<uint64_t>(table_value.dwords[1]) << 32u) &
+	                  AddressMask;
+	const auto bytes = static_cast<uint64_t>(indirect.table_count) * 8u * sizeof(uint32_t);
+	if (base == 0u || indirect.table_offset > AddressMask - base ||
+	    bytes > AddressMask - (base + indirect.table_offset)) {
+		if (error != nullptr) {
+			*error = fmt::format("direct image table at pc 0x{:08x} exceeds the 48-bit address space",
+			                     use_pc);
+		}
+		return false;
+	}
+
+	ResourceSnapshot::IndirectImage next;
+	next.capacity = indirect.table_count;
+	next.keys.reserve(indirect.table_count);
+	next.candidates.reserve(indirect.table_count);
+	for (uint32_t key = 0; key < indirect.table_count; key++) {
+		DescriptorValue candidate;
+		candidate.dword_count = 8u;
+		const auto address = base + indirect.table_offset + static_cast<uint64_t>(key) * 32u;
+		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
+			if (!ReadSpecializationWord(runtime, address + dword * sizeof(uint32_t),
+			                            candidate.dwords[dword])) {
+				if (error != nullptr) {
+					*error = fmt::format("direct image table at pc 0x{:08x} read failed at "
+					                     "0x{:016x}",
+					                     use_pc, address + dword * sizeof(uint32_t));
+				}
+				return false;
+			}
+		}
+		if (!NullImageDescriptor(candidate) && !ValidDirectImageDescriptor(candidate)) {
+			if (key == 0u) {
+				if (error != nullptr) {
+					*error = fmt::format("direct image table at pc 0x{:08x} has no valid entries",
+					                     use_pc);
+				}
+				return false;
+			}
+			break;
+		}
+		if (NullImageDescriptor(candidate)) {
+			candidate.dwords.fill(0u);
+		}
+		const auto found = std::ranges::find(next.descriptors, candidate);
+		if (found == next.descriptors.end()) {
+			next.descriptors.push_back(candidate);
+			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
+		} else {
+			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
+		}
+		next.keys.push_back(key);
 	}
 	result = std::move(next);
 	return true;
@@ -540,8 +640,11 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			}
 			MarkCleanFlatSlots(program, Source(program, source->indirect_image->material_source),
 			                   clean_flat_slots);
-			MarkCleanFlatSlots(program, Source(program, source->indirect_image->heap_source),
-			                   clean_flat_slots);
+			if (source->indirect_image->mode ==
+			    DescriptorSource::IndirectImage::Mode::MaterialHeap) {
+				MarkCleanFlatSlots(program, Source(program, source->indirect_image->heap_source),
+				                   clean_flat_slots);
+			}
 		} else {
 			requests.push_back({image.source, image.first_use_pc});
 		}
@@ -578,21 +681,27 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			    image.indirect_root != image_index) {
 				continue;
 			}
-			const std::array requests {
-			    DescriptorSourceRequest {source->indirect_image->material_source,
-			                             image.first_use_pc},
-			    DescriptorSourceRequest {source->indirect_image->heap_source, image.first_use_pc}};
+			std::vector<DescriptorSourceRequest> requests {
+			    {source->indirect_image->material_source, image.first_use_pc}};
+			if (source->indirect_image->mode ==
+			    DescriptorSource::IndirectImage::Mode::MaterialHeap) {
+				requests.push_back({source->indirect_image->heap_source, image.first_use_pc});
+			}
 			SrtRuntime clean_runtime  = runtime;
 			clean_runtime.read_memory = runtime.read_specialization_memory;
 			std::vector<DescriptorValue> tables;
 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables, error)) {
 				return false;
 			}
-			const auto&                     material = tables[0];
-			const auto&                     heap     = tables[1];
 			ResourceSnapshot::IndirectImage table;
-			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, runtime, table,
-			                              error, image.first_use_pc)) {
+			const bool materialized =
+			    source->indirect_image->mode ==
+			            DescriptorSource::IndirectImage::Mode::DirectAddress
+			        ? MaterializeDirectIndirectImage(*source->indirect_image, tables[0], runtime, table,
+			                                         error, image.first_use_pc)
+			        : MaterializeIndirectImage(*source->indirect_image, tables[0], tables[1], runtime,
+			                                   table, error, image.first_use_pc);
+			if (!materialized) {
 				return false;
 			}
 			if (image.indirect_root == ImageResource::NoIndirectImage) {

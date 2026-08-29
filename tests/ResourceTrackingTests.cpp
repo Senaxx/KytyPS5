@@ -237,6 +237,93 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
+void TestDirectAddressIndirectImageMaterialization() {
+  Fixture fixture(ShaderType::Pixel);
+  const auto table =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 0x118);
+  const auto key = fixture.Emit(ValueOpcode::FindILsb32, {fixture.UserData(2)});
+  const auto shifted =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+  const auto first =
+      fixture.Emit(ValueOpcode::IAdd32, {shifted, Value(0x158u)});
+  const auto second = fixture.Emit(ValueOpcode::IAdd32, {first, Value(16u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarAddress;
+    scalar.offset = (dword & 3u) * sizeof(uint32_t);
+    image_words[dword] = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {table, dword < 4u ? first : second, Value(0u), Value(true)},
+        fixture.AddMemory(scalar, 0x118));
+  }
+  const auto image = fixture.Image(image_words, 0x118);
+  const auto sampler =
+      fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x118);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x118));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                             {sampled, Value(0u)})});
+
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == 1,
+        "direct address image table was not tracked");
+  const auto source = fixture.program.info.images[0].source;
+  Check(source < fixture.program.descriptor_sources.size() &&
+            fixture.program.descriptor_sources[source]
+                .indirect_image.has_value() &&
+            fixture.program.descriptor_sources[source].indirect_image->mode ==
+                DescriptorSource::IndirectImage::Mode::DirectAddress &&
+            fixture.program.descriptor_sources[source]
+                    .indirect_image->table_offset == 0x158u &&
+            fixture.program.descriptor_sources[source]
+                    .indirect_image->table_count == ShaderInfo::MaxImages,
+        "direct address image-table proof lost its bounded metadata");
+
+  std::array<uint32_t, 3> user_data{0x1000u, 0u, 8u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  for (uint32_t entry = 0; entry < ShaderInfo::MaxImages; entry++) {
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[(0x1158u - memory.base) / 4u + entry * 8u + dword] =
+          descriptor[dword];
+    }
+  }
+  memory.words[(0x1158u - memory.base) / 4u + 7u * 8u] ^= 1u;
+  memory.words[(0x1158u - memory.base) / 4u + 8u * 8u + 3u] |= 1u << 12u;
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  std::string error;
+  Check(MaterializeResources(fixture.program, runtime, snapshot, &error) &&
+            snapshot.images.size() == 1 &&
+            snapshot.indirect_images.size() == 1 &&
+            snapshot.indirect_images[0].keys.size() == 8u &&
+            snapshot.indirect_images[0].descriptors.size() == 2u &&
+            SpecializeResources(fixture.program, snapshot, &error) &&
+            fixture.program.info.images.size() == 2u &&
+            fixture.program.info.images[0].indirect_mapping_capacity ==
+                ShaderInfo::MaxImages,
+        error.empty() ? "direct address image table did not materialize and specialize"
+                      : error.c_str());
+}
+
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
@@ -1034,6 +1121,46 @@ void TestPhiValidation() {
             fixture.program.info.buffers.empty() &&
             fixture.program.descriptor_sources.empty(),
         "control-dependent descriptor phi was not rejected transactionally");
+
+  Fixture optional_sampler;
+  auto *inactive = optional_sampler.block;
+  auto *active = optional_sampler.AddBlock();
+  auto *sample = optional_sampler.AddBlock();
+  inactive->AddBranch(sample);
+  active->AddBranch(sample);
+  std::array<Value, 4> sampler_words;
+  for (uint32_t dword = 0; dword < sampler_words.size(); dword++) {
+    auto &word = sample->AppendNewInst(ValueOpcode::Phi, {},
+                                       static_cast<uint64_t>(Type::U32));
+    word.AddPhiOperand(inactive, Value(0u));
+    word.AddPhiOperand(active, optional_sampler.UserData(dword));
+    sampler_words[dword] = Value(&word);
+  }
+  const auto image = optional_sampler.Image(
+      {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u)},
+      0x2a0);
+  const auto sampler = optional_sampler.Sampler(sampler_words, 0x2a0);
+  MemoryInfo sample_memory;
+  sample_memory.kind = ResourceKind::Image;
+  sample_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  optional_sampler.Emit(
+      ValueOpcode::ImageSampleRaw,
+      {image, sampler, optional_sampler.ImageAddress()},
+      optional_sampler.AddMemory(sample_memory, 0x2a0), sample);
+  optional_sampler.PlanAndTrack();
+
+  Check(optional_sampler.program.info.samplers.size() == 1,
+        "optional sampler descriptor was not tracked");
+  const auto optional_source = optional_sampler.program.info.samplers[0].source;
+  const auto &optional_descriptor =
+      optional_sampler.program.descriptor_sources[optional_source];
+  for (uint32_t dword = 0; dword < sampler_words.size(); dword++) {
+    const auto *stored =
+        optional_descriptor.dwords[dword].Resolve().TryInstruction();
+    Check(stored != nullptr && stored->GetOpcode() == ValueOpcode::GetUserData,
+          "optional sampler retained an inactive zero phi");
+  }
 }
 
 void TestLoopCycleEnteredThroughRuntimeValue() {
@@ -1433,6 +1560,8 @@ int main() {
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
+    Run("direct address indirect images",
+        TestDirectAddressIndirectImageMaterialization);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

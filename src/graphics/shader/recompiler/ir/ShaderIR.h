@@ -458,11 +458,16 @@ struct BlockInfo {
 
 struct DescriptorSource {
 	struct IndirectImage {
+		enum class Mode { MaterialHeap, DirectAddress };
+
+		Mode     mode            = Mode::MaterialHeap;
 		uint32_t material_source = 0;
 		uint32_t heap_source     = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t key_arg         = 0;
+		uint32_t table_offset    = 0;
+		uint32_t table_count     = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

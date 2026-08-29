@@ -19890,7 +19890,11 @@ void CheckIndirectImageKeySwitch() {
   program.descriptor_sources.resize(2);
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_image =
-      DescriptorSource::IndirectImage{0u, 0u, 224u, 12u, 0u};
+      DescriptorSource::IndirectImage{.material_source = 0u,
+                                      .heap_source = 0u,
+                                      .selector_stride = 224u,
+                                      .selector_offset = 12u,
+                                      .key_arg = 0u};
   program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};
