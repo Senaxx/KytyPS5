@@ -413,12 +413,10 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				const auto root = image.indirect_root;
 				if (root >= program.info.images.size() ||
 				    program.info.images[root].kind != image.kind ||
-				    program.info.images[root].dimension != image.dimension ||
 				    program.info.images[root].mip_mode != image.mip_mode ||
 				    program.info.images[root].mip_count != image.mip_count ||
 				    program.info.images[root].conversion_format != image.conversion_format ||
-				    program.info.images[root].shader_swizzle != image.shader_swizzle ||
-				    program.info.images[root].cube != image.cube) {
+				    program.info.images[root].shader_swizzle != image.shader_swizzle) {
 					if (error != nullptr) {
 						*error = fmt::format(
 						    "null indirect image descriptor {} changed binding class", i);
@@ -615,8 +613,9 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 				}
 				return false;
 			}
-			for (uint32_t candidate = 0; candidate < image.indirect_resources.size(); candidate++) {
-				const auto resource = image.indirect_resources[candidate];
+			DescriptorValue null_descriptor;
+			null_descriptor.dword_count = 8u;
+			for (const auto resource: image.indirect_resources) {
 				if (resource >= program.info.images.size() ||
 				    program.info.images[resource].indirect_root != image_index) {
 					if (error != nullptr) {
@@ -624,9 +623,45 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 					}
 					return false;
 				}
-				next.images[resource] =
-				    table.descriptors[candidate < table.descriptors.size() ? candidate : 0u];
+				next.images[resource]   = null_descriptor;
 				image_written[resource] = 1u;
+			}
+			std::vector<uint32_t> descriptor_slots(table.descriptors.size(), UINT32_MAX);
+			std::vector<uint8_t>  slot_used(image.indirect_resources.size());
+			for (uint32_t pass = 0; pass < 2u; pass++) {
+				for (uint32_t descriptor_index = 0; descriptor_index < table.descriptors.size();
+				     descriptor_index++) {
+					const auto& descriptor = table.descriptors[descriptor_index];
+					const bool  is_null    = NullImageDescriptor(descriptor);
+					if ((pass == 0u && is_null) || (pass == 1u && !is_null)) {
+						continue;
+					}
+					for (uint32_t slot = 0; slot < image.indirect_resources.size(); slot++) {
+						if (slot_used[slot] != 0u) {
+							continue;
+						}
+						const auto  resource  = image.indirect_resources[slot];
+						const auto& candidate = program.info.images[resource];
+						if (!is_null &&
+						    (DescriptorDimension(descriptor, candidate.dimension) !=
+						         candidate.dimension ||
+						     DescriptorIsCube(descriptor) != candidate.cube)) {
+							continue;
+						}
+						descriptor_slots[descriptor_index] = slot;
+						slot_used[slot]                    = 1u;
+						next.images[resource]              = descriptor;
+						break;
+					}
+					if (descriptor_slots[descriptor_index] == UINT32_MAX) {
+						if (error != nullptr) {
+							*error = fmt::format(
+							    "indirect image table at pc 0x{:08x} changed candidate topology",
+							    image.first_use_pc);
+						}
+						return false;
+					}
+				}
 			}
 			std::vector<uint32_t> order(table.keys.size());
 			std::iota(order.begin(), order.end(), 0u);
@@ -637,7 +672,7 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 				const auto source              = order[entry];
 				const auto offset              = mapping + 1u + entry * 2u;
 				next.flattened_srt[offset]     = table.keys[source];
-				next.flattened_srt[offset + 1] = table.candidates[source];
+				next.flattened_srt[offset + 1] = descriptor_slots[table.candidates[source]];
 			}
 		} else {
 			auto descriptor = *cursor++;
@@ -842,13 +877,11 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			if (image.kind != image_class.kind || image.dimension != image_class.dimension ||
-			    image.mip_mode != image_class.mip_mode ||
+			if (image.kind != image_class.kind || image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.depth_compare != image_class.depth_compare ||
-			    image.cube != image_class.cube) {
+			    image.depth_compare != image_class.depth_compare) {
 				if (error != nullptr) {
 					*error = fmt::format(
 					    "indirect image table at pc 0x{:08x} has incompatible candidates",

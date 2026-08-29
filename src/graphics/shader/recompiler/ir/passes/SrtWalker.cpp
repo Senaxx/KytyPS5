@@ -102,6 +102,7 @@ bool IsRuntimeIntegerOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::FindILsb32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::ULessThan32:
@@ -692,6 +693,14 @@ private:
 			case ValueOpcode::BitwiseNot32:
 				if (Arg(inst, 0, a, error)) {
 					result = ~static_cast<uint32_t>(a);
+					return true;
+				}
+				return false;
+			case ValueOpcode::FindILsb32:
+				if (Arg(inst, 0, a, error)) {
+					const auto bits = static_cast<uint32_t>(a);
+					result = bits == 0u ? UINT32_MAX
+					                    : static_cast<uint32_t>(std::countr_zero(bits));
 					return true;
 				}
 				return false;

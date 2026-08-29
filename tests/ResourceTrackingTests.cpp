@@ -355,6 +355,65 @@ void TestInvariantIndirectImageMaterialization() {
             dynamic_snapshot.indirect_images.empty(),
         "dynamic indirect image table was not specialized transactionally");
 
+  auto mixed_fixture = MakeIndirectImageFixture(false);
+  mixed_fixture->PlanAndTrack();
+  memory.words[(0x2020u - memory.base) / 4u + 2u] = 3u;
+  memory.words[(0x2020u - memory.base) / 4u + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor1D)
+       << 28u);
+  ResourceSnapshot mixed_snapshot;
+  Check(MaterializeResources(mixed_fixture->program, runtime, mixed_snapshot,
+                             &error) &&
+            SpecializeResources(mixed_fixture->program, mixed_snapshot,
+                                &error) &&
+            mixed_fixture->program.info.images.size() == 2 &&
+            mixed_fixture->program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            mixed_fixture->program.info.images[1].dimension ==
+                Decoder::ImageDimension::Dim1D,
+        "mixed indirect image dimensions were not specialized");
+
+  auto image_descriptor_1d = image_descriptor;
+  image_descriptor_1d[0] ^= 1u;
+  image_descriptor_1d[2] = 3u;
+  image_descriptor_1d[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor1D)
+       << 28u);
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor_1d[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  const auto mixed_mapping =
+      mixed_fixture->program.info.images[0].indirect_mapping_offset;
+  Check(MaterializeResources(mixed_fixture->program, runtime, mixed_snapshot,
+                             &error) &&
+            ValidateResourceSpecialization(mixed_fixture->program,
+                                           mixed_snapshot, &error) &&
+            std::equal(image_descriptor.begin(), image_descriptor.end(),
+                       mixed_snapshot.images[0].dwords.begin()) &&
+            std::equal(image_descriptor_1d.begin(), image_descriptor_1d.end(),
+                       mixed_snapshot.images[1].dwords.begin()) &&
+            mixed_snapshot.flattened_srt[mixed_mapping + 2u] == 1u &&
+            mixed_snapshot.flattened_srt[mixed_mapping + 4u] == 0u,
+        "reordered mixed indirect image candidates changed typed slots");
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  Check(MaterializeResources(mixed_fixture->program, runtime, mixed_snapshot,
+                             &error) &&
+            ValidateResourceSpecialization(mixed_fixture->program,
+                                           mixed_snapshot, &error) &&
+            std::ranges::all_of(mixed_snapshot.images[1].dwords,
+                                [](uint32_t dword) { return dword == 0u; }),
+        "collapsed mixed indirect image candidates retained an incompatible slot");
+
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
         image_descriptor[dword];

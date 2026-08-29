@@ -19904,6 +19904,7 @@ void CheckIndirectImageKeySwitch() {
   root.indirect_mapping_capacity = mapping_capacity;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
+  candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
   candidate.indirect_mapping_capacity = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
@@ -19925,6 +19926,9 @@ void CheckIndirectImageKeySwitch() {
       (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
   snapshot.images = {descriptor, descriptor};
   snapshot.images[1].dwords[0] = 0x40u;
+  snapshot.images[1].dwords[3] =
+      DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Prospero::ImageType::kColor1D) << 28u);
   snapshot.flattened_srt.resize(1u + mapping_capacity * 2u);
   snapshot.flattened_srt[0] = 2u;
   snapshot.flattened_srt[1] = 0u;
