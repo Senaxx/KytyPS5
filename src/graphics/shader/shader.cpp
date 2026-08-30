@@ -835,11 +835,9 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	                                   ShaderComputeInputInfo& info) {
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
 	const bool needs_lds_barriers          = info.needs_lds_barriers;
-	const auto host_subgroup_size          = info.host_subgroup_size;
 	info = {};
 	info.dispatch_thread_dimensions = dispatch_thread_dimensions;
 	info.needs_lds_barriers          = needs_lds_barriers;
-	info.host_subgroup_size          = host_subgroup_size;
 	info.threads_num[0]      = regs.cs_regs.num_thread_x;
 	info.threads_num[1]      = regs.cs_regs.num_thread_y;
 	info.threads_num[2]      = regs.cs_regs.num_thread_z;
@@ -1003,7 +1001,6 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.push_back(info.lds_size_dwords);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(static_cast<uint32_t>(info.needs_lds_barriers));
-	key.push_back(info.host_subgroup_size);
 	key.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions));
 	for (int i = 0; i < 3; i++) {
 		key.push_back(info.threads_num[i]);
@@ -1144,13 +1141,11 @@ void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info) {
 	LOGF("\t workgroup_register = %d\n"
 	     "\t thread_ids_num     = %d\n"
 	     "\t wave_size          = %u\n"
-	     "\t host_subgroup_size = %u\n"
 	     "\t lds_size_dwords    = %u\n"
 	     "\t needs_lds_barriers = %s\n"
 	     "\t threads_num        = {%u, %u, %u}\n"
 	     "\t tg_size_en         = %s\n",
-	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.host_subgroup_size,
-	     info.lds_size_dwords,
+	     info.workgroup_register, info.thread_ids_num, info.wave_size, info.lds_size_dwords,
 	     info.needs_lds_barriers ? "true" : "false",
 	     info.threads_num[0], info.threads_num[1], info.threads_num[2],
 	     info.tg_size_en ? "true" : "false");

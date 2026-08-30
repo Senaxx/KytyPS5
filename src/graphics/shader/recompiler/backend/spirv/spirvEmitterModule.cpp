@@ -420,20 +420,12 @@ void AllocateInputVariables(EmitterState& state) {
 		binding.variable_id = state.builder.AllocateId();
 		state.interface_variables.push_back(binding.variable_id);
 	}
-	if (state.requirements.subgroup_local_invocation_id ||
-	    !state.wave64_mask_branch_scratch_banks.empty()) {
+	if (state.requirements.subgroup_local_invocation_id) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
-	if (!state.wave64_mask_branch_scratch_banks.empty()) {
-		state.subgroup_id_variable = state.builder.AllocateId();
-		state.interface_variables.push_back(state.subgroup_id_variable);
-	}
 	if (!state.wave64_read_lane_scratch_banks.empty()) {
 		state.wave64_read_lane_scratch_variable = state.builder.AllocateId();
-	}
-	if (!state.wave64_mask_branch_scratch_banks.empty()) {
-		state.wave64_mask_branch_scratch_variable = state.builder.AllocateId();
 	}
 }
 
@@ -515,11 +507,6 @@ void AddInputAnnotationsAndNames(EmitterState& state) {
 			state.builder.AddAnnotation(
 			    {OpDecorate, state.subgroup_local_invocation_id_variable, DecorationFlat});
 		}
-	}
-	if (state.subgroup_id_variable != 0) {
-		state.builder.AddName(state.subgroup_id_variable, "gl_SubgroupID");
-		state.builder.AddAnnotation({OpDecorate, state.subgroup_id_variable,
-		                             DecorationBuiltIn, BuiltInSubgroupId});
 	}
 	for (const auto& input: state.inputs) {
 		state.builder.AddName(input.variable_id, input.debug_name.c_str());
@@ -705,12 +692,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(CapabilityImageGatherExtended);
 	}
 	if (state.requirements.subgroup_ballot || state.requirements.subgroup_shuffle ||
-	    state.requirements.subgroup_local_invocation_id ||
-	    !state.wave64_mask_branch_scratch_banks.empty()) {
+	    state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(CapabilityGroupNonUniform);
 	}
-	if (state.requirements.subgroup_ballot ||
-	    !state.wave64_mask_branch_scratch_banks.empty()) {
+	if (state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {
@@ -776,10 +761,6 @@ void DefineModule(EmitterState& state) {
 		state.builder.AddName(state.wave64_read_lane_scratch_variable,
 		                      "wave64_read_lane_scratch");
 	}
-	if (state.wave64_mask_branch_scratch_variable != 0) {
-		state.builder.AddName(state.wave64_mask_branch_scratch_variable,
-		                      "wave64_mask_branch_scratch");
-	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);
 	AddDescriptorAnnotationsAndNames(state);
@@ -790,23 +771,11 @@ void DefineModule(EmitterState& state) {
 		                                   TypePointer(state, StorageClassInput, TypeU32(state)),
 		                                   StorageClassInput);
 	}
-	if (state.subgroup_id_variable != 0) {
-		state.builder.DefineGlobalVariable(state.subgroup_id_variable,
-		                                   TypePointer(state, StorageClassInput, TypeU32(state)),
-		                                   StorageClassInput);
-	}
 	if (state.wave64_read_lane_scratch_variable != 0) {
 		const auto dwords =
 		    static_cast<uint32_t>(state.wave64_read_lane_scratch_banks.size()) * 64u;
 		state.builder.DefineGlobalVariable(
 		    state.wave64_read_lane_scratch_variable,
-		    TypeU32ArrayPointer(state, StorageClassWorkgroup, dwords), StorageClassWorkgroup);
-	}
-	if (state.wave64_mask_branch_scratch_variable != 0) {
-		const auto dwords =
-		    static_cast<uint32_t>(state.wave64_mask_branch_scratch_banks.size()) * 2u;
-		state.builder.DefineGlobalVariable(
-		    state.wave64_mask_branch_scratch_variable,
 		    TypeU32ArrayPointer(state, StorageClassWorkgroup, dwords), StorageClassWorkgroup);
 	}
 	for (const auto& input: state.inputs) {

@@ -120,7 +120,6 @@ int SelfTest() {
   input.lds_size_dwords = 128;
   input.group_id[0] = true;
   input.needs_lds_barriers = true;
-  input.host_subgroup_size = 32;
   input.wave_size = 64;
   input.thread_ids_num = 2;
   input.workgroup_register = 40;
@@ -167,7 +166,6 @@ int SelfTest() {
       capture.code != code || capture.user_data != user_data ||
       capture.input.threads_num[0] != 8u ||
       capture.input.needs_lds_barriers != input.needs_lds_barriers ||
-      capture.input.host_subgroup_size != input.host_subgroup_size ||
       capture.resources.images != resources.images ||
       capture.resources.indirect_images.size() != 1u ||
       capture.resources.indirect_images[0].keys != table.keys ||

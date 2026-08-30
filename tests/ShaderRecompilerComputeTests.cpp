@@ -980,7 +980,6 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
   std::string expected_compile_error;
-  std::vector<std::pair<std::string, size_t>> spirv_counts;
 };
 
 struct GraphicsCase {
@@ -1155,14 +1154,6 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
     if (text.find(forbidden) != std::string::npos) {
       Fail(test.name, "SPIR-V disassembly",
            std::string("found forbidden text: ") + forbidden);
-    }
-  }
-  for (const auto &[needle, expected] : test.spirv_counts) {
-    const auto actual = CountText(text, needle);
-    if (actual != expected) {
-      Fail(test.name, "SPIR-V disassembly",
-           needle + " count=" + std::to_string(actual) +
-               ", expected=" + std::to_string(expected));
     }
   }
 }
@@ -14881,133 +14872,6 @@ TestCase VectorReadlaneFromInactiveWrittenLane() {
   return test;
 }
 
-TestCase Wave64VccBranchesUseLogicalMask() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeVopc(0xc2, InlineU32(63), 0));
-  AppendVMovU32(&code, 1, 0);
-  code.push_back(EncodeSopp(0x06, 1));
-  AppendVMovU32(&code, 1, 7);
-  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
-  AppendVMovU32(&code, 2, 0);
-  code.push_back(EncodeSopp(0x07, 1));
-  AppendVMovU32(&code, 2, 9);
-  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 64);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "Wave64VccBranchesUseLogicalMask";
-  test.code = code;
-  test.expected = std::vector<u32>(64, 7u);
-  test.expected.insert(test.expected.end(), 64, 0u);
-  test.opcodes = {O::V_CMP_EQ_U32, O::V_MOV_B32, O::S_CBRANCH_VCCZ,
-                  O::S_CBRANCH_VCCNZ, O::V_LSHLREV_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 64;
-  test.compute_info.threads_num[1] = 1;
-  test.compute_info.threads_num[2] = 1;
-  test.compute_info.lds_size_dwords = 0;
-  test.compute_info.needs_lds_barriers = true;
-  test.compute_info.host_subgroup_size = 32;
-  test.compute_info.wave_size = 64;
-  test.compute_info.thread_ids_num = 1;
-  test.has_compute_info = true;
-  test.required_spirv = {"wave64_mask_branch_scratch", "BuiltIn SubgroupId",
-                         "BuiltIn SubgroupLocalInvocationId",
-                         "OpGroupNonUniformBallot", "OpControlBarrier"};
-  test.spirv_counts = {{"OpControlBarrier", 4}};
-  return test;
-}
-
-TestCase Wave64ExecBranchesUseLogicalMask() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeSMovB32(4, InlineU32(0)));
-  code.push_back(EncodeSMovB32(5, InlineU32(0)));
-  code.push_back(EncodeSop1(0x04, 20, 126));
-  code.push_back(EncodeVopc(0xc2, InlineU32(63), 0));
-  code.push_back(EncodeSop1(0x04, 126, 106));
-  code.push_back(EncodeSopp(0x08, 1));
-  code.push_back(EncodeSMovB32(4, InlineU32(7)));
-  code.push_back(EncodeSop1(0x04, 126, 20));
-  AppendStoreSgprAtLaneDwordOffset(&code, 4, 0, 0);
-  code.push_back(EncodeSop1(0x04, 126, 106));
-  code.push_back(EncodeSopp(0x09, 1));
-  code.push_back(EncodeSMovB32(5, InlineU32(9)));
-  code.push_back(EncodeSop1(0x04, 126, 20));
-  AppendStoreSgprAtLaneDwordOffset(&code, 5, 0, 64);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "Wave64ExecBranchesUseLogicalMask";
-  test.code = code;
-  test.expected = std::vector<u32>(64, 7u);
-  test.expected.insert(test.expected.end(), 64, 0u);
-  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::V_CMP_EQ_U32,
-                  O::S_CBRANCH_EXECZ, O::S_CBRANCH_EXECNZ, O::V_MOV_B32,
-                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 64;
-  test.compute_info.threads_num[1] = 1;
-  test.compute_info.threads_num[2] = 1;
-  test.compute_info.lds_size_dwords = 0;
-  test.compute_info.needs_lds_barriers = true;
-  test.compute_info.host_subgroup_size = 32;
-  test.compute_info.wave_size = 64;
-  test.compute_info.thread_ids_num = 1;
-  test.has_compute_info = true;
-  test.required_spirv = {"wave64_mask_branch_scratch", "BuiltIn SubgroupId",
-                         "BuiltIn SubgroupLocalInvocationId",
-                         "OpGroupNonUniformBallot", "OpControlBarrier"};
-  test.spirv_counts = {{"OpControlBarrier", 4}};
-  return test;
-}
-
-TestCase Wave64MaskBranchesRequireGuaranteedWave32() {
-  auto test = Wave64VccBranchesUseLogicalMask();
-  test.name = "Wave64MaskBranchesRequireGuaranteedWave32";
-  test.compute_info.host_subgroup_size = 64;
-  test.required_spirv.clear();
-  test.forbidden_spirv = {"wave64_mask_branch_scratch", "BuiltIn SubgroupId",
-                          "OpControlBarrier"};
-  test.spirv_counts.clear();
-  test.compile_only = true;
-  return test;
-}
-
-TestCase Wave64MaskBranchInDivergentBlockUsesExistingPath() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
-  code.push_back(EncodeSop1(0x24, 4, 106));
-  code.push_back(EncodeSopp(0x04, 2));
-  code.push_back(EncodeSopp(0x07, 1));
-  AppendVMovU32(&code, 1, 7);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "Wave64MaskBranchInDivergentBlockUsesExistingPath";
-  test.code = code;
-  test.opcodes = {O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64,
-                  O::S_CBRANCH_SCC0, O::S_CBRANCH_VCCNZ, O::V_MOV_B32,
-                  O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 64;
-  test.compute_info.threads_num[1] = 1;
-  test.compute_info.threads_num[2] = 1;
-  test.compute_info.lds_size_dwords = 0;
-  test.compute_info.needs_lds_barriers = true;
-  test.compute_info.host_subgroup_size = 32;
-  test.compute_info.wave_size = 64;
-  test.compute_info.thread_ids_num = 1;
-  test.has_compute_info = true;
-  test.forbidden_spirv = {"wave64_mask_branch_scratch", "BuiltIn SubgroupId",
-                          "OpControlBarrier"};
-  test.compile_only = true;
-  return test;
-}
-
 TestCase VectorReadlaneWave64CrossHalf() {
   using O = ShaderOpcode;
 
@@ -21337,10 +21201,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSinF16SdwaAndEdges);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
-  AddCase(Wave64VccBranchesUseLogicalMask);
-  AddCase(Wave64ExecBranchesUseLogicalMask);
-  AddCase(Wave64MaskBranchesRequireGuaranteedWave32);
-  AddCase(Wave64MaskBranchInDivergentBlockUsesExistingPath);
   AddCase(VectorReadlaneWave64CrossHalf);
   AddCase(VectorReadlaneWave64DivergentUsesSubgroup);
   AddCase(DsAddtidWave64UsesLocalInvocationIndex);
@@ -25251,14 +25111,6 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mbcnt-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMbcntUsesThreadMask());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--wave64-mask-branch-only") == 0) {
-    VulkanHarness vulkan;
-    RunCase(&vulkan, Wave64VccBranchesUseLogicalMask());
-    RunCase(&vulkan, Wave64ExecBranchesUseLogicalMask());
-    RunCase(&vulkan, Wave64MaskBranchesRequireGuaranteedWave32());
-    RunCase(&vulkan, Wave64MaskBranchInDivergentBlockUsesExistingPath());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--readlane64-only") == 0) {

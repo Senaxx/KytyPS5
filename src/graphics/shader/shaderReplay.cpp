@@ -11,8 +11,7 @@ namespace {
 
 constexpr std::array<char, 8> CaptureMagic          = {'K', 'Y', 'T', 'Y', 'C', 'S', 'R', 'P'};
 constexpr std::array<char, 8> PixelCaptureMagic     = {'K', 'Y', 'T', 'Y', 'P', 'S', 'R', 'P'};
-constexpr uint32_t            CaptureVersion        = 2;
-constexpr uint32_t            MinCaptureVersion     = 1;
+constexpr uint32_t            CaptureVersion        = 1;
 constexpr uint32_t            MaxCaptureWords       = 16u * 1024u * 1024u;
 constexpr uint32_t            MaxCaptureDescriptors = 1u * 1024u * 1024u;
 
@@ -164,8 +163,7 @@ bool WriteInput(Writer& writer, const ShaderComputeInputInfo& input) {
 		if (!writer.U32(value ? 1u : 0u)) return false;
 	}
 	return writer.U32(input.dispatch_thread_dimensions ? 1u : 0u) &&
-	       writer.U32(input.needs_lds_barriers ? 1u : 0u) &&
-	       writer.U32(input.host_subgroup_size) && writer.U32(input.wave_size) &&
+	       writer.U32(input.needs_lds_barriers ? 1u : 0u) && writer.U32(input.wave_size) &&
 	       writer.U32(static_cast<uint32_t>(input.thread_ids_num)) &&
 	       writer.U32(static_cast<uint32_t>(input.workgroup_register)) &&
 	       writer.U32(input.tg_size_en ? 1u : 0u);
@@ -178,7 +176,7 @@ bool ReadFlag(Reader& reader, bool& value) {
 	return true;
 }
 
-bool ReadInput(Reader& reader, ShaderComputeInputInfo& input, uint32_t version) {
+bool ReadInput(Reader& reader, ShaderComputeInputInfo& input) {
 	for (auto& value: input.threads_num) {
 		if (!reader.U32(value)) return false;
 	}
@@ -192,8 +190,7 @@ bool ReadInput(Reader& reader, ShaderComputeInputInfo& input, uint32_t version) 
 	uint32_t thread_ids_num     = 0;
 	uint32_t workgroup_register = 0;
 	if (!ReadFlag(reader, input.dispatch_thread_dimensions) ||
-	    !ReadFlag(reader, input.needs_lds_barriers) ||
-	    (version >= 2u && !reader.U32(input.host_subgroup_size)) || !reader.U32(input.wave_size) ||
+	    !ReadFlag(reader, input.needs_lds_barriers) || !reader.U32(input.wave_size) ||
 	    !reader.U32(thread_ids_num) || !reader.U32(workgroup_register) ||
 	    !ReadFlag(reader, input.tg_size_en) || thread_ids_num > std::numeric_limits<int>::max() ||
 	    workgroup_register > std::numeric_limits<int>::max()) {
@@ -334,11 +331,10 @@ bool ReadComputeCapture(const std::filesystem::path& file, ComputeCapture& captu
 	uint32_t                              version = 0;
 	ComputeCapture                        next;
 	if (!reader.Bytes(magic.data(), magic.size()) || magic != CaptureMagic ||
-	    !reader.U32(version) || version < MinCaptureVersion || version > CaptureVersion ||
-	    !reader.U64(next.shader_hash) ||
+	    !reader.U32(version) || version != CaptureVersion || !reader.U64(next.shader_hash) ||
 	    !reader.U64(next.shader_base) || !reader.U32(next.user_data_base) ||
 	    !reader.U32(next.user_data_count) || !reader.U32(next.scratch_dwords) ||
-	    !reader.U32(next.push_constant_offset) || !ReadInput(reader, next.input, version) ||
+	    !reader.U32(next.push_constant_offset) || !ReadInput(reader, next.input) ||
 	    !ReadWords(reader, next.code, MaxCaptureWords) || !ReadWords(reader, next.user_data, 64u) ||
 	    !ReadResources(reader, next.resources) || !reader.AtEnd()) {
 		return Fail(error, "invalid or truncated compute shader replay: " + file.string());
@@ -386,8 +382,7 @@ bool ReadPixelCapture(const std::filesystem::path& file, PixelCapture& capture,
 	uint32_t                                   version = 0;
 	PixelCapture                               next;
 	if (!reader.Bytes(magic.data(), magic.size()) || magic != PixelCaptureMagic ||
-	    !reader.U32(version) || version < MinCaptureVersion || version > CaptureVersion ||
-	    !reader.U64(next.shader_hash) ||
+	    !reader.U32(version) || version != CaptureVersion || !reader.U64(next.shader_hash) ||
 	    !reader.U64(next.shader_base) || !reader.U32(next.wave_size) ||
 	    !reader.U32(next.user_data_base) || !reader.U32(next.user_data_count) ||
 	    !reader.U32(next.scratch_dwords) || !reader.U32(next.push_constant_offset) ||
