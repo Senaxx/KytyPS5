@@ -14889,6 +14889,7 @@ TestCase VectorReadlaneWave64CrossHalf() {
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
   test.compute_info.needs_lds_barriers = true;
   test.compute_info.wave_size = 64;
   test.compute_info.thread_ids_num = 1;
@@ -14896,6 +14897,42 @@ TestCase VectorReadlaneWave64CrossHalf() {
   test.required_spirv = {"wave64_read_lane_scratch", "OpControlBarrier",
                          "BuiltIn LocalInvocationIndex"};
   test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  return test;
+}
+
+TestCase VectorReadlaneWave64DivergentUsesSubgroup() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 42);
+  AppendVMovU32(&code, 2, 7);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
+  code.push_back(EncodeSop1(0x24, 4, 106));
+  code.push_back(EncodeSopp(0x08, 3));
+  AppendVop3(&code, 0x360, 6, Vgpr(1), InlineU32(31));
+  code.push_back(EncodeVop1(0x01, 2, 6));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneWave64DivergentUsesSubgroup";
+  test.code = code;
+  test.expected = std::vector<u32>(64, 7u);
+  test.expected[0] = 42u;
+  test.opcodes = {O::V_MOV_B32, O::V_CMP_EQ_U32, O::S_AND_SAVEEXEC_B64,
+                  O::S_CBRANCH_EXECZ, O::V_READLANE_B32, O::S_MOV_B64,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 0;
+  test.compute_info.needs_lds_barriers = true;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.forbidden_spirv = {"wave64_read_lane_scratch", "OpControlBarrier"};
   return test;
 }
 
@@ -21165,6 +21202,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorReadlaneWave64CrossHalf);
+  AddCase(VectorReadlaneWave64DivergentUsesSubgroup);
   AddCase(DsAddtidWave64UsesLocalInvocationIndex);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorPermlanex16);
@@ -25078,6 +25116,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--readlane64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneWave64CrossHalf());
+    RunCase(&vulkan, VectorReadlaneWave64DivergentUsesSubgroup());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-addtid-only") == 0) {

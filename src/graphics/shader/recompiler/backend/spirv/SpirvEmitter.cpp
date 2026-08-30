@@ -6,12 +6,121 @@
 
 #include <algorithm>
 #include <array>
+#include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 using ShaderError::Fail;
 
 namespace {
+
+bool DependsOnInvocation(IR::Value value) {
+	std::queue<IR::Value>         queue;
+	std::unordered_set<IR::Inst*> visited;
+	queue.push(value);
+	while (!queue.empty()) {
+		value = queue.front().Resolve();
+		queue.pop();
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr || !visited.insert(inst).second) {
+			continue;
+		}
+		if (inst->GetOpcode() == IR::ValueOpcode::ReadLane ||
+		    inst->GetOpcode() == IR::ValueOpcode::ReadFirstLane) {
+			continue;
+		}
+		if (inst->GetOpcode() == IR::ValueOpcode::LaneId) {
+			return true;
+		}
+		if (inst->GetOpcode() == IR::ValueOpcode::GetBuiltin) {
+			const auto kind = static_cast<IR::StageInputKind>(inst->Arg(0).U32());
+			if (kind == IR::StageInputKind::LocalInvocationId ||
+			    kind == IR::StageInputKind::LocalInvocationIndex ||
+			    kind == IR::StageInputKind::GlobalInvocationId) {
+				return true;
+			}
+		}
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			queue.push(inst->Arg(index));
+		}
+	}
+	return false;
+}
+
+bool CanReachBlock(const IR::Program& program, uint32_t source_id, uint32_t target_id) {
+	const auto FindBlock = [&](uint32_t id) -> const IR::Block* {
+		const auto info = std::ranges::find_if(
+		    program.block_info, [&](const IR::BlockInfo& block) { return block.id == id; });
+		return info == program.block_info.end()
+		           ? nullptr
+		           : program.blocks[static_cast<size_t>(info - program.block_info.begin())];
+	};
+	const auto* source = FindBlock(source_id);
+	const auto* target = FindBlock(target_id);
+	if (source == nullptr || target == nullptr) {
+		return false;
+	}
+	std::queue<const IR::Block*>         queue;
+	std::unordered_set<const IR::Block*> visited;
+	queue.push(source);
+	while (!queue.empty()) {
+		const auto* block = queue.front();
+		queue.pop();
+		if (block == target) {
+			return true;
+		}
+		if (!visited.insert(block).second) {
+			continue;
+		}
+		for (const auto* successor: block->ImmSuccessors()) {
+			queue.push(successor);
+		}
+	}
+	return false;
+}
+
+void CollectConvergedWave64ReadLanes(Emitter::EmitterState& state,
+	                                  const IR::Program& program) {
+	uint32_t                               divergence_depth = 0;
+	std::unordered_map<uint32_t, uint32_t> divergence_ends;
+	bool                                   permanently_divergent = false;
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		const auto& info = program.block_info[index];
+		if (const auto end = divergence_ends.find(info.id); end != divergence_ends.end()) {
+			if (end->second > divergence_depth) {
+				permanently_divergent = true;
+				divergence_depth      = 0;
+			} else {
+				divergence_depth -= end->second;
+			}
+		}
+		if (!permanently_divergent && divergence_depth == 0) {
+			for (const auto& inst: *program.blocks[index]) {
+				if (inst.GetOpcode() == IR::ValueOpcode::ReadLane) {
+					state.wave64_read_lane_scratch_banks.emplace(
+					    &inst,
+					    static_cast<uint32_t>(state.wave64_read_lane_scratch_banks.size()));
+				}
+			}
+		}
+
+		const auto& term = info.terminator;
+		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    !DependsOnInvocation(info.condition)) {
+			continue;
+		}
+		if (term.merge_block == UINT32_MAX ||
+		    !CanReachBlock(program, term.true_block, term.merge_block) ||
+		    !CanReachBlock(program, term.false_block, term.merge_block)) {
+			permanently_divergent = true;
+			continue;
+		}
+		divergence_depth++;
+		divergence_ends[term.merge_block]++;
+	}
+}
 
 bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	using Kind                                             = IR::DescriptorBindingKind;
@@ -339,14 +448,7 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	    input_info.compute->threads_num[0] * input_info.compute->threads_num[1] *
 	            input_info.compute->threads_num[2] ==
 	        64u) {
-		for (const auto* block: program.blocks) {
-			for (const auto& inst: *block) {
-				if (inst.GetOpcode() == IR::ValueOpcode::ReadLane) {
-					state.wave64_read_lane_scratch_banks.emplace(
-					    &inst, static_cast<uint32_t>(state.wave64_read_lane_scratch_banks.size()));
-				}
-			}
-		}
+		CollectConvergedWave64ReadLanes(state, program);
 	}
 	if (!state.wave64_read_lane_scratch_banks.empty() &&
 	    std::ranges::none_of(state.inputs, [](const Emitter::InputBinding& input) {
