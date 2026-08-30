@@ -14872,6 +14872,33 @@ TestCase VectorReadlaneFromInactiveWrittenLane() {
   return test;
 }
 
+TestCase VectorReadlaneWave64CrossHalf() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVop3(&code, 0x360, 5, Vgpr(0), InlineU32(63));
+  AppendStoreSgprAtLaneDwordOffset(&code, 5, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneWave64CrossHalf";
+  test.code = code;
+  test.expected = std::vector<u32>(64, 63u);
+  test.opcodes = {O::V_READLANE_B32, O::V_MOV_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.needs_lds_barriers = true;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  test.required_spirv = {"wave64_read_lane_scratch", "OpControlBarrier",
+                         "BuiltIn LocalInvocationIndex"};
+  test.forbidden_spirv = {"OpGroupNonUniformShuffle"};
+  return test;
+}
+
 TestCase DsAddtidWave64UsesLocalInvocationIndex() {
   using O = ShaderOpcode;
 
@@ -21137,6 +21164,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSinF16SdwaAndEdges);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
+  AddCase(VectorReadlaneWave64CrossHalf);
   AddCase(DsAddtidWave64UsesLocalInvocationIndex);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorPermlanex16);
@@ -25045,6 +25073,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mbcnt-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMbcntUsesThreadMask());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--readlane64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorReadlaneWave64CrossHalf());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-addtid-only") == 0) {

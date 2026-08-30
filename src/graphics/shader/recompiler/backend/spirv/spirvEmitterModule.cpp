@@ -424,6 +424,9 @@ void AllocateInputVariables(EmitterState& state) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
+	if (!state.wave64_read_lane_scratch_banks.empty()) {
+		state.wave64_read_lane_scratch_variable = state.builder.AllocateId();
+	}
 }
 
 static uint32_t AllocateInterfaceVariable(EmitterState& state) {
@@ -754,6 +757,10 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.function_scratch) {
 		state.builder.AddName(state.scratch_variable, "scratch_dwords");
 	}
+	if (state.wave64_read_lane_scratch_variable != 0) {
+		state.builder.AddName(state.wave64_read_lane_scratch_variable,
+		                      "wave64_read_lane_scratch");
+	}
 	AddInputAnnotationsAndNames(state);
 	AddOutputAnnotationsAndNames(state);
 	AddDescriptorAnnotationsAndNames(state);
@@ -763,6 +770,13 @@ void DefineModule(EmitterState& state) {
 		state.builder.DefineGlobalVariable(state.subgroup_local_invocation_id_variable,
 		                                   TypePointer(state, StorageClassInput, TypeU32(state)),
 		                                   StorageClassInput);
+	}
+	if (state.wave64_read_lane_scratch_variable != 0) {
+		const auto dwords =
+		    static_cast<uint32_t>(state.wave64_read_lane_scratch_banks.size()) * 64u;
+		state.builder.DefineGlobalVariable(
+		    state.wave64_read_lane_scratch_variable,
+		    TypeU32ArrayPointer(state, StorageClassWorkgroup, dwords), StorageClassWorkgroup);
 	}
 	for (const auto& input: state.inputs) {
 		uint32_t ptr_type = TypePointer(state, StorageClassInput, TypeU32(state));

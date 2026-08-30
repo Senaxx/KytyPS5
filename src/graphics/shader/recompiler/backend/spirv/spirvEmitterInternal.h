@@ -379,6 +379,8 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   wave64_read_lane_scratch_variable     = 0;
+	std::unordered_map<const IR::Inst*, uint32_t> wave64_read_lane_scratch_banks;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;

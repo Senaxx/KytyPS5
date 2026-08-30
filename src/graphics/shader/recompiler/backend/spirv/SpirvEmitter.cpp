@@ -334,6 +334,27 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	state.outputs.reserve(program.info.outputs.size());
 	state.interface_variables.reserve(program.info.inputs.size() + program.info.outputs.size());
 	CopyProgramInputsAndOutputs(state, program);
+	if (program.stage == ShaderType::Compute && program.wave_size == 64u &&
+	    input_info.compute != nullptr && input_info.compute->needs_lds_barriers &&
+	    input_info.compute->threads_num[0] * input_info.compute->threads_num[1] *
+	            input_info.compute->threads_num[2] ==
+	        64u) {
+		for (const auto* block: program.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() == IR::ValueOpcode::ReadLane) {
+					state.wave64_read_lane_scratch_banks.emplace(
+					    &inst, static_cast<uint32_t>(state.wave64_read_lane_scratch_banks.size()));
+				}
+			}
+		}
+	}
+	if (!state.wave64_read_lane_scratch_banks.empty() &&
+	    std::ranges::none_of(state.inputs, [](const Emitter::InputBinding& input) {
+		    return input.kind == IR::StageInputKind::LocalInvocationIndex;
+	    })) {
+		state.inputs.push_back({IR::StageInputKind::LocalInvocationIndex, 0, 1, 0,
+		                        "gl_LocalInvocationIndex", false});
+	}
 	AllocateInputVariables(state);
 	AllocateOutputVariables(state);
 	DefineModule(state);

@@ -140,6 +140,37 @@ uint32_t EmitWqm(ValueEmitContext& ctx, uint32_t active) {
 	return result;
 }
 
+uint32_t EmitWave64ReadLane(EmitterState& state, uint32_t source, uint32_t selector,
+	                        uint32_t bank) {
+	const auto local_index = EmitLocalInvocationIndex(state);
+	const auto store_index = state.builder.AllocateId();
+	const auto store_ptr   = state.builder.AllocateId();
+	state.builder.AddFunction({OpIAdd, TypeU32(state), store_index,
+	                           ConstantU32(state, bank * 64u), local_index});
+	state.builder.AddFunction({OpAccessChain,
+	                           TypeU32ElementPointer(state, StorageClassWorkgroup), store_ptr,
+	                           state.wave64_read_lane_scratch_variable, store_index});
+	state.builder.AddFunction({OpStore, store_ptr, source});
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+	const auto wrapped_selector = state.builder.AllocateId();
+	const auto load_index       = state.builder.AllocateId();
+	const auto load_ptr         = state.builder.AllocateId();
+	const auto result           = state.builder.AllocateId();
+	state.builder.AddFunction({OpBitwiseAnd, TypeU32(state), wrapped_selector, selector,
+	                           ConstantU32(state, 63u)});
+	state.builder.AddFunction({OpIAdd, TypeU32(state), load_index,
+	                           ConstantU32(state, bank * 64u), wrapped_selector});
+	state.builder.AddFunction({OpAccessChain,
+	                           TypeU32ElementPointer(state, StorageClassWorkgroup), load_ptr,
+	                           state.wave64_read_lane_scratch_variable, load_index});
+	state.builder.AddFunction({OpLoad, TypeU32(state), result, load_ptr});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+	return result;
+}
+
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
                                uint32_t exec) {
 	auto&      state      = ctx.state;
@@ -571,10 +602,17 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), lane});
 			return true;
 		}
-		case IR::ValueOpcode::ReadLane:
-			ctx.Emit(inst, OpGroupNonUniformShuffle, IR::Type::U32,
-			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
+		case IR::ValueOpcode::ReadLane: {
+			const auto bank = state.wave64_read_lane_scratch_banks.find(&inst);
+			if (bank != state.wave64_read_lane_scratch_banks.end()) {
+				ctx.Define(inst, EmitWave64ReadLane(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+				                                    bank->second));
+			} else {
+				ctx.Emit(inst, OpGroupNonUniformShuffle, IR::Type::U32,
+				         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0), ctx.Arg(inst, 1)});
+			}
 			return true;
+		}
 		case IR::ValueOpcode::WriteLane: {
 			const auto hit = state.builder.AllocateId();
 			state.builder.AddFunction({OpIEqual, TypeBool(state), hit,
