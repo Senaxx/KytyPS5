@@ -81,8 +81,16 @@ bool CanReachBlock(const IR::Program& program, uint32_t source_id, uint32_t targ
 	return false;
 }
 
-void CollectConvergedWave64ReadLanes(Emitter::EmitterState& state,
-	                                  const IR::Program& program) {
+bool IsWaveMaskBranch(CFG::BranchCondition condition) {
+	return condition == CFG::BranchCondition::ExecZero ||
+	       condition == CFG::BranchCondition::ExecNonZero ||
+	       condition == CFG::BranchCondition::VccZero ||
+	       condition == CFG::BranchCondition::VccNonZero;
+}
+
+void CollectConvergedWave64Operations(Emitter::EmitterState& state,
+	                                  const IR::Program& program,
+	                                  bool collect_mask_branches) {
 	uint32_t                               divergence_depth = 0;
 	std::unordered_map<uint32_t, uint32_t> divergence_ends;
 	bool                                   permanently_divergent = false;
@@ -96,7 +104,8 @@ void CollectConvergedWave64ReadLanes(Emitter::EmitterState& state,
 				divergence_depth -= end->second;
 			}
 		}
-		if (!permanently_divergent && divergence_depth == 0) {
+		const bool converged = !permanently_divergent && divergence_depth == 0;
+		if (converged) {
 			for (const auto& inst: *program.blocks[index]) {
 				if (inst.GetOpcode() == IR::ValueOpcode::ReadLane) {
 					state.wave64_read_lane_scratch_banks.emplace(
@@ -107,6 +116,14 @@ void CollectConvergedWave64ReadLanes(Emitter::EmitterState& state,
 		}
 
 		const auto& term = info.terminator;
+		if (converged && collect_mask_branches &&
+		    term.kind == CFG::TerminatorKind::ConditionalBranch &&
+		    IsWaveMaskBranch(term.condition)) {
+			state.wave64_mask_branch_scratch_banks.emplace(
+			    program.blocks[index],
+			    static_cast<uint32_t>(state.wave64_mask_branch_scratch_banks.size()));
+			continue;
+		}
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !DependsOnInvocation(info.condition)) {
 			continue;
@@ -445,10 +462,11 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	CopyProgramInputsAndOutputs(state, program);
 	if (program.stage == ShaderType::Compute && program.wave_size == 64u &&
 	    input_info.compute != nullptr && input_info.compute->needs_lds_barriers &&
-	    input_info.compute->threads_num[0] * input_info.compute->threads_num[1] *
-	            input_info.compute->threads_num[2] ==
+	    static_cast<uint64_t>(input_info.compute->threads_num[0]) *
+	            input_info.compute->threads_num[1] * input_info.compute->threads_num[2] ==
 	        64u) {
-		CollectConvergedWave64ReadLanes(state, program);
+		const bool collect_mask_branches = input_info.compute->host_subgroup_size == 32u;
+		CollectConvergedWave64Operations(state, program, collect_mask_branches);
 	}
 	if (!state.wave64_read_lane_scratch_banks.empty() &&
 	    std::ranges::none_of(state.inputs, [](const Emitter::InputBinding& input) {

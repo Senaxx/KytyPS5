@@ -93,6 +93,85 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction({OpReturn});
 }
 
+bool IsZeroWaveMaskBranch(CFG::BranchCondition condition) {
+	return condition == CFG::BranchCondition::ExecZero ||
+	       condition == CFG::BranchCondition::VccZero;
+}
+
+uint32_t EmitWave64MaskBranchCondition(ValueEmitContext& ctx, const IR::Block* block,
+	                                    const IR::BlockInfo& info) {
+	auto&      state = ctx.state;
+	const auto bank  = state.wave64_mask_branch_scratch_banks.find(block);
+	if (bank == state.wave64_mask_branch_scratch_banks.end()) {
+		return ctx.Def(info.condition);
+	}
+
+	uint32_t mask_bit = ctx.Def(info.condition);
+	if (IsZeroWaveMaskBranch(info.terminator.condition)) {
+		const auto inverted = state.builder.AllocateId();
+		state.builder.AddFunction({OpLogicalNot, TypeBool(state), inverted, mask_bit});
+		mask_bit = inverted;
+	}
+
+	const auto ballot = state.builder.AllocateId();
+	const auto low    = state.builder.AllocateId();
+	const auto any    = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                           ConstantU32(state, ScopeSubgroup), mask_bit});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), low, ballot, 0});
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), any, low, ConstantU32(state, 0)});
+
+	const auto lane      = EmitSubgroupLocalInvocationId(state);
+	const auto leader    = state.builder.AllocateId();
+	const auto value     = state.builder.AllocateId();
+	const auto index     = state.builder.AllocateId();
+	const auto pointer   = state.builder.AllocateId();
+	const auto subgroup  = EmitSubgroupId(state);
+	state.builder.AddFunction(
+	    {OpIEqual, TypeBool(state), leader, lane, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpSelect, TypeU32(state), value, any, ConstantU32(state, 1), ConstantU32(state, 0)});
+	state.builder.AddFunction({OpIAdd, TypeU32(state), index,
+	                           ConstantU32(state, bank->second * 2u), subgroup});
+	state.builder.AddFunction({OpAccessChain,
+	                           TypeU32ElementPointer(state, StorageClassWorkgroup), pointer,
+	                           state.wave64_mask_branch_scratch_variable, index});
+	EmitIfCondition(state, leader, [&] { state.builder.AddFunction({OpStore, pointer, value}); });
+
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+
+	const auto low_pointer  = state.builder.AllocateId();
+	const auto high_pointer = state.builder.AllocateId();
+	const auto low_value    = state.builder.AllocateId();
+	const auto high_value   = state.builder.AllocateId();
+	const auto combined     = state.builder.AllocateId();
+	const auto nonzero      = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain,
+	                           TypeU32ElementPointer(state, StorageClassWorkgroup), low_pointer,
+	                           state.wave64_mask_branch_scratch_variable,
+	                           ConstantU32(state, bank->second * 2u)});
+	state.builder.AddFunction({OpAccessChain,
+	                           TypeU32ElementPointer(state, StorageClassWorkgroup), high_pointer,
+	                           state.wave64_mask_branch_scratch_variable,
+	                           ConstantU32(state, bank->second * 2u + 1u)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), low_value, low_pointer});
+	state.builder.AddFunction({OpLoad, TypeU32(state), high_value, high_pointer});
+	state.builder.AddFunction({OpBitwiseOr, TypeU32(state), combined, low_value, high_value});
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), nonzero, combined, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+	if (!IsZeroWaveMaskBranch(info.terminator.condition)) {
+		return nonzero;
+	}
+	const auto zero = state.builder.AllocateId();
+	state.builder.AddFunction({OpLogicalNot, TypeBool(state), zero, nonzero});
+	return zero;
+}
+
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& term       = info.terminator;
@@ -131,7 +210,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(info.condition);
+			const auto condition = EmitWave64MaskBranchCondition(ctx, block, info);
 			emit_merge();
 			ctx.state.builder.AddFunction(
 			    {OpBranchConditional, condition, ctx.Label(true_block), ctx.Label(false_block)});
@@ -161,7 +240,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction({OpSelect, TypeU32(ctx.state), selected,
-			                               ctx.Def(info.condition),
+			                               EmitWave64MaskBranchCondition(ctx, block, info),
 			                               ConstantU32(ctx.state, term.true_block),
 			                               ConstantU32(ctx.state, term.false_block)});
 			return selected;
@@ -299,8 +378,8 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		if (ctx.failed) {
 			break;
 		}
-		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, ctx.program.block_info[index]);
+		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 	}
 	if (!ctx.failed) {
 		PatchStructuredPhis(ctx, structured);

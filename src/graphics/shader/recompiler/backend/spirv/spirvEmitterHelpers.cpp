@@ -164,6 +164,15 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	return value;
 }
 
+uint32_t EmitSubgroupId(EmitterState& state) {
+	if (state.subgroup_id_variable == 0) {
+		return ConstantU32(state, 0);
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, state.subgroup_id_variable});
+	return value;
+}
+
 uint32_t VertexInputDefaultComponentU32(EmitterState& state, VertexInputScalarKind kind,
                                         uint32_t component) {
 	if ((component & 3u) != 3u) {

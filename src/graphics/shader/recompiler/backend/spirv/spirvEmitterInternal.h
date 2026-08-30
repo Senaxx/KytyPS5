@@ -96,6 +96,7 @@ enum : uint32_t {
 	BuiltInLocalInvocationId         = 27,
 	BuiltInGlobalInvocationId        = 28,
 	BuiltInLocalInvocationIndex      = 29,
+	BuiltInSubgroupId                = 40,
 	BuiltInSubgroupLocalInvocationId = 41,
 	BuiltInVertexIndex               = 42,
 	BuiltInInstanceIndex             = 43,
@@ -379,8 +380,11 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
+	uint32_t                   subgroup_id_variable                  = 0;
 	uint32_t                   wave64_read_lane_scratch_variable     = 0;
 	std::unordered_map<const IR::Inst*, uint32_t> wave64_read_lane_scratch_banks;
+	uint32_t                   wave64_mask_branch_scratch_variable = 0;
+	std::unordered_map<const IR::Block*, uint32_t> wave64_mask_branch_scratch_banks;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
 	uint32_t                   clip_distance_variable                = 0;
@@ -736,6 +740,7 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component);
 
 uint32_t EmitLocalInvocationIndex(EmitterState& state);
+uint32_t EmitSubgroupId(EmitterState& state);
 
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t ballot, uint32_t lane);
 
