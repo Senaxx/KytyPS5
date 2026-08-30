@@ -1204,7 +1204,11 @@ uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
 			const bool true_reaches_false =
 			    CanReachBefore(graph, true_target, false_target, global_merge);
 			if (false_reaches_true != true_reaches_false) {
-				return false_reaches_true ? true_target : false_target;
+				const auto candidate = false_reaches_true ? true_target : false_target;
+				const auto other     = false_reaches_true ? false_target : true_target;
+				if (graph.PostDominates(candidate, other)) {
+					return candidate;
+				}
 			}
 		}
 		return global_merge;

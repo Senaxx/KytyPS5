@@ -16,6 +16,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderCompiler.h"
+#include "graphics/shader/shaderReplay.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "kernel/memory.h"
 #include "libs/errno.h"
@@ -150,6 +151,39 @@ static bool SpirvValidateBinary(const char* label, uint64_t shader_hash,
 
 	std::string disassembly;
 	SpirvDisassemble(spirv.data(), spirv.size(), &disassembly);
+	const auto base_name = Config::GetShaderLogFolder() / "validation" /
+	                       fmt::format("failed_{}_{:016x}", label, shader_hash);
+	Common::File::CreateDirectories(base_name.parent_path());
+	{
+		auto         file_name = base_name;
+		Common::File file;
+		file_name += ".spv";
+		file.Create(file_name);
+		if (!file.IsInvalid()) {
+			file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+			file.Close();
+		}
+	}
+	{
+		auto         file_name = base_name;
+		Common::File file;
+		file_name += ".spvasm";
+		file.Create(file_name);
+		if (!file.IsInvalid()) {
+			file.Printf("%s", disassembly.c_str());
+			file.Close();
+		}
+	}
+	{
+		auto         file_name = base_name;
+		Common::File file;
+		file_name += ".txt";
+		file.Create(file_name);
+		if (!file.IsInvalid()) {
+			file.Printf("%s", messages.c_str());
+			file.Close();
+		}
+	}
 	LOGF_COLOR(Log::Color::BrightRed, "%s SPIR-V validation failed hash=0x%016" PRIx64 ":\n%s",
 	           label, shader_hash, messages.c_str());
 	LOGF("%s\n", disassembly.c_str());
@@ -1247,6 +1281,56 @@ static ShaderRecompiler::CompileOptions MakeCompileOptions(const ShaderParams& p
 	return options;
 }
 
+static void DumpShaderRecompilerComputeReplay(
+    std::span<const uint32_t> code, const ShaderRecompiler::CompileOptions& options,
+    const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	const bool replay_shader = options.shader_hash == 0x493c9e4706b8a803ull ||
+	                           options.shader_hash == 0x7c974fb13cc650aeull ||
+	                           options.shader_hash == 0xb3ee9eea5b92b870ull ||
+	                           (code.size() == 1984 && options.input_info.compute != nullptr &&
+	                            options.input_info.compute->threads_num[0] == 8 &&
+	                            options.input_info.compute->threads_num[1] == 8 &&
+	                            options.input_info.compute->threads_num[2] == 1);
+	if (options.stage != ShaderType::Compute || !replay_shader ||
+	    options.input_info.compute == nullptr) {
+		return;
+	}
+	static std::atomic_int id = 0;
+	const auto base_name = Config::GetShaderLogFolder() / "replay" /
+	                       fmt::format("{:04d}_new_shader_cs_{:016x}", id++, options.shader_hash);
+	Common::File::CreateDirectories(base_name.parent_path());
+	auto replay_file = base_name;
+	replay_file += ".replay";
+	std::string error;
+	if (!ShaderReplay::WriteComputeCapture(replay_file, code, options,
+	                                       *options.input_info.compute, resources, &error)) {
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create compute shader replay: %s\n",
+		           error.c_str());
+	}
+}
+
+static void DumpShaderRecompilerPixelReplay(
+    std::span<const uint32_t> code, const ShaderRecompiler::CompileOptions& options,
+    const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	constexpr uint64_t ReplayShaderHash = 0x0000000036e18a55ull;
+	if (options.stage != ShaderType::Pixel || options.shader_hash != ReplayShaderHash ||
+	    options.input_info.pixel == nullptr) {
+		return;
+	}
+	static std::atomic_int id = 0;
+	const auto base_name = Config::GetShaderLogFolder() / "replay" /
+	                       fmt::format("{:04d}_new_shader_ps_{:016x}", id++, options.shader_hash);
+	Common::File::CreateDirectories(base_name.parent_path());
+	auto replay_file = base_name;
+	replay_file += ".replay";
+	std::string error;
+	if (!ShaderReplay::WritePixelCapture(replay_file, code, options, *options.input_info.pixel,
+	                                     resources, &error)) {
+		LOGF_COLOR(Log::Color::BrightRed, "Can't create pixel shader replay: %s\n",
+		           error.c_str());
+	}
+}
+
 static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& params,
                                       ShaderRecompiler::CompileOptions options,
                                       ShaderStageRuntime& stage) {
@@ -1256,6 +1340,10 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
 	std::string                     error;
 	if (!ShaderRecompiler::TryRecompile(params.code, options, result, &error)) {
 		ExitShaderRecompilerFailure(label, options.shader_hash, error.c_str());
+	}
+	if (options.retain_materialized_resources) {
+		DumpShaderRecompilerComputeReplay(params.code, options, result.materialized_resources);
+		DumpShaderRecompilerPixelReplay(params.code, options, result.materialized_resources);
 	}
 
 	DumpShaderRecompilerOriginal(stage_name, options.shader_hash, params.code, result.decoded_dump);
@@ -1309,6 +1397,9 @@ vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
 	options.scratch_dwords         = input_info.scratch_size_dwords;
 	options.push_constant_offset   = input_info.push_constant_offset;
 	options.input_info.pixel       = &input_info;
+	if (params.hash == 0x0000000036e18a55ull) {
+		options.retain_materialized_resources = true;
+	}
 	const auto module              = CompileModule(device, params, options, input_info.stage);
 	ApplyPixelOutputs(input_info, *input_info.stage.program);
 	return module;
@@ -1321,6 +1412,16 @@ vk::ShaderModule CompileProgram(vk::Device device, const ShaderParams& params,
 	options.scratch_dwords     = input_info.scratch_size_dwords;
 	options.wave_size          = input_info.wave_size;
 	options.input_info.compute = &input_info;
+	const bool replay_shader = params.hash == 0x493c9e4706b8a803ull ||
+	                           params.hash == 0x7c974fb13cc650aeull ||
+	                           params.hash == 0xb3ee9eea5b92b870ull ||
+	                           (params.code.size() == 1984 && input_info.threads_num[0] == 8 &&
+	                            input_info.threads_num[1] == 8 &&
+	                            input_info.threads_num[2] == 1);
+	if (replay_shader) {
+		DumpShaderRecompilerComputeReplay(params.code, options, {});
+		options.retain_materialized_resources = true;
+	}
 	return CompileModule(device, params, options, input_info.stage);
 }
 

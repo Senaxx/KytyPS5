@@ -55,7 +55,10 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid) {
+	const auto backing_format = Prospero::RemapTextureFormat(format);
+	if (type < Prospero::ImageType::kColor1D ||
+	    (Prospero::NumBytesPerElement(backing_format) == 0u &&
+	     Prospero::BlockCompressedBytesPerBlock(backing_format) == 0u)) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
@@ -235,14 +238,19 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		return false;
 	}
 
-	// S_BUFFER_LOAD ignores vector-buffer swizzle/add-thread fields. The shader computes the
-	// record stride explicitly; enumerate every wrapped 32-bit offset that can pass bounds.
-	const auto period      = uint64_t {1} << 32u;
-	const auto step        = std::gcd<uint64_t>(indirect.selector_stride, period);
-	const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
-	const auto size        = ScalarBufferSize(material);
-	const auto limit       = std::min<uint64_t>(UINT32_MAX, size + 3u);
-	const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+	// The material descriptor describes an array of regular-buffer records. The shader computes
+	// the same byte address explicitly, so enumerate that member once per declared record.
+	const auto step        = static_cast<uint64_t>(indirect.selector_stride);
+	const auto first       = static_cast<uint64_t>(indirect.selector_offset);
+	const auto probe_count = static_cast<uint64_t>(material.NumRecords());
+	if (first > step || step - first < sizeof(uint32_t)) {
+		if (error != nullptr) {
+			*error = fmt::format("indirect image material table at pc 0x{:08x} has an "
+			                     "out-of-record selector offset",
+			                     use_pc);
+		}
+		return false;
+	}
 	if (probe_count > MaxIndirectImageProbes) {
 		if (error != nullptr) {
 			*error = fmt::format("indirect image material table at pc 0x{:08x} requires {} "
@@ -255,7 +263,8 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 	std::vector<uint32_t>        keys {0u};
 	std::unordered_set<uint32_t> seen {0u};
 	uint32_t                     successful_probes = 0u;
-	for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
+	for (uint64_t record = 0u; record < probe_count; record++) {
+		const auto offset = first + record * step;
 		uint32_t    key = 0;
 		std::string read_error;
 		if (!ReadScalarBufferWord(material, static_cast<uint32_t>(offset), 0u, runtime, key,
@@ -271,9 +280,6 @@ bool MaterializeIndirectImage(const DescriptorSource::IndirectImage& indirect,
 		successful_probes++;
 		if (seen.insert(key).second) {
 			keys.push_back(key);
-		}
-		if (limit - offset < step) {
-			break;
 		}
 	}
 
@@ -356,12 +362,7 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 			}
 			uint32_t key = 0;
 			if (!ReadSpecializationWord(runtime, base + key_offset, key)) {
-				if (error != nullptr) {
-					*error = fmt::format("direct image key table at pc 0x{:08x} read failed at "
-					                     "0x{:016x}",
-					                     use_pc, base + key_offset);
-				}
-				return false;
+				continue;
 			}
 			if (static_cast<int32_t>(key) >= 0 && seen.insert(key).second) {
 				keys.push_back(key);
@@ -395,9 +396,15 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 			return false;
 		}
 		const auto address = base + entry_offset;
+		bool       readable = true;
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 			if (!ReadSpecializationWord(runtime, address + dword * sizeof(uint32_t),
 			                            candidate.dwords[dword])) {
+				if (indirect.direct_key_count != 0u) {
+					readable = false;
+					candidate.dwords.fill(0u);
+					break;
+				}
 				if (error != nullptr) {
 					*error = fmt::format("direct image table at pc 0x{:08x} read failed at "
 					                     "0x{:016x}",
@@ -406,7 +413,8 @@ bool MaterializeDirectIndirectImage(const DescriptorSource::IndirectImage& indir
 				return false;
 			}
 		}
-		if (!NullImageDescriptor(candidate) && !ValidDirectImageDescriptor(candidate)) {
+		if (readable && !NullImageDescriptor(candidate) &&
+		    !ValidDirectImageDescriptor(candidate)) {
 			if (indirect.direct_key_count == 0u && key == 0u) {
 				if (error != nullptr) {
 					*error = fmt::format("direct image table at pc 0x{:08x} has no valid entries",
@@ -1065,15 +1073,34 @@ bool SpecializeResources(Program& program, ResourceSnapshot& snapshot, std::stri
 				image.shader_swizzle    = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
-			if (image.kind != image_class.kind || image.mip_mode != image_class.mip_mode ||
+			if (image.mip_mode != image_class.mip_mode ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
 			    image.depth_compare != image_class.depth_compare) {
 				if (error != nullptr) {
 					*error = fmt::format(
-					    "indirect image table at pc 0x{:08x} has incompatible candidates",
-					    root.first_use_pc);
+					    "indirect image table at pc 0x{:08x} has incompatible candidates: "
+					    "root={} exemplar={} candidate={} "
+					    "class(kind={},mip_mode={},mips={},format={},swizzle=0x{:08x},depth={}) "
+					    "candidate(kind={},mip_mode={},mips={},format={},swizzle=0x{:08x},depth={}) "
+					    "descriptor={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+					    root.first_use_pc, root_index, exemplar, candidate,
+					    static_cast<uint32_t>(image_class.kind),
+					    static_cast<uint32_t>(image_class.mip_mode), image_class.mip_count,
+					    static_cast<uint32_t>(image_class.conversion_format),
+					    image_class.shader_swizzle, image_class.depth_compare,
+					    static_cast<uint32_t>(image.kind), static_cast<uint32_t>(image.mip_mode),
+					    image.mip_count, static_cast<uint32_t>(image.conversion_format),
+					    image.shader_swizzle, image.depth_compare,
+					    next_snapshot.images[candidate].dwords[0],
+					    next_snapshot.images[candidate].dwords[1],
+					    next_snapshot.images[candidate].dwords[2],
+					    next_snapshot.images[candidate].dwords[3],
+					    next_snapshot.images[candidate].dwords[4],
+					    next_snapshot.images[candidate].dwords[5],
+					    next_snapshot.images[candidate].dwords[6],
+					    next_snapshot.images[candidate].dwords[7]);
 				}
 				return false;
 			}

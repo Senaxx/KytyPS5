@@ -14677,6 +14677,39 @@ TestCase VectorReadlaneFromInactiveWrittenLane() {
   return test;
 }
 
+TestCase DsAddtidWave64UsesLocalInvocationIndex() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeSMovB32(124, InlineU32(0)));
+  code.push_back(EncodeDs0(0xb0, 0));
+  code.push_back(EncodeDs1(0, 0, 0));
+  code.push_back(EncodeDs0(0xb1, 0));
+  code.push_back(EncodeDs1(2, 0, 0));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsAddtidWave64UsesLocalInvocationIndex";
+  test.code = code;
+  test.expected.resize(64);
+  std::iota(test.expected.begin(), test.expected.end(), 0u);
+  test.opcodes = {O::S_MOV_B32, O::DS_WRITE_ADDTID_B32,
+                  O::DS_READ_ADDTID_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"BuiltIn LocalInvocationIndex"};
+  test.forbidden_spirv = {"BuiltIn SubgroupLocalInvocationId"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.lds_size_dwords = 64;
+  test.compute_info.needs_lds_barriers = true;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorLaneWave32RuntimeSelectorWraps() {
   using O = ShaderOpcode;
 
@@ -19797,7 +19830,8 @@ TestCase ImageSampleA16CompareBiasRdna2AddressOrder() {
   test.code = code;
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.required_spirv = {"OpImageSampleDrefExplicitLod", "UnpackHalf2x16"};
+  test.required_spirv = {"OpTypeImage %float 2D 2", "OpImageSampleDrefExplicitLod",
+                         "UnpackHalf2x16"};
   test.compile_only = true;
   return test;
 }
@@ -19990,6 +20024,7 @@ void CheckIndirectImageKeySwitch() {
   root.indirect_mapping_capacity = mapping_capacity;
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
+  candidate.kind = ResourceKind::ImageUint;
   candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
   candidate.indirect_mapping_capacity = 0;
   candidate.indirect_resources.clear();
@@ -20012,6 +20047,8 @@ void CheckIndirectImageKeySwitch() {
       (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
   snapshot.images = {descriptor, descriptor};
   snapshot.images[1].dwords[0] = 0x40u;
+  snapshot.images[1].dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u;
   snapshot.images[1].dwords[3] =
       DstSel(4, 5, 6, 7) |
       (static_cast<uint32_t>(Prospero::ImageType::kColor1D) << 28u);
@@ -20869,6 +20906,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorSinF16SdwaAndEdges);
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
+  AddCase(DsAddtidWave64UsesLocalInvocationIndex);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
@@ -24775,6 +24813,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--mbcnt-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorMbcntUsesThreadMask());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-addtid-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsAddtidWave64UsesLocalInvocationIndex());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {

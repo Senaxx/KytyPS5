@@ -533,7 +533,8 @@ private:
 		uint32_t offset = 0;
 	};
 
-	std::vector<AffineOffset> AffineOffsets(Value value, uint32_t depth = 0u) const {
+	std::vector<AffineOffset> AffineOffsets(Value value, Value active_condition = {},
+	                                        uint32_t depth = 0u) const {
 		value = value.Resolve();
 		if (depth >= 16u) {
 			return {};
@@ -546,14 +547,18 @@ private:
 			return {};
 		}
 		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
-			auto result = AffineOffsets(inst->Arg(1), depth + 1u);
-			auto other  = AffineOffsets(inst->Arg(2), depth + 1u);
+			if (!active_condition.IsEmpty() &&
+			    inst->Arg(0).Resolve() == active_condition.Resolve()) {
+				return AffineOffsets(inst->Arg(1), active_condition, depth + 1u);
+			}
+			auto result = AffineOffsets(inst->Arg(1), active_condition, depth + 1u);
+			auto other  = AffineOffsets(inst->Arg(2), active_condition, depth + 1u);
 			result.insert(result.end(), other.begin(), other.end());
 			return result;
 		}
 		if (inst->GetOpcode() == ValueOpcode::IAdd32 && inst->NumArgs() == 2u) {
-			const auto left  = AffineOffsets(inst->Arg(0), depth + 1u);
-			const auto right = AffineOffsets(inst->Arg(1), depth + 1u);
+			const auto left  = AffineOffsets(inst->Arg(0), active_condition, depth + 1u);
+			const auto right = AffineOffsets(inst->Arg(1), active_condition, depth + 1u);
 			std::vector<AffineOffset> result;
 			for (const auto& lhs: left) {
 				for (const auto& rhs: right) {
@@ -587,7 +592,7 @@ private:
 			} else {
 				return {};
 			}
-			auto result = AffineOffsets(source, depth + 1u);
+			auto result = AffineOffsets(source, active_condition, depth + 1u);
 			for (auto& affine: result) {
 				affine.stride *= factor;
 				affine.offset *= factor;
@@ -605,7 +610,7 @@ private:
 			return nullptr;
 		}
 		if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 && inst->NumArgs() == 4u) {
-			const auto* handle = inst->Arg(0).ResolveInstruction();
+			auto* handle = inst->Arg(0).ResolveInstruction();
 			return handle != nullptr &&
 			               (handle == &table_handle ||
 			                EquivalentValue(m_program, Value(handle), Value(&table_handle)))
@@ -632,10 +637,22 @@ private:
 		uint32_t    memory_index = 0;
 		const auto* memory       = ScalarAddressReadMemory(*material_read, memory_index);
 		if (memory == nullptr) {
+			memory_index = material_read->Flags<MemoryFlags>().index;
+			if (memory_index < m_program.memory_info.size()) {
+				const auto& candidate = m_program.memory_info[memory_index];
+				// AGC material batches may obtain their per-lane key with FLAT_LOAD_DWORD.
+				if ((candidate.kind == ResourceKind::Flat ||
+				     candidate.kind == ResourceKind::Global) &&
+				    candidate.data_bits == 32u && candidate.data_dwords == 1u) {
+					memory = &candidate;
+				}
+			}
+		}
+		if (memory == nullptr) {
 			return false;
 		}
 
-		auto candidates = AffineOffsets(material_read->Arg(1));
+		auto candidates = AffineOffsets(material_read->Arg(1), material_read->Arg(3));
 		for (auto& candidate: candidates) {
 			candidate.offset += memory->offset;
 		}

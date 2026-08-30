@@ -239,7 +239,9 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
 
 std::unique_ptr<Fixture>
 MakeReadLaneDirectImageFixture(bool malformed_lane = false,
-                               bool grouped = true) {
+                               bool grouped = true,
+                               ResourceKind material_kind =
+                                   ResourceKind::ScalarAddress) {
   auto fixture = std::make_unique<Fixture>();
   fixture->program.wave_size = 64u;
   const auto table =
@@ -261,10 +263,10 @@ MakeReadLaneDirectImageFixture(bool malformed_lane = false,
   const auto material_offset = fixture->Emit(
       ValueOpcode::SelectU32, {active, based_record, selected_record});
   MemoryInfo material_memory;
-  material_memory.kind = ResourceKind::ScalarAddress;
+  material_memory.kind = material_kind;
   const auto material = fixture->Emit(
       ValueOpcode::LoadAddressU32,
-      {table, material_offset, Value(0u), Value(true)},
+      {table, material_offset, Value(0u), active},
       fixture->AddMemory(material_memory, 0x108u));
   const auto lane = fixture->Emit(
       ValueOpcode::BitwiseAnd32,
@@ -328,6 +330,19 @@ void TestReadLaneDirectImageMaterialization() {
   Check(source.indirect_image->direct_key_count == 64u,
         "wave64 material record count was not retained");
 
+  auto global_material = MakeReadLaneDirectImageFixture(
+      false, true, ResourceKind::Global);
+  global_material->PlanAndTrack();
+  const auto global_source_index = global_material->program.info.images[0].source;
+  const auto &global_source =
+      global_material->program.descriptor_sources[global_source_index];
+  Check(global_source.indirect_image.has_value() &&
+            global_source.indirect_image->mode ==
+                DescriptorSource::IndirectImage::Mode::DirectAddress &&
+            global_source.indirect_image->direct_key_stride == 144u &&
+            global_source.indirect_image->direct_key_offset == 0xc00u,
+        "a FLAT_LOAD material key did not retain its direct image table");
+
   auto malformed = MakeReadLaneDirectImageFixture(true);
   std::string error;
   Check(BuildSrtPlan(malformed->program, &error) &&
@@ -349,6 +364,8 @@ void TestReadLaneDirectImageMaterialization() {
   memory.words[0xc00u / 4u] = 5u;
   memory.words[(0xc00u + 144u) / 4u] = 17u;
   memory.words[(0xc00u + 288u) / 4u] = 63u;
+  memory.words[(0xc00u + 432u) / 4u] = 4096u;
+  memory.words[(0xc00u + 576u) / 4u] = 23u;
 
   std::array<uint32_t, 8> descriptor{};
   descriptor[0] = 0x20u;
@@ -368,6 +385,10 @@ void TestReadLaneDirectImageMaterialization() {
     }
   }
   memory.words[(0x158u + 17u * 32u) / 4u] ^= 1u;
+  for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+    memory.words[(0x158u + 23u * 32u) / 4u + dword] = descriptor[dword];
+  }
+  memory.words[(0x158u + 23u * 32u) / 4u + 1u] = 256u << 20u;
 
   std::array<uint32_t, 8> user_data{
       static_cast<uint32_t>(memory.base), 0u, 1u, 2u, 5u, 0u, 0u, 1u};
@@ -380,9 +401,18 @@ void TestReadLaneDirectImageMaterialization() {
             snapshot.indirect_images.size() == 1u &&
             snapshot.indirect_images[0].capacity == 64u &&
             snapshot.indirect_images[0].keys ==
-                std::vector<uint32_t>({5u, 17u, 63u}) &&
-            snapshot.indirect_images[0].descriptors.size() == 2u,
+                std::vector<uint32_t>({5u, 17u, 63u, 4096u, 23u}) &&
+            snapshot.indirect_images[0].descriptors.size() == 3u &&
+            snapshot.indirect_images[0].candidates.back() == 2u,
         error.empty() ? "wave64 material keys did not materialize"
+                      : error.c_str());
+
+  memory.fail_address = memory.base + 0xc00u + 4u * 144u;
+  error.clear();
+  Check(MaterializeResources(fixture->program, runtime, snapshot, &error) &&
+            snapshot.indirect_images[0].keys ==
+                std::vector<uint32_t>({5u, 17u, 63u, 4096u}),
+        error.empty() ? "an unreadable inactive-lane key was not ignored"
                       : error.c_str());
 }
 
@@ -692,7 +722,7 @@ void TestInvariantIndirectImageMaterialization() {
   user_data[2] = 2u;
   memory.fail_address = UINT64_MAX;
 
-  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+  memory.words[(0x1000u - memory.base + 228u) / 4u] = 1u;
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] = 0u;
     memory.words[(0x2020u - memory.base) / 4u + dword] = 0u;
@@ -717,7 +747,7 @@ void TestInvariantIndirectImageMaterialization() {
         image_descriptor[dword];
   }
   memory.words[(0x2020u - memory.base) / 4u] ^= 1u;
-  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+  memory.words[(0x1000u - memory.base + 228u) / 4u] = 1u;
   ResourceSnapshot dynamic_snapshot;
   Check(MaterializeResources(fixture->program, runtime, dynamic_snapshot,
                              &error) &&
@@ -825,7 +855,7 @@ void TestInvariantIndirectImageMaterialization() {
                                            &error),
         "runtime indirect key mapping rejected a fitting material-table size");
   }
-  user_data[2] = 2u;
+  user_data[2] = 3u;
   memory.words[(0x2020u - memory.base) / 4u] =
       memory.words[(0x2000u - memory.base) / 4u] + 1u;
   memory.words[(0x2040u - memory.base) / 4u] =
@@ -834,7 +864,7 @@ void TestInvariantIndirectImageMaterialization() {
     memory.words[(0x2040u - memory.base) / 4u + dword] =
         image_descriptor[dword];
   }
-  memory.words[(0x1000u - memory.base + 68u) / 4u] = 2u;
+  memory.words[(0x1000u - memory.base + 452u) / 4u] = 2u;
   Check(
       !MaterializeResources(fixture->program, runtime, rebound_snapshot,
                             &error) &&

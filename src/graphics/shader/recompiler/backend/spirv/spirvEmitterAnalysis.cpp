@@ -172,7 +172,7 @@ uint32_t ImageViewSpatialComponents(ImageViewKind view) {
 uint32_t ImageViewImageType(EmitterState& state, ImageViewKind view, bool integer) {
 	const auto component = integer ? TypeU32(state) : TypeF32(state);
 	return state.builder.Type(OpTypeImage,
-	                          {component, ImageSpirvDimension(view), 0, ImageSpirvArrayed(view),
+	                          {component, ImageSpirvDimension(view), 2, ImageSpirvArrayed(view),
 	                           ImageSpirvMultisampled(view), 1, ImageFormatUnknown});
 }
 

@@ -705,16 +705,19 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                              integer && !dref, false, mem, true));
 			return true;
 		}
-		const auto result_type =
-		    dref ? TypeF32(state) : (integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
-		const auto EmitSample = [&](uint32_t resource) {
+		const auto EmitSample = [&](uint32_t resource, bool normalize) {
 			auto candidate_mem = mem;
 			if (resource < state.program.info.images.size()) {
 				const auto& candidate = state.program.info.images[resource];
+				candidate_mem.resource        = resource;
 				candidate_mem.kind            = candidate.kind;
 				candidate_mem.image_dimension = candidate.dimension;
 				candidate_mem.image_cube      = candidate.cube;
 			}
+			const bool candidate_integer = candidate_mem.kind == IR::ResourceKind::ImageUint;
+			const auto candidate_result_type =
+			    dref ? TypeF32(state)
+			         : (candidate_integer ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4));
 			const auto candidate_view = SampledImageViewKind(state, candidate_mem, pc);
 			const auto candidate_layout = Layout(candidate_mem, candidate_view);
 			const auto candidate_coord =
@@ -759,7 +762,7 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto sampled =
 			    MakeSampledImage(state, candidate_mem, pc, candidate_view, resource);
 			const auto            sample  = state.builder.AllocateId();
-			std::vector<uint32_t> words {opcode, result_type, sample, sampled,
+			std::vector<uint32_t> words {opcode, candidate_result_type, sample, sampled,
 			                             candidate_coord};
 			if (dref) {
 				words.push_back(dref_value);
@@ -769,11 +772,16 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				words.insert(words.end(), operands.begin(), operands.end());
 			}
 			state.builder.AddFunction(words);
-			return sample;
+			return normalize
+			           ? ResultVector(ctx,
+			                          dref ? sample
+			                               : UnpackImageTexel(ctx, candidate_mem, sample),
+			                          candidate_integer, dref, candidate_mem)
+			           : sample;
 		};
 		const auto& image = state.program.info.images[mem.resource];
 		if (image.indirect_root != mem.resource) {
-			const auto sample = EmitSample(mem.resource);
+			const auto sample = EmitSample(mem.resource, false);
 			ctx.Define(inst, ResultVector(ctx, dref ? sample : UnpackImageTexel(ctx, mem, sample),
 			                              integer, dref, mem));
 			return true;
@@ -853,22 +861,21 @@ bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
 		state.builder.AddFunction(switch_words);
-		std::vector<uint32_t> phi_words {OpPhi, result_type, state.builder.AllocateId()};
+		std::vector<uint32_t> phi_words {OpPhi, TypeU32Vector(state, 4),
+		                                 state.builder.AllocateId()};
 		EmitLabel(state, default_label);
-		phi_words.push_back(EmitSample(image.indirect_resources[0]));
+		phi_words.push_back(EmitSample(image.indirect_resources[0], true));
 		phi_words.push_back(default_label);
 		state.builder.AddFunction({OpBranch, merge_label});
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
 			EmitLabel(state, labels[candidate - 1u]);
-			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
+			phi_words.push_back(EmitSample(image.indirect_resources[candidate], true));
 			phi_words.push_back(labels[candidate - 1u]);
 			state.builder.AddFunction({OpBranch, merge_label});
 		}
 		EmitLabel(state, merge_label);
 		state.builder.AddFunction(phi_words);
-		ctx.Define(inst,
-		           ResultVector(ctx, dref ? phi_words[2] : UnpackImageTexel(ctx, mem, phi_words[2]),
-		                        integer, dref, mem));
+		ctx.Define(inst, phi_words[2]);
 		return true;
 	}
 	const auto atomic_opcode = ImageAtomicOpcode(op);

@@ -147,6 +147,8 @@ struct PipelineCache::ProgramCache {
 			id = 1;
 		}
 		const ShaderProgram handle {.id = id, .module = module};
+		SetVulkanObjectNameF(device, module, "Kyty shader type={} hash={:016x} permutation={}",
+		                     static_cast<uint32_t>(stage), params.hash, permutations.size());
 		permutations.push_back({key_scratch, input_info.stage.program, handle});
 
 		std::printf("Num compiled %u shaders\n", ++num_compiled);

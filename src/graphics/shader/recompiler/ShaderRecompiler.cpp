@@ -490,9 +490,9 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 
 	const auto compile_begin = std::chrono::steady_clock::now();
 	const auto phase_ms      = [&compile_begin]() {
-		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-		                                 std::chrono::steady_clock::now() - compile_begin)
-		                                 .count());
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - compile_begin)
+		                                      .count());
 	};
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
@@ -560,7 +560,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
 	}
 
-	IR::Program ir;
+	IR::Program                   ir;
 	const ShaderVertexInputInfo*  vertex  = nullptr;
 	const ShaderPixelInputInfo*   pixel   = nullptr;
 	const ShaderComputeInputInfo* compute = nullptr;
@@ -588,12 +588,11 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	    .scratch_dwords      = options.scratch_dwords,
 	    .dispatcher_fallback = dispatcher_fallback,
 	    .cfg_failure_kind    = cfg.failure_kind,
-	    .fallback_reason     = dispatcher_reason.empty() ? cfg.unsupported_reason
-	                                                    : dispatcher_reason,
-	    .vertex              = vertex,
-	    .pixel               = pixel,
-	    .compute             = compute,
-	    .embedded_fetch      = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .fallback_reason = dispatcher_reason.empty() ? cfg.unsupported_reason : dispatcher_reason,
+	    .vertex          = vertex,
+	    .pixel           = pixel,
+	    .compute         = compute,
+	    .embedded_fetch  = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
@@ -619,8 +618,7 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	if (options.stage == ShaderType::Compute) {
-		const auto lds_barriers =
-		    IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *compute);
+		const auto lds_barriers = IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *compute);
 		if (lds_barriers.inserted_barriers != 0) {
 			LOGF("%s wave64 LDS synchronization: barriers=%" PRIu32 "\n", GetDumpLabel(options),
 			     lds_barriers.inserted_barriers);
@@ -636,9 +634,20 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	}
 	IR::EliminateDeadCode(ir.blocks);
 	if (!IR::TrackResources(ir, error)) {
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.ir_dump      = MakeIrDump(cfg, ir);
+		}
 		return false;
 	}
 	IR::EliminateDeadCode(ir.blocks);
+	// Preserve diagnostics before runtime resource materialization. A replay captured before
+	// materialization can have an intentionally incomplete snapshot, but its decoded program and
+	// tracked IR are still useful for investigating the shader that requested those resources.
+	if (options.dump_ir) {
+		result.decoded_dump = decoded_dump;
+		result.ir_dump      = MakeIrDump(cfg, ir);
+	}
 	if (options.stage == ShaderType::Vertex) {
 		ir.info.vertex_offset_sgpr = embedded_fetch.vertex_offset_sgpr;
 	}
@@ -664,10 +673,14 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 		if (runtime.read_memory == nullptr && options.user_data == nullptr) {
 			runtime.read_memory = ReadZeroMemory;
 		}
-		runtime.userdata         = options.read_memory_data;
+		runtime.userdata = options.read_memory_data;
 		if (!IR::MaterializeResources(ir, runtime, resources, error)) {
 			return false;
 		}
+	}
+	IR::ResourceSnapshot materialized_resources;
+	if (options.retain_materialized_resources) {
+		materialized_resources = resources;
 	}
 	if (!IR::SpecializeResources(ir, resources, error)) {
 		return false;
@@ -713,9 +726,10 @@ bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(spirv.size()), phase_ms());
-	result.spirv     = std::move(spirv);
-	result.program   = std::move(ir);
-	result.resources = std::move(resources);
+	result.spirv                  = std::move(spirv);
+	result.program                = std::move(ir);
+	result.resources              = std::move(resources);
+	result.materialized_resources = std::move(materialized_resources);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.ir_dump      = std::move(ir_dump);

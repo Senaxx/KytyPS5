@@ -869,7 +869,14 @@ bool Translator::DS_ADDTID(const Decoder::Instruction& inst, bool write) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	const auto base =
 	    ir.BitwiseAnd(ReadU32(MemorySourceAt(inst, write ? 1u : 0u)), IR::U32(IR::Value(0xffffu)));
-	const auto lane    = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	if (program.stage == ShaderType::Compute) {
+		lane = ir.BitwiseAnd(
+		    IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
+		                    {IR::Value(static_cast<uint32_t>(IR::StageInputKind::LocalInvocationIndex)),
+		                     IR::Value(0u)})),
+		    IR::U32(IR::Value(current_wave_size - 1u)));
+	}
 	const auto address = ir.IAdd(base, ir.ShiftLeftLogical(lane, IR::U32(IR::Value(2u))));
 	if (write) {
 		ir.Emit(IR::ValueOpcode::WriteSharedU32,

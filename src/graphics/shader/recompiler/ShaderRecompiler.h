@@ -22,6 +22,7 @@ struct CompileOptions {
 	uint32_t                    push_constant_offset      = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	bool                        retain_materialized_resources = false;
 	const char*                 dump_label                 = nullptr;
 	const uint32_t*             user_data                  = nullptr;
 	IR::SrtMemoryReader         read_memory                = nullptr;
@@ -37,6 +38,7 @@ struct CompileResult {
 	std::string           ir_dump;
 	IR::Program           program;
 	IR::ResourceSnapshot  resources;
+	IR::ResourceSnapshot  materialized_resources;
 };
 
 bool TryRecompile(std::span<const uint32_t> code, const CompileOptions& options,

@@ -1247,7 +1247,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
-vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc, bool defer_gpu_write) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1257,7 +1257,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 	}
 	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
+		image.usage.storage = true;
+		// Compute descriptor acquisition is not a guest write. Preserve graphics ownership,
+		// but let compute refresh pre-dispatch contents before the dispatch promotes the image.
+		if (!defer_gpu_write || image.info.data.Empty()) {
+			image.MarkGpuModified();
+		}
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id, desc);
@@ -1269,9 +1274,13 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 				if (!image.registered || image.depth_id) {
 					EXIT("TextureCache: cannot acquire an unavailable storage image\n");
 				}
-				CommitGpuWrite(image);
+				if (!defer_gpu_write) {
+					CommitGpuWrite(image);
+				}
 			}
-			TrackImageDownload(id, image);
+			if (!defer_gpu_write) {
+				TrackImageDownload(id, image);
+			}
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -1360,6 +1369,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
+	TrackImageDownload(id, image);
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {

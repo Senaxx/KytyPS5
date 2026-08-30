@@ -106,7 +106,6 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 	if (wave_size != 32u && wave_size != 64u) {
 		return stats;
 	}
-
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::ReadLane) {
