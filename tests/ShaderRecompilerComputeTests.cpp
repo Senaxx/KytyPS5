@@ -13950,7 +13950,8 @@ TestCase VectorMbcntUsesThreadMask() {
   TestCase test;
   test.name = "VectorMbcntUsesThreadMask";
   test.code = code;
-  test.expected = {0, 1, 2, 3, 0, 1, 2, 3};
+  test.expected.resize(64);
+  std::iota(test.expected.begin(), test.expected.end(), 0u);
   test.opcodes = {O::V_MOV_B32,
                   O::V_LSHLREV_B32,
                   O::V_ADD_NC_U32,
@@ -13958,14 +13959,14 @@ TestCase VectorMbcntUsesThreadMask() {
                   O::V_MBCNT_HI_U32_B32,
                   O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.group_id[0] = true;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.workgroup_register = 0;
   test.has_compute_info = true;
-  test.dispatch_x = 2;
+  test.dispatch_x = 1;
   return test;
 }
 
@@ -24769,6 +24770,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mbcnt-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMbcntUsesThreadMask());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {

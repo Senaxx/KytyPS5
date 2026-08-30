@@ -319,7 +319,14 @@ bool Translator::V_BCNT_U32_B32(const Decoder::Instruction& inst) {
 }
 
 bool Translator::V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low) {
-	const auto lane  = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+	if (program.stage == ShaderType::Compute) {
+		lane = ir.BitwiseAnd(
+		    IR::U32(ir.Emit(IR::ValueOpcode::GetBuiltin,
+		                    {IR::Value(static_cast<uint32_t>(IR::StageInputKind::LocalInvocationIndex)),
+		                     IR::Value(0u)})),
+		    IR::U32(IR::Value(current_wave_size - 1u)));
+	}
 	const auto local = ir.BitwiseAnd(lane, IR::U32(IR::Value(31u)));
 	const auto below =
 	    ir.ISub(ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), local), IR::U32(IR::Value(1u)));
