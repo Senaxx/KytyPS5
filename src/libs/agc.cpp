@@ -25,6 +25,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -142,8 +143,8 @@ struct RegisterDefaultsStorage {
 
 #include <fmt/format.h>
 
-static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION      = 12;
-static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_FALLBACK_VERSION = 11;
+static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION      = 13;
+static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_FALLBACK_VERSION = 13;
 static constexpr uint32_t GRAPHICS_INIT_NO_FEATURE_STATE              = 0;
 
 static std::mutex g_register_defaults_mutex;
@@ -3437,6 +3438,12 @@ uint32_t* KYTY_SYSV_ABI AgcDcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
 	cmd[5] = static_cast<uint32_t>((dst_address >> 32u) & 0xffffffffu);
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcDcbCopyDataGetSize() {
+	PRINT_NAME();
+
+	return 6 * sizeof(uint32_t);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcDcbDmaData(CommandBuffer* buf, uint8_t engine, uint8_t dst,

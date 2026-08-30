@@ -351,6 +351,7 @@ enum class Opcode {
 	V_CMP_GE_I32,
 	V_CMP_T_I32,
 	V_CMP_CLASS_F32,
+	V_CMPX_CLASS_F32,
 	V_CMP_LT_I16,
 	V_CMP_EQ_I16,
 	V_CMP_LE_I16,
@@ -632,6 +633,7 @@ struct Operand {
 	uint32_t dpp_ctrl           = 0;
 	uint32_t dpp_row_mask       = 0xf;
 	uint32_t dpp_bank_mask      = 0xf;
+	bool     explicit_sdwa_dst  = false;
 	bool     sdwa_sext          = false;
 	bool     dpp_fetch_inactive = false;
 	bool     dpp_bound_ctrl     = false;

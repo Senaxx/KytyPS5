@@ -3169,16 +3169,16 @@ void TestNewShaderRecompilerStagedShaderOps() {
         "new decoder did not decode RDNA2 S_SUBB_U32");
   Check(Common::ContainsStr(result.decoded_dump, "s_bitset0_b32 s3, s1"),
         "new decoder did not decode RDNA2 S_BITSET0_B32");
-  Check(Common::ContainsStr(result.decoded_dump, "v_fmac_f16 v70.sdwa(sel=4"),
+  Check(Common::ContainsStr(result.decoded_dump, "v_fmac_f16 v70, v5, v6"),
         "new decoder did not decode RDNA2 V_FMAC_F16");
   Check(
       Common::ContainsStr(
           result.decoded_dump,
-          "v_fmamk_f16 v71.sdwa(sel=4,sext=0), v7, 0x3c003c00, v8"),
+          "v_fmamk_f16 v71, v7, 0x3c003c00, v8"),
       "new decoder did not consume V_FMAMK_F16 literal as the multiply source");
   Check(Common::ContainsStr(
             result.decoded_dump,
-            "v_fmaak_f16 v72.sdwa(sel=4,sext=0), v9, v10, 0x40004000"),
+            "v_fmaak_f16 v72, v9, v10, 0x40004000"),
         "new decoder did not consume V_FMAAK_F16 literal as the add source");
   Check(Common::ContainsStr(result.ir_dump,
                             "ScalarSubBorrowCarryU32 s2, s0, s1, scc"),
@@ -3189,15 +3189,15 @@ void TestNewShaderRecompilerStagedShaderOps() {
   Check(
       Common::ContainsStr(
           result.ir_dump,
-          "FmaF16 v70.sdwa(sel=4,sext=0), v5, v6, v70.sdwa(sel=4,sext=0)"),
+          "FmaF16 v70, v5, v6, v70"),
       "V_FMAC_F16 did not lower using the destination as the FMA accumulator");
   Check(
       Common::ContainsStr(result.ir_dump,
-                          "FmaF16 v71.sdwa(sel=4,sext=0), v7, 0x3c003c00, v8"),
+                          "FmaF16 v71, v7, 0x3c003c00, v8"),
       "V_FMAMK_F16 did not lower with the literal in source 1");
   Check(
       Common::ContainsStr(result.ir_dump,
-                          "FmaF16 v72.sdwa(sel=4,sext=0), v9, v10, 0x40004000"),
+                          "FmaF16 v72, v9, v10, 0x40004000"),
       "V_FMAAK_F16 did not lower with the literal in source 2");
   Check(SpirvContainsOpcode(result.spirv, 130),
         "SPIR-V binary does not contain OpISub for S_SUBB_U32");
@@ -4203,6 +4203,17 @@ void TestNewShaderDecoderArchitecture() {
               packed_inst.src2.op_sel_hi == (source == 2u),
           "VOP3P OPSEL_HI source bit mapping is incorrect");
   }
+
+  const uint32_t packed_fmac_dpp[] = {0x780402fau, 0xff500000u};
+  Instruction packed_fmac;
+  Check(DecodeInstruction(packed_fmac_dpp, 0u, packed_fmac, &error),
+        error.c_str());
+  Check(packed_fmac.opcode == Opcode::V_PK_FMAC_F16 &&
+            packed_fmac.src0.dpp && packed_fmac.src0.op_sel_hi &&
+            packed_fmac.src1.op_sel_hi && packed_fmac.dst.op_sel_hi &&
+            packed_fmac.src0.negate && packed_fmac.src0.negate_hi &&
+            packed_fmac.src1.negate && packed_fmac.src1.negate_hi,
+        "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
 }
 
 void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
@@ -4229,6 +4240,67 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
                               "VOPC DPP modifier is not supported for opcode"),
           "64-bit VOPC DPP rejection reason was not explicit");
   }
+}
+
+void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t shader[] = {
+      0x7d30d4f9u, 0x8606000du, // v_cmpx_class_f32 exec, v13, vcc_lo (SDWA)
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  std::string error;
+  Check(Decoder::DecodeInstruction(shader, 0u, decoded, &error),
+        error.c_str());
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_CLASS_F32 &&
+            decoded.opcode_id == 0x98u && decoded.word_count == 2u &&
+            decoded.raw_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src0.reg == 13u && decoded.src0.sdwa_sel == 6u &&
+            decoded.src1.kind == Decoder::OperandKind::VccLo &&
+            decoded.src1.sdwa_sel == 6u,
+        "decoder rejected captured SDWA V_CMPX_CLASS_F32 fields");
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderPixelInputInfo pixel{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Pixel;
+  translate_options.wave_size = 64u;
+  translate_options.pixel = &pixel;
+  Check(Decoder::DecodeProgram(shader, program, &error) &&
+            CFG::BuildGraph(program, graph, &error) &&
+            Frontend::TranslateProgram(program, graph, translate_options, ir,
+                                       &error),
+        error.c_str());
+  uint32_t class_compares = 0u;
+  uint32_t dynamic_exec_writes = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      class_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::FPCmpClass32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        dynamic_exec_writes++;
+      }
+    }
+  }
+  Check(class_compares == 1u && dynamic_exec_writes == 1u,
+        "captured V_CMPX_CLASS_F32 did not lower to class compare plus EXEC update");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  CompileResult result;
+  Check(TryRecompile(shader, options, result, &error), error.c_str());
+  Check(Common::ContainsStr(result.decoded_dump,
+                            "V_CMPX_CLASS_F32 exec_lo, v13, vcc_lo"),
+        "captured SDWA V_CMPX_CLASS_F32 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
@@ -12496,6 +12568,7 @@ int main() {
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks
   // here.
   TestNewShaderDecoderArchitecture();
+  TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestPsInputCountRegisterDecode();
