@@ -571,6 +571,9 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
 	                                : vk::ImageUsageFlagBits::eSampled;
+	if (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) {
+		desc.view_info.type = vk::ImageViewType::e2DArray;
+	}
 	desc.type                 = binding;
 	return desc;
 }
