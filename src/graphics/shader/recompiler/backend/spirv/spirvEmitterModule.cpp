@@ -421,13 +421,11 @@ void AllocateInputVariables(EmitterState& state) {
 		state.interface_variables.push_back(binding.variable_id);
 	}
 	if (state.requirements.subgroup_local_invocation_id ||
-	    !state.wave64_mask_branch_scratch_banks.empty() ||
-	    state.has_wave64_read_first_lane_scratch) {
+	    !state.wave64_mask_branch_scratch_banks.empty()) {
 		state.subgroup_local_invocation_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_local_invocation_id_variable);
 	}
-	if (!state.wave64_mask_branch_scratch_banks.empty() ||
-	    state.has_wave64_read_first_lane_scratch) {
+	if (!state.wave64_mask_branch_scratch_banks.empty()) {
 		state.subgroup_id_variable = state.builder.AllocateId();
 		state.interface_variables.push_back(state.subgroup_id_variable);
 	}

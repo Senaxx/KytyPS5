@@ -383,7 +383,6 @@ struct EmitterState {
 	uint32_t                   subgroup_id_variable                  = 0;
 	uint32_t                   wave64_read_lane_scratch_variable     = 0;
 	std::unordered_map<const IR::Inst*, uint32_t> wave64_read_lane_scratch_banks;
-	bool                       has_wave64_read_first_lane_scratch    = false;
 	uint32_t                   wave64_mask_branch_scratch_variable = 0;
 	std::unordered_map<const IR::Block*, uint32_t> wave64_mask_branch_scratch_banks;
 	uint32_t                   per_vertex_variable                   = 0;

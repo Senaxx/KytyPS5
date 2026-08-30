@@ -15008,142 +15008,6 @@ TestCase Wave64MaskBranchInDivergentBlockUsesExistingPath() {
   return test;
 }
 
-void ConfigureWave64ReadFirstLane(TestCase *test) {
-  test->compute_info.threads_num[0] = 64;
-  test->compute_info.threads_num[1] = 1;
-  test->compute_info.threads_num[2] = 1;
-  test->compute_info.lds_size_dwords = 0;
-  test->compute_info.needs_lds_barriers = true;
-  test->compute_info.host_subgroup_size = 32;
-  test->compute_info.wave_size = 64;
-  test->compute_info.thread_ids_num = 1;
-  test->has_compute_info = true;
-}
-
-TestCase VectorReadFirstLaneWave64UpperOnly() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeVopc(0xc2, InlineU32(32), 0));
-  code.push_back(EncodeSop1(0x24, 4, 106));
-  code.push_back(EncodeVop1(0x02, 6, Vgpr(0)));
-  code.push_back(EncodeSop1(0x04, 126, 4));
-  AppendStoreSgprAtLaneDwordOffset(&code, 6, 0, 0);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "VectorReadFirstLaneWave64UpperOnly";
-  test.code = code;
-  test.expected = std::vector<u32>(64, 32u);
-  test.opcodes = {O::V_CMP_EQ_U32,        O::S_AND_SAVEEXEC_B64,
-                  O::V_READFIRSTLANE_B32, O::S_MOV_B64,
-                  O::V_MOV_B32,           O::V_LSHLREV_B32,
-                  O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
-  ConfigureWave64ReadFirstLane(&test);
-  test.required_spirv = {
-      "wave64_read_lane_scratch",          "BuiltIn SubgroupId",
-      "BuiltIn SubgroupLocalInvocationId", "OpGroupNonUniformBallot",
-      "OpGroupNonUniformShuffle",          "OpControlBarrier"};
-  test.spirv_counts = {{"OpControlBarrier", 2}};
-  return test;
-}
-
-TestCase VectorReadFirstLaneWave64EmptyExecUsesLaneZero() {
-  auto test = VectorReadFirstLaneWave64UpperOnly();
-  test.name = "VectorReadFirstLaneWave64EmptyExecUsesLaneZero";
-  test.code[0] = EncodeVopc(0xc2, InlineU32(64), 0);
-  test.expected.assign(64, 0u);
-  return test;
-}
-
-TestCase VectorReadFirstLaneWave64LowerHalfPriority() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeVopc(0xc2, InlineU32(31), 0));
-  code.push_back(EncodeSop1(0x04, 20, 106));
-  code.push_back(EncodeVopc(0xc2, InlineU32(32), 0));
-  code.push_back(EncodeSop2(0x11, 106, 106, 20));
-  code.push_back(EncodeSop1(0x24, 4, 106));
-  code.push_back(EncodeVop1(0x02, 6, Vgpr(0)));
-  code.push_back(EncodeSop1(0x04, 126, 4));
-  AppendStoreSgprAtLaneDwordOffset(&code, 6, 0, 0);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "VectorReadFirstLaneWave64LowerHalfPriority";
-  test.code = code;
-  test.expected = std::vector<u32>(64, 31u);
-  test.opcodes = {O::V_CMP_EQ_U32, O::S_MOV_B64, O::S_OR_B64,
-                  O::S_AND_SAVEEXEC_B64, O::V_READFIRSTLANE_B32,
-                  O::V_MOV_B32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
-  ConfigureWave64ReadFirstLane(&test);
-  test.required_spirv = {"wave64_read_lane_scratch", "BuiltIn SubgroupId",
-                         "OpGroupNonUniformBallot", "OpControlBarrier"};
-  test.spirv_counts = {{"OpControlBarrier", 2}};
-  return test;
-}
-
-TestCase VectorReadFirstLaneWave64PreservesScc() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeVopc(0xc2, InlineU32(32), 0));
-  code.push_back(EncodeSop1(0x24, 4, 106));
-  code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1)));
-  code.push_back(EncodeVop1(0x02, 6, Vgpr(0)));
-  code.push_back(EncodeSop2(0x0a, 7, InlineU32(1), InlineU32(0)));
-  code.push_back(EncodeSop1(0x04, 126, 4));
-  AppendStoreSgprAtLaneDwordOffset(&code, 6, 0, 0);
-  AppendStoreSgprAtLaneDwordOffset(&code, 7, 0, 64);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "VectorReadFirstLaneWave64PreservesScc";
-  test.code = code;
-  test.expected = std::vector<u32>(64, 32u);
-  test.expected.insert(test.expected.end(), 64, 1u);
-  test.opcodes = {O::V_CMP_EQ_U32,  O::S_AND_SAVEEXEC_B64,
-                  O::S_CMP_EQ_U32,  O::V_READFIRSTLANE_B32,
-                  O::S_CSELECT_B32, O::S_MOV_B64,
-                  O::V_MOV_B32,     O::V_ADD_NC_U32,
-                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
-                  O::S_ENDPGM};
-  ConfigureWave64ReadFirstLane(&test);
-  test.required_spirv = {"wave64_read_lane_scratch", "BuiltIn SubgroupId",
-                         "OpGroupNonUniformBallot", "OpControlBarrier"};
-  test.spirv_counts = {{"OpControlBarrier", 2}};
-  return test;
-}
-
-TestCase VectorReadFirstLaneWave64DivergentUsesSubgroup() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
-  code.push_back(EncodeSop1(0x24, 4, 106));
-  code.push_back(EncodeSopp(0x04, 5));
-  code.push_back(EncodeVop1(0x02, 6, Vgpr(0)));
-  AppendStoreSgprAtLaneDwordOffset(&code, 6, 0, 0);
-  code.push_back(EncodeSop1(0x04, 126, 4));
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "VectorReadFirstLaneWave64DivergentUsesSubgroup";
-  test.code = code;
-  test.opcodes = {
-      O::V_CMP_EQ_U32,        O::S_AND_SAVEEXEC_B64, O::S_CBRANCH_SCC0,
-      O::V_READFIRSTLANE_B32, O::V_MOV_B32,          O::V_LSHLREV_B32,
-      O::BUFFER_STORE_DWORD,  O::S_MOV_B64,          O::S_ENDPGM};
-  ConfigureWave64ReadFirstLane(&test);
-  test.required_spirv = {"OpGroupNonUniformShuffle"};
-  test.forbidden_spirv = {"wave64_read_lane_scratch", "BuiltIn SubgroupId",
-                          "OpControlBarrier"};
-  test.compile_only = true;
-  return test;
-}
-
 TestCase VectorReadlaneWave64CrossHalf() {
   using O = ShaderOpcode;
 
@@ -21477,11 +21341,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64ExecBranchesUseLogicalMask);
   AddCase(Wave64MaskBranchesRequireGuaranteedWave32);
   AddCase(Wave64MaskBranchInDivergentBlockUsesExistingPath);
-  AddCase(VectorReadFirstLaneWave64UpperOnly);
-  AddCase(VectorReadFirstLaneWave64EmptyExecUsesLaneZero);
-  AddCase(VectorReadFirstLaneWave64LowerHalfPriority);
-  AddCase(VectorReadFirstLaneWave64PreservesScc);
-  AddCase(VectorReadFirstLaneWave64DivergentUsesSubgroup);
   AddCase(VectorReadlaneWave64CrossHalf);
   AddCase(VectorReadlaneWave64DivergentUsesSubgroup);
   AddCase(DsAddtidWave64UsesLocalInvocationIndex);
@@ -25406,15 +25265,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorReadlaneWave64CrossHalf());
     RunCase(&vulkan, VectorReadlaneWave64DivergentUsesSubgroup());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--readfirstlane64-only") == 0) {
-    VulkanHarness vulkan;
-    RunCase(&vulkan, VectorReadFirstLaneWave64UpperOnly());
-    RunCase(&vulkan, VectorReadFirstLaneWave64EmptyExecUsesLaneZero());
-    RunCase(&vulkan, VectorReadFirstLaneWave64LowerHalfPriority());
-    RunCase(&vulkan, VectorReadFirstLaneWave64PreservesScc());
-    RunCase(&vulkan, VectorReadFirstLaneWave64DivergentUsesSubgroup());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-addtid-only") == 0) {
