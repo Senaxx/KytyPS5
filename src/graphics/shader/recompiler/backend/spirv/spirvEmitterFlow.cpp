@@ -171,6 +171,98 @@ uint32_t EmitWave64ReadLane(EmitterState& state, uint32_t source, uint32_t selec
 	return result;
 }
 
+uint32_t EmitWave64ReadFirstLane(EmitterState& state, uint32_t source, uint32_t exec,
+                                 uint32_t bank) {
+	const auto ballot       = state.builder.AllocateId();
+	const auto ballot_low   = state.builder.AllocateId();
+	const auto has_active   = state.builder.AllocateId();
+	const auto first_lane   = state.builder.AllocateId();
+	const auto safe_lane    = state.builder.AllocateId();
+	const auto candidate    = state.builder.AllocateId();
+	const auto active_value = state.builder.AllocateId();
+	state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                           ConstantU32(state, ScopeSubgroup), exec});
+	state.builder.AddFunction({OpCompositeExtract, TypeU32(state), ballot_low, ballot, 0});
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), has_active, ballot_low, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpGroupNonUniformBallotFindLSB, TypeU32(state), first_lane,
+	                           ConstantU32(state, ScopeSubgroup), ballot});
+	state.builder.AddFunction(
+	    {OpSelect, TypeU32(state), safe_lane, has_active, first_lane, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpGroupNonUniformShuffle, TypeU32(state), candidate,
+	                           ConstantU32(state, ScopeSubgroup), source, safe_lane});
+	state.builder.AddFunction({OpSelect, TypeU32(state), active_value, has_active,
+	                           ConstantU32(state, 1), ConstantU32(state, 0)});
+
+	const auto subgroup        = EmitSubgroupId(state);
+	const auto lane            = EmitSubgroupLocalInvocationId(state);
+	const auto leader          = state.builder.AllocateId();
+	const auto subgroup_offset = state.builder.AllocateId();
+	const auto store_index     = state.builder.AllocateId();
+	const auto active_index    = state.builder.AllocateId();
+	const auto store_ptr       = state.builder.AllocateId();
+	const auto active_ptr      = state.builder.AllocateId();
+	state.builder.AddFunction({OpIEqual, TypeBool(state), leader, lane, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU32(state), subgroup_offset, subgroup, ConstantU32(state, 2)});
+	state.builder.AddFunction(
+	    {OpIAdd, TypeU32(state), store_index, ConstantU32(state, bank * 64u), subgroup_offset});
+	state.builder.AddFunction(
+	    {OpIAdd, TypeU32(state), active_index, store_index, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
+	                           store_ptr, state.wave64_read_lane_scratch_variable, store_index});
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
+	                           active_ptr, state.wave64_read_lane_scratch_variable, active_index});
+	EmitIfCondition(state, leader, [&] {
+		state.builder.AddFunction({OpStore, store_ptr, candidate});
+		state.builder.AddFunction({OpStore, active_ptr, active_value});
+	});
+
+	const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+
+	const auto low_value_ptr   = state.builder.AllocateId();
+	const auto low_active_ptr  = state.builder.AllocateId();
+	const auto high_value_ptr  = state.builder.AllocateId();
+	const auto high_active_ptr = state.builder.AllocateId();
+	const auto low_value       = state.builder.AllocateId();
+	const auto low_active      = state.builder.AllocateId();
+	const auto high_value      = state.builder.AllocateId();
+	const auto high_active     = state.builder.AllocateId();
+	const auto low_has_active  = state.builder.AllocateId();
+	const auto high_is_empty   = state.builder.AllocateId();
+	const auto use_low         = state.builder.AllocateId();
+	const auto result          = state.builder.AllocateId();
+	const auto base            = bank * 64u;
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
+	                           low_value_ptr, state.wave64_read_lane_scratch_variable,
+	                           ConstantU32(state, base)});
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
+	                           low_active_ptr, state.wave64_read_lane_scratch_variable,
+	                           ConstantU32(state, base + 1u)});
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
+	                           high_value_ptr, state.wave64_read_lane_scratch_variable,
+	                           ConstantU32(state, base + 2u)});
+	state.builder.AddFunction({OpAccessChain, TypeU32ElementPointer(state, StorageClassWorkgroup),
+	                           high_active_ptr, state.wave64_read_lane_scratch_variable,
+	                           ConstantU32(state, base + 3u)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), low_value, low_value_ptr});
+	state.builder.AddFunction({OpLoad, TypeU32(state), low_active, low_active_ptr});
+	state.builder.AddFunction({OpLoad, TypeU32(state), high_value, high_value_ptr});
+	state.builder.AddFunction({OpLoad, TypeU32(state), high_active, high_active_ptr});
+	state.builder.AddFunction(
+	    {OpINotEqual, TypeBool(state), low_has_active, low_active, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpIEqual, TypeBool(state), high_is_empty, high_active, ConstantU32(state, 0)});
+	state.builder.AddFunction(
+	    {OpLogicalOr, TypeBool(state), use_low, low_has_active, high_is_empty});
+	state.builder.AddFunction({OpSelect, TypeU32(state), result, use_low, low_value, high_value});
+	state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+	                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state, semantics)});
+	return result;
+}
+
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
                                uint32_t exec) {
 	auto&      state      = ctx.state;
@@ -592,6 +684,12 @@ bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst) {
 			         {ConstantU32(state, ScopeSubgroup), ctx.Arg(inst, 0)});
 			return true;
 		case IR::ValueOpcode::ReadFirstLane: {
+			const auto bank = state.wave64_read_lane_scratch_banks.find(&inst);
+			if (bank != state.wave64_read_lane_scratch_banks.end()) {
+				ctx.Define(inst, EmitWave64ReadFirstLane(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1),
+				                                         bank->second));
+				return true;
+			}
 			const auto ballot = state.builder.AllocateId();
 			const auto lane   = state.builder.AllocateId();
 			state.builder.AddFunction({OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,

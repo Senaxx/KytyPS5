@@ -90,7 +90,7 @@ bool IsWaveMaskBranch(CFG::BranchCondition condition) {
 
 void CollectConvergedWave64Operations(Emitter::EmitterState& state,
 	                                  const IR::Program& program,
-	                                  bool collect_mask_branches) {
+	                                  bool collect_split_wave_operations) {
 	uint32_t                               divergence_depth = 0;
 	std::unordered_map<uint32_t, uint32_t> divergence_ends;
 	bool                                   permanently_divergent = false;
@@ -107,16 +107,22 @@ void CollectConvergedWave64Operations(Emitter::EmitterState& state,
 		const bool converged = !permanently_divergent && divergence_depth == 0;
 		if (converged) {
 			for (const auto& inst: *program.blocks[index]) {
-				if (inst.GetOpcode() == IR::ValueOpcode::ReadLane) {
+				const auto opcode = inst.GetOpcode();
+				if (opcode == IR::ValueOpcode::ReadLane ||
+				    (collect_split_wave_operations &&
+				     opcode == IR::ValueOpcode::ReadFirstLane)) {
 					state.wave64_read_lane_scratch_banks.emplace(
 					    &inst,
 					    static_cast<uint32_t>(state.wave64_read_lane_scratch_banks.size()));
+					if (opcode == IR::ValueOpcode::ReadFirstLane) {
+						state.has_wave64_read_first_lane_scratch = true;
+					}
 				}
 			}
 		}
 
 		const auto& term = info.terminator;
-		if (converged && collect_mask_branches &&
+		if (converged && collect_split_wave_operations &&
 		    term.kind == CFG::TerminatorKind::ConditionalBranch &&
 		    IsWaveMaskBranch(term.condition)) {
 			state.wave64_mask_branch_scratch_banks.emplace(
@@ -465,8 +471,9 @@ bool EmitProgram(const IR::Program& program, const IR::ResourceSnapshot& resourc
 	    static_cast<uint64_t>(input_info.compute->threads_num[0]) *
 	            input_info.compute->threads_num[1] * input_info.compute->threads_num[2] ==
 	        64u) {
-		const bool collect_mask_branches = input_info.compute->host_subgroup_size == 32u;
-		CollectConvergedWave64Operations(state, program, collect_mask_branches);
+		const bool collect_split_wave_operations =
+		    input_info.compute->host_subgroup_size == 32u;
+		CollectConvergedWave64Operations(state, program, collect_split_wave_operations);
 	}
 	if (!state.wave64_read_lane_scratch_banks.empty() &&
 	    std::ranges::none_of(state.inputs, [](const Emitter::InputBinding& input) {
