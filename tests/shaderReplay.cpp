@@ -267,28 +267,6 @@ int SelfTest() {
   Common::Subsystems subsystems;
   InitializeConfig(subsystems);
 
-  const std::vector<uint32_t> incomplete_code = {
-      0xe0702008u, // buffer_store_dword v0, v1, s[0:3], 0 offset:8
-      0x80000001u, 0xbf810000u};
-  ShaderRecompiler::IR::ResourceSnapshot incomplete_resources;
-  ShaderRecompiler::CompileOptions incomplete_options;
-  incomplete_options.stage = ShaderType::Compute;
-  incomplete_options.dump_ir = true;
-  incomplete_options.resource_snapshot = &incomplete_resources;
-  incomplete_options.input_info.compute = &capture.input;
-  ShaderRecompiler::CompileResult incomplete_result;
-  error.clear();
-  if (ShaderRecompiler::TryRecompile(incomplete_code, incomplete_options,
-                                     incomplete_result, &error) ||
-      incomplete_result.decoded_dump.empty() ||
-      incomplete_result.ir_dump.empty() ||
-      error.find("resource snapshot") == std::string::npos) {
-    std::fprintf(stderr,
-                 "shader_replay incomplete-resource self-test failed: %s\n",
-                 error.c_str());
-    return 1;
-  }
-
   ShaderRecompiler::CompileOptions replay_options;
   replay_options.stage = ShaderType::Compute;
   replay_options.wave_size = capture.input.wave_size;
@@ -298,10 +276,14 @@ int SelfTest() {
   replay_options.resource_snapshot = &capture.resources;
   replay_options.input_info.compute = &capture.input;
   ShaderRecompiler::CompileResult replay_result;
-  if (!ShaderRecompiler::TryRecompile(capture.code, replay_options,
-                                      replay_result, &error) ||
-      replay_result.decoded_dump.empty() || replay_result.ir_dump.empty() ||
-      replay_result.spirv.empty()) {
+  error.clear();
+  try {
+    replay_result = ShaderRecompiler::Recompile(capture.code, replay_options);
+  } catch (const std::runtime_error &exception) {
+    error = exception.what();
+  }
+  if (!error.empty() || replay_result.decoded_dump.empty() ||
+      replay_result.ir_dump.empty() || replay_result.spirv.empty()) {
     std::fprintf(stderr, "shader_replay self-test: replay failed: %s\n",
                  error.c_str());
     return 1;
@@ -325,9 +307,13 @@ int SelfTest() {
   pixel_replay_options.input_info.pixel = &pixel_capture.input;
   ShaderRecompiler::CompileResult pixel_replay_result;
   error.clear();
-  if (!ShaderRecompiler::TryRecompile(pixel_capture.code, pixel_replay_options,
-                                      pixel_replay_result, &error) ||
-      pixel_replay_result.decoded_dump.empty() ||
+  try {
+    pixel_replay_result =
+        ShaderRecompiler::Recompile(pixel_capture.code, pixel_replay_options);
+  } catch (const std::runtime_error &exception) {
+    error = exception.what();
+  }
+  if (!error.empty() || pixel_replay_result.decoded_dump.empty() ||
       pixel_replay_result.ir_dump.empty() ||
       pixel_replay_result.spirv.empty()) {
     std::fprintf(stderr, "shader_replay pixel self-test: replay failed: %s\n",
@@ -411,7 +397,10 @@ int main(int argc, char **argv) {
   }
 
   ShaderRecompiler::CompileResult result;
-  if (!ShaderRecompiler::TryRecompile(code, options, result, &error)) {
+  try {
+    result = ShaderRecompiler::Recompile(code, options);
+  } catch (const std::runtime_error &exception) {
+    error = exception.what();
     if (argc == 3) {
       auto decoded = std::filesystem::path(argv[2]);
       decoded += ".rdna2";

@@ -1,9 +1,7 @@
-#include "common/magicEnum.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
 #include <array>
-#include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -57,11 +55,14 @@ uint32_t ResourceIndexFromOperand(const Decoder::Operand& operand) {
 	}
 }
 
-uint32_t RawScalarLoadBase(const Decoder::Operand& operand) {
-	if (operand.kind == Decoder::OperandKind::Sgpr) {
-		return operand.reg;
+Decoder::Operand RawScalarLoadBase(const Decoder::Operand& operand) {
+	if (operand.kind != Decoder::OperandKind::M0) {
+		return operand;
 	}
-	return operand.kind == Decoder::OperandKind::VccLo ? 106u : 0u;
+	auto result = operand;
+	// The compressed SBASE value 62 decodes as code 124, but means NULL for S_LOAD.
+	result.kind = Decoder::OperandKind::Null;
+	return result;
 }
 
 ResourceKind FlatSegmentResourceKind(uint32_t segment) {
@@ -321,8 +322,9 @@ Translator::AddressOperands Translator::ReadAddressOperands(const Decoder::Instr
 	return {GetAddressResource(low, high), low, high};
 }
 
-IR::Value Translator::GetScalarAddressResource(uint32_t base) {
-	return GetAddressResource(ReadScalarCode(base), ReadScalarCode(base + 1u));
+IR::Value Translator::GetScalarAddressResource(const Decoder::Operand& base) {
+	const auto raw = ReadU32Pair(base);
+	return GetAddressResource(raw[0], raw[1]);
 }
 
 IR::Value Translator::GetImageResource(const IR::MemoryInfo& memory) {
@@ -904,7 +906,7 @@ bool Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
 	return true;
 }
 
-bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error) {
+bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::S_LOAD_DWORD:
 		case Decoder::Opcode::S_LOAD_DWORDX2:
@@ -1096,12 +1098,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst, std::string* error
 		case Decoder::Opcode::DS_WRITE_B64:
 		case Decoder::Opcode::DS_WRITE_B96:
 		case Decoder::Opcode::DS_WRITE_B128: return DS_WRITE(inst);
-		default:
-			if (error != nullptr) {
-				*error = fmt::format("memory-family opcode has no specialized IR translation: {}",
-				                     magic_enum::enum_name(inst.opcode));
-			}
-			return false;
+		default: return false;
 	}
 }
 

@@ -145,7 +145,6 @@ struct RegisterDefaultsStorage {
 
 static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION      = 13;
 static constexpr uint32_t GRAPHICS_REGISTER_DEFAULTS_FALLBACK_VERSION = 13;
-static constexpr uint32_t GRAPHICS_INIT_NO_FEATURE_STATE              = 0;
 
 static std::mutex g_register_defaults_mutex;
 
@@ -336,19 +335,11 @@ int KYTY_SYSV_ABI AgcInit(uint32_t* state, uint32_t ver) {
 	     "\t ver   = %u\n",
 	     reinterpret_cast<uint64_t>(state), ver);
 
-	if (state == nullptr) {
-		LOGF_COLOR(Log::Color::Red, "\t state is null\n");
-		return OK;
-	}
-
 	if (ver > GRAPHICS_REGISTER_DEFAULTS_MAX_VERSION) {
 		LOGF_COLOR(Log::Color::Red, "\t unsupported version %u\n", ver);
 	}
 
 	printf("version = %u\n", ver);
-
-	state[0] = ver;
-	state[1] = GRAPHICS_INIT_NO_FEATURE_STATE;
 
 	return OK;
 }
@@ -903,8 +894,12 @@ static bool is_native_reg_indirect_packet(const uint32_t* cmd, RegIndirectPacket
 	return ((cmd[0] >> 8u) & 0xffu) == reg_indirect_native_op(type);
 }
 
+static constexpr bool is_trinity_mode() {
+	return false;
+}
+
 static uint32_t reg_indirect_pm4_r(RegIndirectPacket type) {
-	return (type == RegIndirectPacket::Uc && AgcGetIsTrinityMode() != 0 ? 1u : 0u);
+	return (type == RegIndirectPacket::Uc && is_trinity_mode() ? 1u : 0u);
 }
 
 static void reg_indirect_write_packet(uint32_t* cmd, uint64_t vaddr, uint32_t num_regs,
@@ -1690,9 +1685,8 @@ uint64_t KYTY_SYSV_ABI AgcDcbContextStateOpGetSize(uint32_t operation) {
 	return static_cast<uint64_t>(context_state_op_size_dw(operation)) * sizeof(uint32_t);
 }
 
-uint64_t KYTY_SYSV_ABI AgcGetIsTrinityMode() {
-	// PS5 Pro?
-	return 0;
+void KYTY_SYSV_ABI AgcGetIsTrinityMode(uint8_t* result) {
+	*result = is_trinity_mode();
 }
 
 static constexpr int      GRAPHICS5_DRIVER_ERROR_INVALID_VALUE    = static_cast<int>(0x8a6c0033u);
@@ -3240,6 +3234,27 @@ uint32_t KYTY_SYSV_ABI AgcAcbCondExecGetSize() {
 	return AgcDcbCondExecGetSize();
 }
 
+uint32_t* KYTY_SYSV_ABI AgcAcbJump(CommandBuffer* buf, uint8_t cache_policy,
+                                   const uint32_t* target, uint32_t size_in_dwords) {
+	if (buf == nullptr) {
+		return nullptr;
+	}
+
+	auto* cmd = buf->AllocateDW(4);
+	if (cmd == nullptr) {
+		return nullptr;
+	}
+
+	auto target_address = reinterpret_cast<uint64_t>(target);
+	cmd[0]              = KYTY_PM4(4, Pm4::IT_INDIRECT_BUFFER, 0u);
+	cmd[1]              = static_cast<uint32_t>(target_address) & ~0x3u;
+	cmd[2]              = static_cast<uint32_t>(target_address >> 32u);
+	cmd[3] = 0x0f900000u | ((static_cast<uint32_t>(cache_policy) & 0x3u) << 28u) |
+	         (size_in_dwords & 0xfffffu);
+
+	return cmd;
+}
+
 uint32_t KYTY_SYSV_ABI AgcAcbJumpGetSize() {
 	return 0x10u;
 }
@@ -3249,6 +3264,12 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles) {
 	return AgcDcbWaitRegMem(buf, size, compare_function, 0, cache_policy, address, reference, mask,
 	                        poll_cycles);
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbWaitOnAddressGetSize(uint8_t size) {
+	PRINT_NAME();
+
+	return AgcDcbWaitOnAddressGetSize(size);
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
@@ -3320,6 +3341,12 @@ uint32_t* KYTY_SYSV_ABI AgcAcbCopyData(CommandBuffer* buf, uint8_t dst, uint8_t 
 	cmd[5] = static_cast<uint32_t>((dst_address >> 32u) & 0xffffffffu);
 
 	return cmd;
+}
+
+uint64_t KYTY_SYSV_ABI AgcAcbCopyDataGetSize() {
+	PRINT_NAME();
+
+	return AgcDcbCopyDataGetSize();
 }
 
 uint32_t* KYTY_SYSV_ABI AgcAcbDispatchIndirect(CommandBuffer*       buf,
