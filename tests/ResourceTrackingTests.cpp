@@ -814,6 +814,44 @@ void TestInvariantIndirectImageMaterialization() {
         "collapsed mixed indirect image candidates retained an incompatible "
         "slot");
 
+  auto cube_fixture = MakeIndirectImageFixture(false);
+  cube_fixture->PlanAndTrack();
+  auto cube_descriptor = image_descriptor;
+  cube_descriptor[0] ^= 1u;
+  cube_descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube)
+       << 28u);
+  cube_descriptor[4] = 5u;
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        cube_descriptor[dword];
+  }
+  ResourceSnapshot cube_snapshot;
+  Check(MaterializeResources(cube_fixture->program, runtime, cube_snapshot),
+        "mixed 2D and cubemap candidates did not materialize");
+  SpecializeResources(cube_fixture->program, cube_snapshot);
+  Check(cube_fixture->program.info.images.size() == 2 &&
+            !cube_fixture->program.info.images[0].cube &&
+            cube_fixture->program.info.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            cube_fixture->program.info.images[1].cube &&
+            cube_fixture->program.info.images[1].dimension ==
+                Decoder::ImageDimension::Dim2DArray,
+        "mixed 2D and cubemap candidates lost their typed slots");
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  Check(MaterializeResources(cube_fixture->program, runtime, cube_snapshot) &&
+            ValidateResourceSpecialization(cube_fixture->program,
+                                           cube_snapshot) &&
+            std::ranges::all_of(cube_snapshot.images[1].dwords,
+                                [](uint32_t dword) { return dword == 0u; }),
+        "collapsed cubemap candidate retained an incompatible typed slot");
+
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
         image_descriptor[dword];

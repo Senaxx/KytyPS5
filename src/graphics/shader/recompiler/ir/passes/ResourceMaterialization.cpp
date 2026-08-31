@@ -524,8 +524,7 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 				    program.info.images[root].mip_mode != image.mip_mode ||
 				    program.info.images[root].mip_count != image.mip_count ||
 				    program.info.images[root].conversion_format != image.conversion_format ||
-				    program.info.images[root].shader_swizzle != image.shader_swizzle ||
-				    program.info.images[root].cube != image.cube) {
+				    program.info.images[root].shader_swizzle != image.shader_swizzle) {
 					return false;
 				}
 				continue;
@@ -924,8 +923,7 @@ void SpecializeResources(Program& program, ResourceSnapshot& snapshot) {
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
-			    image.depth_compare != image_class.depth_compare ||
-			    image.cube != image_class.cube) {
+			    image.depth_compare != image_class.depth_compare) {
 				return SpecializationFail(
 				    fmt::format(
 				        "indirect image table at pc 0x{:08x} has incompatible candidates: "
