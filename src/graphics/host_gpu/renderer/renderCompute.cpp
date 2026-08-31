@@ -25,6 +25,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -354,12 +355,16 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
+	const auto operation_serial =
+	    m_context.GetGpuResources().GetContentVersions().ReserveSerial();
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	MarkStorageImagesWritten(bindings);
+	const std::array<const PreparedBindings*, 1> written_stages {&bindings};
+	StampShaderWritesAt(m_context, written_stages, operation_serial, "compute-dispatch");
 	ResetBindings();
 }
 

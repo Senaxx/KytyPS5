@@ -3,6 +3,7 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "graphics/host_gpu/contentVersionMap.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -21,9 +22,10 @@ public:
 	~GpuResourceManager();
 	KYTY_CLASS_NO_COPY(GpuResourceManager);
 
-	[[nodiscard]] BufferCache&  GetBufferCache() { return m_buffer_cache; }
-	[[nodiscard]] TextureCache& GetTextureCache() { return m_texture_cache; }
-	void                        SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
+	[[nodiscard]] BufferCache&           GetBufferCache() { return m_buffer_cache; }
+	[[nodiscard]] TextureCache&          GetTextureCache() { return m_texture_cache; }
+	[[nodiscard]] ContentVersionTracker& GetContentVersions() { return m_content_versions; }
+	void                                 SetGpu(GuestGpu* gpu) noexcept { m_gpu = gpu; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
@@ -36,11 +38,12 @@ public:
 private:
 	PageManager               m_page_manager;
 	CommandScheduler&         m_scheduler;
+	ContentVersionTracker     m_content_versions;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
-	GuestGpu*                 m_gpu = nullptr;
+	GuestGpu*                 m_gpu                   = nullptr;
 	bool                      m_fault_process_pending = false;
 };
 

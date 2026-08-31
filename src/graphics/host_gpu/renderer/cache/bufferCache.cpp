@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/contentVersionMap.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -60,7 +61,7 @@ void BufferCache::Unregister(BufferId id) {
 
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
-	auto& buffer = m_slot_buffers[id];
+	auto&                buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
@@ -136,40 +137,41 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
-	uint64_t                  packed_size = 0;
-	auto&                     download    = m_download_buffer;
-	const auto flush = [&] {
-		const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
-		EXIT_IF(mapped == nullptr);
-		uint64_t cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin, base_offset + cursor,
-			                  envelope_size, vk::AccessFlagBits::eMemoryWrite, vk::AccessFlags {},
-			                  vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-			                  vk::AccessFlagBits::eHostRead);
-			cursor += AlignDownload(envelope_size);
-		}
-		download.Commit();
-		const auto completion_tick = m_scheduler.CurrentTick();
-		m_scheduler.Finish();
-		m_scheduler.WaitPriorityOperations(completion_tick);
-		cursor = 0;
-		for (const auto& copy: batch) {
-			const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
-			const auto offset = cursor + copy.source_offset - source_begin;
-			download.Invalidate(base_offset + offset, copy.size);
-			Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
-			cursor += AlignDownload(envelope_size);
-		}
-		batch.clear();
-		packed_size = 0;
+	uint64_t   packed_size = 0;
+	auto&      download    = m_download_buffer;
+	const auto flush       = [&] {
+        const auto [mapped, base_offset] = download.Map(packed_size, DOWNLOAD_ALIGNMENT);
+        EXIT_IF(mapped == nullptr);
+        uint64_t cursor = 0;
+        for (const auto& copy: batch) {
+            const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+            download.CopyFrom(m_scheduler.Current(), *copy.buffer, source_begin,
+			                        base_offset + cursor, envelope_size, vk::AccessFlagBits::eMemoryWrite,
+			                        vk::AccessFlags {},
+			                        vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
+			                        vk::AccessFlagBits::eHostRead);
+            cursor += AlignDownload(envelope_size);
+        }
+        download.Commit();
+        const auto completion_tick = m_scheduler.CurrentTick();
+        m_scheduler.Finish();
+        m_scheduler.WaitPriorityOperations(completion_tick);
+        cursor = 0;
+        for (const auto& copy: batch) {
+            const auto [source_begin, envelope_size] = DownloadEnvelope(copy);
+            const auto offset                        = cursor + copy.source_offset - source_begin;
+            download.Invalidate(base_offset + offset, copy.size);
+            Libs::LibKernel::Memory::WriteBacking(copy.address, mapped + offset, copy.size);
+            cursor += AlignDownload(envelope_size);
+        }
+        batch.clear();
+        packed_size = 0;
 	};
 	for (auto copy: copies) {
 		while (copy.size != 0) {
-			const auto available = download.Size() - packed_size;
-			const auto prefix    = copy.source_offset & 3u;
-			const auto bytes     = std::min(copy.size, available - prefix);
+			const auto   available = download.Size() - packed_size;
+			const auto   prefix    = copy.source_offset & 3u;
+			const auto   bytes     = std::min(copy.size, available - prefix);
 			DownloadCopy part {copy.buffer, copy.source_offset, copy.address, bytes};
 			const auto [source_begin, envelope_size] = DownloadEnvelope(part);
 			(void)source_begin;
@@ -192,18 +194,19 @@ void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
-                         PageManager& page_manager, TextureCache& texture_cache)
-	: m_graphics(graphics), m_scheduler(scheduler),
-	  m_fault_manager(graphics, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES),
-	  m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
-	  m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-	                         BDA_PAGETABLE_SIZE),
-	  m_memory_tracker(page_manager),
-	  m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
-	  m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
-	  m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
-	  m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
-	  m_texture_cache(texture_cache) {
+                         PageManager& page_manager, TextureCache& texture_cache,
+                         ContentVersionTracker& content_versions)
+    : m_graphics(graphics), m_scheduler(scheduler),
+      m_fault_manager(graphics, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES),
+      m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
+      m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
+                             BDA_PAGETABLE_SIZE),
+      m_memory_tracker(page_manager),
+      m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
+      m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
+      m_download_buffer(graphics, scheduler, MemoryUsage::Download, 32 * MiB),
+      m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
+      m_texture_cache(texture_cache), m_content_versions(content_versions) {
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -272,10 +275,10 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "memory invalidation");
 	    },
-		[&](uint64_t address, uint64_t bytes) noexcept {
+	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    for (const auto range: m_gpu_modified_ranges.Intersections(address, bytes)) {
 			    for (uint64_t copied = 0; copied < range.size;) {
-				    const auto copy_address = range.address + copied;
+				    const auto  copy_address = range.address + copied;
 				    const auto* owner = m_page_table.Find(copy_address >> PageTable::kPageBits);
 				    if (owner == nullptr || !*owner) {
 					    EXIT("BufferCache: invalidation readback has no buffer owner\n");
@@ -330,9 +333,9 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	auto& command = m_scheduler.Current();
 	EXIT_IF(command.IsInvalid());
-	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	auto       first = m_buffers.lower_bound(begin);
+	auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	auto first = m_buffers.lower_bound(begin);
 	if (first != m_buffers.begin()) {
 		const auto previous = std::prev(first);
 		if (const auto& buffer = m_slot_buffers[previous->second];
@@ -346,17 +349,20 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		begin              = std::min(begin, buffer.CpuAddress());
 		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
 	}
+	if (!m_content_versions.EnsureTracked({begin, end - begin})) {
+		EXIT("BufferCache: failed to register buffer content range\n");
+	}
 
-	const auto id = m_slot_buffers.insert(
-	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
-	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, end - begin);
+	const auto id = m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, begin,
+	                                      AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+	                                      end - begin);
 	auto&      buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
 	for (auto overlap = first; overlap != last;) {
-		const auto current = overlap++;
-		const auto old_id  = current->second;
-		const auto& old    = m_slot_buffers[old_id];
+		const auto  current = overlap++;
+		const auto  old_id  = current->second;
+		const auto& old     = m_slot_buffers[old_id];
 		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
 		DeleteBuffer(old_id);
 	}
@@ -379,7 +385,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
-		const auto native = command.Handle();
+		const auto              native = command.Handle();
 		vk::BufferMemoryBarrier before {};
 		before.sType         = vk::StructureType::eBufferMemoryBarrier;
 		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
@@ -391,17 +397,17 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		before.buffer              = buffer.Handle();
 		before.offset              = 0;
 		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
+		native.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eTransfer,
+		    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
 		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
 		                  copies.data());
 		auto after          = before;
 		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+		native.pipelineBarrier(
+		    vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eAllCommands,
+		    vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
@@ -427,7 +433,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	}
 
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
-	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
+	                                          vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
 		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
@@ -443,8 +449,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	auto& command = m_scheduler.Current();
-	if (command.IsInvalid() || vaddr == 0 || size == 0 ||
-	    vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+	if (command.IsInvalid() || vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
@@ -594,15 +600,21 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 				WriteHostMemory(vaddr + offset, bytes.first(chunk));
 				offset += chunk;
 			}
+			ShadowStampGpuWrite(vaddr, size, "dma-fill-host", value);
 			return;
 		}
 	}
 
-	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size,
+	                                        TextureCache::GpuWriteOrigin {
+	                                            .kind  = TextureCache::GpuWriteKind::DmaFill,
+	                                            .value = value,
+	                                        });
 	const auto id          = FindBuffer(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true, id);
 	EXIT_IF(dst == nullptr);
 	dst->Fill(dst_offset, size, value);
+	ShadowStampGpuWrite(vaddr, size, "dma-fill", value);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -639,13 +651,20 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 				WriteHostMemory(dst_vaddr + offset, std::span {bytes}.first(chunk));
 				offset += chunk;
 			}
+			ShadowStampGpuWrite(dst_vaddr, size, "dma-copy-host", src_vaddr);
 			return;
 		}
 	}
 
 	auto& command = m_scheduler.Current();
 	if (dst_memory) {
-		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size);
+		m_texture_cache.InvalidateMemoryFromGPU(dst_vaddr, size,
+		                                        TextureCache::GpuWriteOrigin {
+		                                            .kind = TextureCache::GpuWriteKind::DmaCopy,
+		                                            .source_address  = src_vaddr,
+		                                            .source_gds      = src_gds,
+		                                            .destination_gds = dst_gds,
+		                                        });
 	}
 	const auto src_id      = src_memory ? FindBuffer(src_vaddr, size) : BufferId {};
 	const auto dst_id      = dst_memory ? FindBuffer(dst_vaddr, size) : BufferId {};
@@ -658,6 +677,14 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 		EXIT("BufferCache: resolved Vulkan copy ranges overlap\n");
 	}
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
+	if (dst_memory) {
+		ShadowStampGpuWrite(dst_vaddr, size, "dma-copy", src_vaddr);
+	}
+}
+
+void BufferCache::ShadowStampGpuWrite(uint64_t vaddr, uint64_t size, const char* event,
+                                      uint64_t source_id) {
+	(void)m_content_versions.Stamp(ContentDomain::Buffer, {vaddr, size}, event, source_id);
 }
 
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
@@ -700,7 +727,7 @@ void BufferCache::RunGarbageCollector() {
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 
-	std::vector<BufferId> dirty_buffers;
+	std::vector<BufferId>     dirty_buffers;
 	std::vector<DownloadCopy> copies;
 	size_t                    retire_count = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
@@ -722,10 +749,10 @@ void BufferCache::RunGarbageCollector() {
 			    [&](uint64_t dirty_address, uint64_t dirty_size) noexcept {
 				    m_gpu_modified_ranges.ForEachIntersection(
 				        dirty_address, dirty_size, [&](RangeSet::Range range) {
-					    copies.push_back({&buffer, range.address - buffer.CpuAddress(),
-					                      range.address, range.size});
+					        copies.push_back({&buffer, range.address - buffer.CpuAddress(),
+					                          range.address, range.size});
 				        });
-				});
+			    });
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());

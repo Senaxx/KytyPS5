@@ -5023,8 +5023,12 @@ public:
       const auto clear_image = texture_cache.FindImage(clear_desc);
       auto buffer_write = resources.GetBufferCache().ObtainBuffer(
           base + 0x6000, sizeof(clear_source), true, true);
-      texture_cache.InvalidateMemoryFromGPU(base + 0x6000,
-                                            sizeof(clear_source));
+      texture_cache.InvalidateMemoryFromGPU(
+          base + 0x6000, sizeof(clear_source),
+          TextureCache::GpuWriteOrigin {
+              .kind = TextureCache::GpuWriteKind::StorageBuffer,
+              .formatted = true,
+          });
       Require(name, "buffer-write ownership",
               buffer_write.first != nullptr &&
                   texture_cache.GetImage(clear_image).IsBufferModified(),

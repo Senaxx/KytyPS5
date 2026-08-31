@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/contentVersionMap.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
@@ -11,10 +12,13 @@
 
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
 #include <vector>
 
 namespace Libs::Graphics {
+
+class RenderContext;
 
 namespace ShaderRecompiler::IR {
 struct ResourceSnapshot;
@@ -52,6 +56,10 @@ struct PreparedBindings {
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;
 };
+
+void StampShaderWritesAt(RenderContext& context,
+                         std::span<const PreparedBindings* const> bindings,
+                         ContentSerial serial, const char* event);
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);

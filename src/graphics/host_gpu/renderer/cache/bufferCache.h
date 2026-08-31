@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -20,21 +21,23 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class ContentVersionTracker;
+struct ContentRange;
 class TextureCache;
 
 using BufferId = Common::SlotId;
+using ImageId  = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
 class BufferCache {
 public:
-	static constexpr uint32_t CACHING_PAGEBITS  = 14;
-	static constexpr uint64_t CACHING_PAGESIZE  = uint64_t {1} << CACHING_PAGEBITS;
-	static constexpr uint64_t CACHING_NUMPAGES  = uint64_t {1} << (40 - CACHING_PAGEBITS);
-	static constexpr uint64_t BDA_PAGETABLE_SIZE =
-	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	static constexpr uint32_t CACHING_PAGEBITS   = 14;
+	static constexpr uint64_t CACHING_PAGESIZE   = uint64_t {1} << CACHING_PAGEBITS;
+	static constexpr uint64_t CACHING_NUMPAGES   = uint64_t {1} << (40 - CACHING_PAGEBITS);
+	static constexpr uint64_t BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
 
 	BufferCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	            TextureCache& texture_cache);
+	            TextureCache& texture_cache, ContentVersionTracker& content_versions);
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
@@ -47,21 +50,25 @@ public:
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
-		switch (usage) {
-			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
-			case MemoryUsage::Download: return m_download_buffer;
-			case MemoryUsage::DeviceLocal: return m_device_buffer;
-		}
-		EXIT("BufferCache: invalid utility-buffer usage\n");
+        switch (usage) {
+            case MemoryUsage::Upload: return m_staging_buffer;
+            case MemoryUsage::Stream: return m_stream_buffer;
+            case MemoryUsage::Download: return m_download_buffer;
+            case MemoryUsage::DeviceLocal: return m_device_buffer;
+        }
+        EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
-	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
+	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
-	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	[[nodiscard]] bool MaterializeLatest(Buffer& destination, ContentRange range,
+	                                     std::optional<ImageId> target = {});
+	void               FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
+	void ShadowStampGpuWrite(uint64_t vaddr, uint64_t size, const char* event,
+	                         uint64_t source_id = 0);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
@@ -73,6 +80,7 @@ public:
 
 private:
 	friend struct BufferCacheTestAccess;
+	friend class TextureCache;
 
 	struct DownloadCopy;
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 40, 16>;
@@ -86,36 +94,40 @@ private:
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void Unregister(BufferId id);
+	void                   Unregister(BufferId id);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	void                     ChangeRegister(BufferId id);
+	void                     DeleteBuffer(BufferId id);
+	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                           bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void DownloadBufferMemory(std::span<const DownloadCopy> copies);
-	void WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
-	void ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
+	[[nodiscard]] bool MaterializeLatestLocked(Buffer& destination, ContentRange range,
+	                                           std::optional<ImageId> target,
+	                                           bool*                  target_upload = nullptr);
+	void               DownloadBufferMemory(std::span<const DownloadCopy> copies);
+	void               WriteHostMemory(uint64_t vaddr, std::span<const uint8_t> data);
+	void               ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write);
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
-	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
+	GraphicContext&                                    m_graphics;
+	CommandScheduler&                                  m_scheduler;
+	FaultManager                                       m_fault_manager;
+	Buffer                                             m_gds_buffer;
+	Buffer                                             m_bda_pagetable_buffer;
+	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	std::map<uint64_t, BufferId>                      m_buffers;
-	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
-	MemoryTracker                                     m_memory_tracker;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
-	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
+	std::map<uint64_t, BufferId>                       m_buffers;
+	PageTable                                          m_page_table;
+	RangeSet                                           m_gpu_modified_ranges;
+	MemoryTracker                                      m_memory_tracker;
+	StreamBuffer                                       m_staging_buffer;
+	StreamBuffer                                       m_stream_buffer;
+	StreamBuffer                                       m_download_buffer;
+	StreamBuffer                                       m_device_buffer;
+	TextureCache&                                      m_texture_cache;
+	ContentVersionTracker&                             m_content_versions;
+	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

@@ -6,19 +6,23 @@
 namespace Libs::Graphics {
 
 GpuResourceManager::GpuResourceManager(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_scheduler(scheduler), m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache) {}
+    : m_scheduler(scheduler),
+      m_buffer_cache(graphics, scheduler, m_page_manager, m_texture_cache, m_content_versions),
+      m_texture_cache(graphics, scheduler, m_page_manager, m_buffer_cache, m_content_versions) {}
 
 GpuResourceManager::~GpuResourceManager() = default;
 
 bool GpuResourceManager::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
-	constexpr uint64_t fault_size = 8;
+	constexpr uint64_t fault_size   = 8;
+	const uint64_t     page_address = fault_vaddr & ~(TRACKER_PAGE_SIZE - 1);
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		(void)m_content_versions.Stamp(ContentDomain::Cpu, {page_address, TRACKER_PAGE_SIZE},
+		                               "cpu-fault");
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
@@ -31,6 +35,7 @@ bool GpuResourceManager::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	(void)m_content_versions.Stamp(ContentDomain::Cpu, {vaddr, size}, "cpu-write");
 	return true;
 }
 
@@ -44,6 +49,7 @@ bool GpuResourceManager::IsMapped(uint64_t vaddr, uint64_t size) const noexcept 
 }
 
 void GpuResourceManager::MapMemory(uint64_t vaddr, uint64_t size) {
+	(void)m_content_versions.Stamp(ContentDomain::Cpu, {vaddr, size}, "cpu-map-init");
 	{
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Add(vaddr, size);
@@ -66,6 +72,7 @@ void GpuResourceManager::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_page_manager.OnGpuUnmap(vaddr, size);
+		(void)m_content_versions.Erase({vaddr, size});
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 	};

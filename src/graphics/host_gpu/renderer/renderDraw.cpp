@@ -1216,12 +1216,38 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
+	const auto operation_serial =
+	    m_context.GetGpuResources().GetContentVersions().ReserveSerial();
 	m_context.GetCommandScheduler().BeginRendering(state.rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	std::array<const PreparedBindings*, 2> written_stages {&bindings.vertex, nullptr};
+	const size_t written_stage_count = bindings.pixel.has_value() ? 2u : 1u;
+	if (bindings.pixel) {
+		written_stages[1] = &*bindings.pixel;
+	}
+	StampShaderWritesAt(m_context,
+	                    std::span {written_stages.data(), written_stage_count}, operation_serial,
+	                    "graphics-draw");
+	auto& texture_cache = m_context.GetTextureCache();
+	for (uint32_t index = 0; index < state.color_count; index++) {
+		const auto& color = state.color_info[index];
+		const bool writes = render_target_mask_slot(buffer.GetRegisters().GetRenderTargetMask(),
+		                                            color.target_slot) != 0 ||
+		                    state.rendering.color_attachments[index].is_clear;
+		if (writes && color.image_id) {
+			texture_cache.StampImageWriteAt(color.image_id, "graphics-draw-color",
+			                               operation_serial);
+		}
+	}
+	if (state.depth_info.image_id &&
+	    (state.depth_info.AttachmentWriteAspects() || state.depth_info.depth_load_clear_enable)) {
+		texture_cache.StampImageWriteAt(state.depth_info.image_id, "graphics-draw-depth",
+		                               operation_serial);
+	}
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1505,8 +1531,11 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
+	const auto operation_serial =
+	    m_context.GetGpuResources().GetContentVersions().ReserveSerial();
 	destination.Resolve(source, {src.base_mip_level, 1, src.base_array_layer, 1},
 	                    {dst.base_mip_level, 1, dst.base_array_layer, 1});
+	cache.StampImageWriteAt(dst.image_id, "graphics-resolve", operation_serial);
 	return true;
 }
 

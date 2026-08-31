@@ -5,6 +5,7 @@
 #include "common/common.h"
 #include "common/lruCache.h"
 #include "common/slotVector.h"
+#include "graphics/host_gpu/contentVersionMap.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
@@ -24,12 +25,26 @@ class Buffer;
 class BufferCache;
 class CommandBuffer;
 class CommandScheduler;
+class ContentVersionTracker;
 class RenderExecutor;
 struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
+	enum class GpuWriteKind : uint8_t { StorageBuffer, DmaFill, DmaCopy };
+
+	struct GpuWriteOrigin {
+		GpuWriteKind kind            = GpuWriteKind::StorageBuffer;
+		const char*  shader_stage    = nullptr;
+		uint64_t     shader_hash     = 0;
+		uint64_t     source_address  = 0;
+		uint32_t     slot            = UINT32_MAX;
+		uint32_t     value           = 0;
+		bool         formatted       = false;
+		bool         source_gds      = false;
+		bool         destination_gds = false;
+	};
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -44,7 +59,7 @@ public:
 	};
 
 	TextureCache(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager,
-	             BufferCache& buffer_cache);
+	             BufferCache& buffer_cache, ContentVersionTracker& content_versions);
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
@@ -62,11 +77,14 @@ public:
 		return image;
 	}
 	void MarkGpuWritten(ImageId id);
+	void ShadowStampImageWrite(ImageId id, const char* event);
+	void StampImageWriteAt(ImageId id, const char* event, ContentSerial serial);
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
-	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	void TraceMemoryWriteFromGPU(uint64_t address, uint64_t size, const GpuWriteOrigin& origin);
+	void InvalidateMemoryFromGPU(uint64_t address, uint64_t size, const GpuWriteOrigin& origin);
 	[[nodiscard]] RegionInfo QueryRegion(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -147,6 +165,7 @@ private:
 	void DownloadImageData(Image& image, Buffer& destination, uint64_t destination_offset,
 	                       uint64_t destination_size, DownloadPlan plan);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
+	void StampImageWrite(ImageId id, Image& image, const char* event);
 	void CommitGpuWrite(Image& image);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
@@ -166,6 +185,7 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	ContentVersionTracker&                            m_content_versions;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;

@@ -27,6 +27,8 @@
 #include <unistd.h>
 #endif
 
+void RunContentVersionMapTests();
+
 namespace {
 
 using Libs::Graphics::MemoryTracker;
@@ -844,6 +846,7 @@ int main(int argc, char **argv) {
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();
+  RunContentVersionMapTests();
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;
 }

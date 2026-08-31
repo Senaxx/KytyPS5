@@ -170,8 +170,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 static BufferView NativeStorageBuffer(RenderContext&                              context,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
-                                      ShaderType stage, uint32_t slot, uint32_t& buffer_offset,
-                                      BufferId id) {
+                                      ShaderType stage, uint64_t shader_hash, uint32_t slot,
+                                      uint32_t& buffer_offset, BufferId id) {
 	BufferView result;
 	buffer_offset = 0;
 
@@ -205,8 +205,19 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	result.buffer = buffer->Handle();
 	result.offset = aligned_offset;
 	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
-	if (resource.formatted && resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	if (resource.written) {
+		const TextureCache::GpuWriteOrigin origin {
+		    .kind         = TextureCache::GpuWriteKind::StorageBuffer,
+		    .shader_stage = ShaderStageResourceName(stage),
+		    .shader_hash  = shader_hash,
+		    .slot         = slot,
+		    .formatted    = resource.formatted,
+		};
+		if (resource.formatted) {
+			context.GetTextureCache().InvalidateMemoryFromGPU(address, size, origin);
+		} else {
+			context.GetTextureCache().TraceMemoryWriteFromGPU(address, size, origin);
+		}
 	}
 	SetVulkanObjectNameF(
 	    graphics.device, result.buffer,
@@ -960,7 +971,6 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_ids.push_back(cache.FindBuffer(address, size));
 	}
-
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
@@ -985,9 +995,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		ShaderBufferResource descriptor;
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		uint32_t buffer_offset = 0;
-		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
-		                                                program.info.buffers[i], program.stage, i,
-		                                                buffer_offset, prepared.buffer_ids[i]));
+		resources.buffers.push_back(
+		    NativeStorageBuffer(m_context, descriptor, program.info.buffers[i], program.stage,
+		                        program.shader_hash, i, buffer_offset, prepared.buffer_ids[i]));
 		pack_memory_offset(i, buffer_offset);
 	}
 	if (!prepared.flattened_srt.empty()) {
@@ -1071,6 +1081,58 @@ void RenderExecutor::MarkStorageImagesWritten(const PreparedBindings& prepared) 
 		}
 		texture_cache.MarkGpuWritten(binding.image_id);
 		committed.push_back(binding.image_id);
+	}
+}
+
+void StampShaderWritesAt(RenderContext& context,
+                         std::span<const PreparedBindings* const> bindings,
+                         ContentSerial serial, const char* event) {
+	std::vector<ContentRange> stamped_buffers;
+	std::vector<ImageId>      stamped_images;
+	auto&                     versions = context.GetGpuResources().GetContentVersions();
+	auto&                     textures = context.GetTextureCache();
+	for (const auto* prepared: bindings) {
+		if (prepared == nullptr) {
+			continue;
+		}
+		EXIT_IF(prepared->program == nullptr || prepared->snapshot == nullptr);
+		const auto& program  = *prepared->program;
+		const auto& snapshot = *prepared->snapshot;
+		EXIT_IF(program.info.buffers.size() != snapshot.buffers.size() ||
+		        program.info.images.size() != prepared->resources.images.size());
+		for (uint32_t index = 0; index < program.info.buffers.size(); index++) {
+			if (!program.info.buffers[index].written) {
+				continue;
+			}
+			const auto descriptor =
+			    DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[index]);
+			const uint64_t records = descriptor.NumRecords();
+			const uint64_t stride  = descriptor.Stride();
+			EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
+			const auto requested_size = stride == 0 ? records : records * stride;
+			const ContentRange range {
+			    descriptor.Base48(),
+			    Libs::LibKernel::Memory::ClampRangeSize(descriptor.Base48(), requested_size)};
+			const bool already_stamped = std::ranges::any_of(
+			    stamped_buffers, [&](const ContentRange& other) { return other == range; });
+			if (!range.Valid() || already_stamped) {
+				continue;
+			}
+			(void)versions.StampAt(ContentDomain::Buffer, range, serial, event,
+			                       program.shader_hash);
+			stamped_buffers.push_back(range);
+		}
+		for (uint32_t index = 0; index < program.info.images.size(); index++) {
+			const auto& resource = program.info.images[index];
+			const auto& binding  = prepared->resources.images[index];
+			if (!resource.written || binding.desc.type != TextureCache::BindingType::Storage ||
+			    !binding.image_id ||
+			    std::ranges::find(stamped_images, binding.image_id) != stamped_images.end()) {
+				continue;
+			}
+			textures.StampImageWriteAt(binding.image_id, event, serial);
+			stamped_images.push_back(binding.image_id);
+		}
 	}
 }
 

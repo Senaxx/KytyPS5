@@ -149,6 +149,8 @@ public:
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
+	uint64_t         content_serial   = 0;
+	bool             content_complete = false;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 
