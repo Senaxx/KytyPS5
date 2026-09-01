@@ -89,6 +89,15 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (program.bindings.ShaderDataDwords() != 0 && program.bindings.push_constant_size == 0) {
 		Expect(Kind::UserData);
 	}
+	for (const auto& buffer: program.info.buffers) {
+		const auto* source = buffer.source < program.descriptor_sources.size()
+		                         ? &program.descriptor_sources[buffer.source]
+		                         : nullptr;
+		if (source == nullptr || source->runtime_buffer != buffer.runtime_descriptor ||
+		    (buffer.runtime_descriptor && (!program.info.uses_dma || source->dword_count != 4u))) {
+			Fail(program, "native buffer descriptor provenance is inconsistent");
+		}
+	}
 
 	std::array<bool, KindCount> seen {};
 	for (const auto& binding: program.bindings.descriptors) {
@@ -216,7 +225,16 @@ void AnalyzeProgramRequirements(IR::Program& program) {
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
-					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+					const auto& resource = program.info.buffers[memory.resource];
+					if (resource.runtime_descriptor) {
+						if (program.stage != ShaderType::Compute || !program.info.uses_dma) {
+							Fail(program, "runtime buffer descriptors require compute DMA support");
+						}
+						requirements.subgroup_local_invocation_id = true;
+						continue;
+					}
+					const bool add_tid = (resource.packed_stride & (1u << 20u)) != 0u;
+					if (add_tid) {
 						if (program.stage != ShaderType::Compute) {
 							Fail(program, "buffer ADD_TID is only valid for compute shaders");
 						}

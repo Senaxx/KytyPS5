@@ -122,6 +122,7 @@ struct BufferResource {
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
 	uint32_t               image_alias        = NoImageAlias;
+	bool                   runtime_descriptor = false;
 	bool                   read               = false;
 	bool                   written            = false;
 	bool                   atomic             = false;
@@ -469,6 +470,7 @@ struct DescriptorSource {
 
 	std::array<Value, 8>         dwords {};
 	uint32_t                     dword_count = 0;
+	bool                         runtime_buffer = false;
 	std::optional<IndirectImage> indirect_image;
 
 	bool operator==(const DescriptorSource& other) const = default;

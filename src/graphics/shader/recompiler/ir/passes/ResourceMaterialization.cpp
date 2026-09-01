@@ -16,8 +16,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
-constexpr uint64_t MaxIndirectImageProbes = 65536u;
+constexpr uint64_t AddressMask             = 0x0000ffffffffffffull;
+constexpr uint64_t MaxIndirectImageProbes  = 65536u;
 
 [[noreturn]] void SpecializationFail(std::string_view message) {
 	EXIT("shader resource specialization failed: %s", std::string(message).c_str());
@@ -283,8 +283,19 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		}
 	}
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const auto alias = program.info.buffers[i].image_alias;
+		const auto& buffer = program.info.buffers[i];
+		const auto  alias  = buffer.image_alias;
 		if (alias != BufferResource::NoImageAlias && alias >= program.info.images.size()) {
+			return false;
+		}
+		const auto* source = Source(program, buffer.source);
+		if (source == nullptr || source->runtime_buffer != buffer.runtime_descriptor) {
+			return false;
+		}
+		if (buffer.runtime_descriptor &&
+		    (alias != BufferResource::NoImageAlias || snapshot.buffers[i].dword_count != 4u ||
+		     std::ranges::any_of(snapshot.buffers[i].dwords,
+		                         [](uint32_t dword) { return dword != 0u; }))) {
 			return false;
 		}
 	}
@@ -423,7 +434,13 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	requests.reserve(program.info.buffers.size() + program.info.images.size() * 2u +
 	                 program.info.samplers.size());
 	for (const auto& buffer: program.info.buffers) {
-		requests.push_back({buffer.source});
+		const auto* source = Source(program, buffer.source);
+		if (source == nullptr) {
+			return false;
+		}
+		if (!source->runtime_buffer) {
+			requests.push_back({buffer.source});
+		}
 	}
 	for (const auto& image: program.info.images) {
 		const auto* source = Source(program, image.source);
@@ -451,16 +468,29 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 
 	ResourceSnapshot next;
 	auto             cursor = values.begin();
-	next.buffers.assign(cursor, cursor + program.info.buffers.size());
-	cursor += program.info.buffers.size();
-	for (auto& descriptor: next.buffers) {
-		ShaderBufferResource buffer;
-		if (DecodeBufferDescriptor(descriptor, buffer) && buffer.Type() != 0) {
-			descriptor.dwords.fill(0);
-		}
-	}
 	next.flattened_srt = std::move(flattened_srt);
 	next.flattened_srt.resize(FlattenedRuntimeDwords(program));
+	next.buffers.resize(program.info.buffers.size());
+	std::vector<uint8_t> buffer_written(program.info.buffers.size());
+	for (uint32_t buffer_index = 0; buffer_index < program.info.buffers.size(); buffer_index++) {
+		const auto& buffer = program.info.buffers[buffer_index];
+		const auto* source = Source(program, buffer.source);
+		if (source != nullptr && source->runtime_buffer) {
+			next.buffers[buffer_index].dword_count = 4u;
+			buffer_written[buffer_index]            = 1u;
+		} else {
+			auto                 descriptor = *cursor++;
+			ShaderBufferResource decoded;
+			if (DecodeBufferDescriptor(descriptor, decoded) && decoded.Type() != 0u) {
+				descriptor.dwords.fill(0u);
+			}
+			next.buffers[buffer_index]   = descriptor;
+			buffer_written[buffer_index] = 1u;
+		}
+	}
+	if (std::ranges::find(buffer_written, uint8_t {0}) != buffer_written.end()) {
+		return false;
+	}
 	next.images.resize(program.info.images.size());
 	std::vector<uint8_t> image_written(program.info.images.size());
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {

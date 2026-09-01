@@ -108,6 +108,7 @@ public:
 		if (!m_program.srt_plan_complete) {
 			Fail(0, "SRT plan is not ready");
 		}
+		PlanIndirectBuffers();
 		PlanIndirectImages();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -141,8 +142,8 @@ public:
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			});
+				                   return std::ranges::find(plan.reads, inst) != plan.reads.end();
+			                   });
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -169,6 +170,11 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+	};
+
+	struct IndirectBufferPlan {
+		Inst*    handle = nullptr;
+		uint32_t source = 0;
 	};
 
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
@@ -217,6 +223,7 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
+			    current.runtime_buffer != descriptor.runtime_buffer ||
 			    current.indirect_image != descriptor.indirect_image) {
 				continue;
 			}
@@ -326,6 +333,116 @@ private:
 		const auto* selector_inst = selector.TryInstruction();
 		return stride != 0u && selector_inst != nullptr &&
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+	}
+
+	bool TryMakeIndirectBuffer(Inst& handle, uint32_t pc, IndirectBufferPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		DescriptorSource direct_source;
+		MakeSource(handle, 4u, false, false, direct_source, pc);
+		uint32_t bad_dword = 0;
+		if (ValidateSource(direct_source, bad_dword)) {
+			return false;
+		}
+
+		std::array<Inst*, 4> reads {};
+		Inst*                table_handle = nullptr;
+		Value                dynamic_offset;
+		uint32_t             descriptor_offset = 0;
+		for (uint32_t dword = 0; dword < reads.size(); dword++) {
+			reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
+			if (reads[dword] == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*reads[dword], memory_index);
+			if (memory == nullptr || !MemoryIndexBelongsTo(memory_index, *reads[dword])) {
+				return false;
+			}
+			if (dword == 0u) {
+				descriptor_offset = memory->offset;
+				dynamic_offset    = reads[dword]->Arg(1).Resolve();
+			} else if (memory->offset != descriptor_offset + dword * sizeof(uint32_t) ||
+			           !EquivalentValue(m_program, dynamic_offset, reads[dword]->Arg(1))) {
+				return false;
+			}
+			auto* current_handle = reads[dword]->Arg(0).Resolve().TryInstruction();
+			if (current_handle == nullptr ||
+			    (table_handle != nullptr && current_handle != table_handle)) {
+				return false;
+			}
+			table_handle = current_handle;
+		}
+		if (handle.Uses().empty() || !std::ranges::all_of(handle.Uses(), [&](const Use& use) {
+			    if (use.operand != 0u ||
+			        BufferAccessOf(use.user->GetOpcode()) != BufferAccess::Read) {
+				    return false;
+			    }
+			    const auto flags = use.user->Flags<MemoryFlags>();
+			    if (flags.index >= m_program.memory_info.size()) {
+				    return false;
+			    }
+			    const auto& memory = m_program.memory_info[flags.index];
+			    return memory.kind == ResourceKind::Buffer && !memory.formatted && !memory.typed &&
+			           memory.data_bits == 32u && memory.data_dwords >= 2u;
+		    })) {
+			return false;
+		}
+
+		DescriptorSource table_source;
+		uint32_t         table_source_index = 0;
+		if (!MakeRuntimeBufferSource(*table_handle, pc, table_source_index, table_source)) {
+			return false;
+		}
+		DescriptorSource buffer_source;
+		buffer_source.dword_count = 4u;
+		for (uint32_t dword = 0; dword < reads.size(); dword++) {
+			buffer_source.dwords[dword] = handle.Arg(dword).Resolve();
+		}
+		buffer_source.runtime_buffer = true;
+
+		plan.handle = &handle;
+		plan.source = InternSource(buffer_source);
+		return true;
+	}
+
+	const IndirectBufferPlan* FindIndirectBuffer(const Inst& handle) const {
+		const auto found =
+		    std::find_if(m_indirect_buffers.begin(), m_indirect_buffers.end(),
+		                 [&](const IndirectBufferPlan& plan) { return plan.handle == &handle; });
+		return found == m_indirect_buffers.end() ? nullptr : &*found;
+	}
+
+	void PlanIndirectBuffers() {
+		if (m_program.stage != ShaderType::Compute) {
+			return;
+		}
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Read ||
+				    inst.NumArgs() == 0u) {
+					continue;
+				}
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) {
+					continue;
+				}
+				const auto& memory = m_program.memory_info[flags.index];
+				if (memory.kind != ResourceKind::Buffer || memory.formatted || memory.typed ||
+				    memory.data_bits != 32u || memory.data_dwords < 2u) {
+					continue;
+				}
+				auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (handle == nullptr || FindIndirectBuffer(*handle) != nullptr) {
+					continue;
+				}
+				IndirectBufferPlan plan;
+				if (TryMakeIndirectBuffer(*handle, flags.pc, plan)) {
+					m_indirect_buffers.push_back(std::move(plan));
+				}
+			}
+		}
 	}
 
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
@@ -443,8 +560,8 @@ private:
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
+			                   return std::ranges::find(plan.memory, index) != plan.memory.end();
+		                   });
 	}
 
 	void PlanIndirectImages() {
@@ -505,6 +622,11 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
+		if (const auto* descriptor = Source(source);
+		    descriptor != nullptr && descriptor->runtime_buffer) {
+			resource.runtime_descriptor = true;
+			m_info.uses_dma              = true;
+		}
 		Merge(resource, memory, op, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
@@ -652,7 +774,13 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
+			handle               = inst.Arg(0).Resolve().TryInstruction();
+			const auto* indirect = handle != nullptr ? FindIndirectBuffer(*handle) : nullptr;
+			if (indirect != nullptr) {
+				source = indirect->source;
+			} else {
+				GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
+			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
@@ -724,7 +852,8 @@ private:
 	void LinkImageAliases() {
 		for (auto& buffer: m_info.buffers) {
 			const auto* buffer_source = Source(buffer.source);
-			if (buffer_source == nullptr || buffer_source->dword_count != 4) {
+			if (buffer_source == nullptr || buffer_source->dword_count != 4 ||
+			    buffer_source->runtime_buffer) {
 				continue;
 			}
 			for (uint32_t image = 0; image < m_info.images.size(); image++) {
@@ -751,6 +880,7 @@ private:
 	std::vector<DescriptorSource>  m_sources;
 	std::vector<HandlePatch>       m_handle_patches;
 	std::vector<MemoryPatch>       m_memory_patches;
+	std::vector<IndirectBufferPlan> m_indirect_buffers;
 	std::vector<IndirectImagePlan> m_indirect_images;
 };
 
