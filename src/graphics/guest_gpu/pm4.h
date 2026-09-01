@@ -506,6 +506,9 @@ constexpr uint32_t PA_SU_SMALL_PRIM_FILTER_CNTL = 0x20C;
 constexpr uint32_t PA_CL_OBJPRIM_ID_CNTL        = 0x20D;
 constexpr uint32_t PA_STEREO_CNTL               = 0x210;
 constexpr uint32_t PA_STATE_STEREO_X            = 0x211;
+// GFX10 context-register holes accepted by hardware clear-state streams.
+constexpr uint32_t CX_RESERVED_CLEAR_STATE_FIRST = 0x220;
+constexpr uint32_t CX_RESERVED_CLEAR_STATE_LAST  = 0x27F;
 constexpr uint32_t PA_SU_POINT_SIZE             = 0x280;
 constexpr uint32_t PA_SU_POINT_MINMAX           = 0x281;
 

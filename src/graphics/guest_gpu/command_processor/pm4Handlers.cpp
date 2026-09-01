@@ -344,6 +344,19 @@ static void HwCtxIgnoreSpiTmpringSize(uint32_t value) {
 	}
 }
 
+static void HwCtxIgnoreReservedRegister(uint32_t cmd_offset, uint32_t value) {
+	if (value == 0) {
+		return;
+	}
+
+	static std::atomic<uint32_t> log_count {0};
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 8) {
+		LOGF("\t warning: ignoring nonzero reserved CX register 0x%04" PRIx32 " = 0x%08" PRIx32
+		     "\n",
+		     cmd_offset, value);
+	}
+}
+
 KYTY_HW_CTX_PARSER(HwCtxSetSpiTmpringSize) {
 	auto reg_num = (cmd_id >> 16u) & 0x3fffu;
 
@@ -1984,6 +1997,7 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
+	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
 	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
 		// Keep the encoded offset for packet control values, and use the normalized offset
 		// only for register dispatch.
@@ -2020,7 +2034,17 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
+			LOGF("unknown indirect CX register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
+			     ", raw=0x%08" PRIx32 ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
+			     i, indirect_num_dw, indirect_address, raw_cmd_offset, cmd_offset, value);
+			auto* dump_regs = indirect_buffer - i * 2;
+			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
+				LOGF("\t cx_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
+				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+			}
+			EXIT("unknown cx reg at %05" PRIx32 ": raw=0x%08" PRIx32 ", offset=0x%" PRIx32
+			     ", value=0x%08" PRIx32 "\n",
+			     num_dw - dw, raw_cmd_offset, cmd_offset, value);
 		}
 
 		pfunc(cp, cmd_offset, value);
@@ -2644,6 +2668,13 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 void GraphicsInitJmpTablesCxIndirect() {
 	for (auto& func: g_hw_ctx_indirect_func) {
 		func = nullptr;
+	}
+
+	for (auto cmd_offset = Pm4::CX_RESERVED_CLEAR_STATE_FIRST;
+	     cmd_offset <= Pm4::CX_RESERVED_CLEAR_STATE_LAST; cmd_offset++) {
+		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			HwCtxIgnoreReservedRegister(cmd_offset, value);
+		};
 	}
 
 	for (auto cmd_offset = Pm4::SPI_PS_INPUT_CNTL_0; cmd_offset <= Pm4::SPI_PS_INPUT_CNTL_31;
