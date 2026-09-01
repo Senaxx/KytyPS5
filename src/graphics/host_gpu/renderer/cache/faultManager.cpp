@@ -6,8 +6,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -148,13 +150,27 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		m_fault_ranges.Clear();
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		const auto  count  = static_cast<uint32_t>(
+		    std::min<uint64_t>(faults[0], MaxPageFaults - 1u));
+		auto&       resources = m_scheduler.Context().GetGpuResources();
 		for (uint32_t index = 1; index <= count; ++index) {
-			m_fault_ranges.Add(faults[index], m_caching_pagesize);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);
+			const auto address = faults[index];
+			if (!resources.IsMapped(address, m_caching_pagesize)) {
+				LOGF("Ignoring stale BDA fault for unmapped memory at 0x%016" PRIx64 "\n",
+				     address);
+				continue;
+			}
+			m_fault_ranges.Add(address, m_caching_pagesize);
+			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
 		}
 		m_fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+			if (!m_scheduler.Context().GetGpuResources().IsMapped(start, end - start)) {
+				LOGF("Ignoring stale BDA fault for unmapped memory at 0x%016" PRIx64
+				     " with size 0x%016" PRIx64 "\n",
+				     start, end - start);
+				return;
+			}
 			(void)m_buffer_cache.FindBuffer(start, end - start);
 		});
 		m_fault_areas[area] = 0;
