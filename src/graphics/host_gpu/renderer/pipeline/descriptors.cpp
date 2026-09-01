@@ -428,8 +428,7 @@ static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::Imag
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D && valid_2d_slice;
 	const bool is_cube = resource.cube && descriptor.Type() == Prospero::ImageType::kCube &&
 	                     descriptor.Width5() == descriptor.Height5() &&
-	                     descriptor.BaseArray5() <= descriptor.Depth() &&
-	                     (descriptor.Depth() - descriptor.BaseArray5() + 1u) % 6u == 0;
+	                     descriptor.BaseArray5() <= descriptor.Depth();
 	const bool is_2d_array =
 	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray &&
 	    ((!resource.cube && is_color_2d_array && descriptor.BaseArray5() <= descriptor.Depth()) ||
