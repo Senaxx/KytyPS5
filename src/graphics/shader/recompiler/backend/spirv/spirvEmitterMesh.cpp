@@ -1,5 +1,10 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "common/logging/log.h"
+
+#include <algorithm>
+#include <atomic>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -26,6 +31,61 @@ uint32_t MeshLoad(EmitterState& state, uint32_t variable, spv::StorageClass stor
 
 uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 	return kind == IR::StageOutputKind::Layer ? TypeU32(state) : TypeF32Vector(state, 4);
+}
+
+// The guest's allocation clamped to the declared output size: larger counts are undefined.
+uint32_t MeshCount(EmitterState& state, uint32_t field, uint32_t maximum) {
+	const auto count  = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
+	                             TypeU32(state), ConstantU32(state, field));
+	const auto limit  = ConstantU32(state, maximum);
+	const auto within = Binary(state, spv::OpULessThanEqual, TypeBool(state), count, limit);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), result, within, count, limit);
+	return result;
+}
+
+uint32_t ZeroPositionMaskWord(EmitterState& state, uint32_t vertex) {
+	return MeshElement(
+	    state, state.mesh_zero_position_mask, spv::StorageClassWorkgroup, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), vertex, ConstantU32(state, 5)));
+}
+
+void MarkZeroPosition(EmitterState& state, uint32_t position, uint32_t vertex) {
+	const auto equal = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFOrdEqual, TypeBoolVector(state, 4), equal, position,
+	                          state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 4)));
+	const auto zero = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAll, TypeBool(state), zero, equal);
+	EmitIfCondition(state, zero, [&] {
+		const auto bit = Binary(
+		    state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), vertex, ConstantU32(state, 31)));
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), state.builder.AllocateId(),
+		                          ZeroPositionMaskWord(state, vertex),
+		                          ConstantU32(state, spv::ScopeWorkgroup),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
+	});
+}
+
+// True when a primitive's vertex index is past the allocation or its vertex sits at (0,0,0,0).
+uint32_t UnusableVertex(EmitterState& state, uint32_t vertex, uint32_t vertices) {
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), vertex, vertices);
+	const auto safe     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), safe, in_range, vertex,
+	                          ConstantU32(state, 0));
+	const auto pointer = ZeroPositionMaskWord(state, safe);
+	const auto word    = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, pointer);
+	const auto shifted =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), safe, ConstantU32(state, 31)));
+	const auto marked =
+	    Binary(state, spv::OpINotEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), shifted, ConstantU32(state, 1)),
+	           ConstantU32(state, 0));
+	const auto out_of_range = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), out_of_range, in_range);
+	return Binary(state, spv::OpLogicalOr, TypeBool(state), marked, out_of_range);
 }
 
 } // namespace
@@ -78,6 +138,20 @@ void DefineMeshOutputs(EmitterState& state) {
 	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_cull, spv::DecorationBuiltIn,
 	                            spv::BuiltInCullPrimitiveEXT); // CullPrimitiveEXT
 	state.builder.AddAnnotation(spv::OpDecorate, state.mesh_cull, spv::DecorationPerPrimitiveEXT);
+	// A vertex at (0,0,0,0), which an out-of-bounds vertex fetch exports, leaves nothing of its
+	// primitives on AMD hardware; NVIDIA rasterises them as screen-wide wedges. The vertex-shader
+	// path clips them with its zero-position guard; here a bit per vertex culls the primitives.
+	if (std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
+		state.mesh_zero_position_words = (mesh.max_vertices + 31u) / 32u;
+		state.mesh_zero_position_mask  = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state),
+		                                           state.mesh_zero_position_words);
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog("Shader: emitted mesh zero-position primitive cull\n");
+		}
+	}
 }
 
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index) {
@@ -121,17 +195,32 @@ void EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 void EmitMeshEntryPoint(EmitterState& state) {
+	const auto& mesh = state.input_info.vertex->mesh;
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
 	EmitLabel(state, state.builder.AllocateId());
+	state.lane_half = 0;
+	if (state.mesh_zero_position_mask != 0) {
+		// Cleared before the guest code: the barrier after it orders the clear before the marks.
+		const auto first = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), first,
+		                          EmitLocalInvocationIndex(state), ConstantU32(state, 0));
+		EmitIfCondition(state, first, [&] {
+			for (uint32_t word = 0; word < state.mesh_zero_position_words; word++) {
+				state.builder.AddFunction(
+				    spv::OpStore,
+				    MeshElement(state, state.mesh_zero_position_mask, spv::StorageClassWorkgroup,
+				                TypeU32(state), ConstantU32(state, word)),
+				    ConstantU32(state, 0));
+			}
+		});
+	}
 	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
 	EmitBarrier(state);
-	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 0));
-	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
-	                                 TypeU32(state), ConstantU32(state, 1));
+	const auto vertices   = MeshCount(state, 0, mesh.max_vertices);
+	const auto primitives = MeshCount(state, 1, mesh.max_primitives);
 	state.builder.AddFunction(spv::OpSetMeshOutputsEXT, vertices,
 	                          primitives); // OpSetMeshOutputsEXT
 	for (uint32_t half = 0; half < state.lane_count; half++) {
@@ -151,8 +240,20 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				const auto pointer =
 				    MeshElement(state, output.variable_id, spv::StorageClassOutput, type, index);
 				state.builder.AddFunction(spv::OpStore, pointer, value);
+				if (output.kind == IR::StageOutputKind::Position &&
+				    state.mesh_zero_position_mask != 0) {
+					MarkZeroPosition(state, value, index);
+				}
 			}
 		});
+	}
+	if (state.mesh_zero_position_mask != 0) {
+		// Primitives test the marks of vertices that other invocations stored.
+		EmitBarrier(state);
+	}
+	for (uint32_t half = 0; half < state.lane_count; half++) {
+		state.lane_half         = half;
+		const auto index        = EmitLocalInvocationIndex(state);
 		const auto is_primitive = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_primitive, index,
 		                          primitives);
@@ -175,9 +276,15 @@ void EmitMeshEntryPoint(EmitterState& state) {
 			state.builder.AddFunction(spv::OpStore, triangle_pointer, triangle);
 			const auto null_bit =
 			    EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u));
-			const auto culled = state.builder.AllocateId();
+			auto culled = state.builder.AllocateId();
 			state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), culled, null_bit,
 			                          ConstantU32(state, 0));
+			if (state.mesh_zero_position_mask != 0) {
+				for (const auto component: vertex) {
+					culled = Binary(state, spv::OpLogicalOr, TypeBool(state), culled,
+					                UnusableVertex(state, component, vertices));
+				}
+			}
 			state.builder.AddFunction(spv::OpStore,
 			                          MeshElement(state, state.mesh_cull, spv::StorageClassOutput,
 			                                      TypeBool(state), index),
