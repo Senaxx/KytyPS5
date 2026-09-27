@@ -24,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -56,6 +57,36 @@ struct DrawIndexedIndirectArgs {
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
+}
+
+// KYTY_LOG_INDIRECT_DRAWS=<n>: log the arguments of the first n indirect draws, including
+// multi-draws whose GPU-written count is zero. A diagnostic for draws that GPU work generation
+// (culling passes) should have filled.
+static bool LogIndirectDraw() {
+	static const uint32_t budget = [] {
+		const char* value = std::getenv("KYTY_LOG_INDIRECT_DRAWS");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (budget == 0) {
+		return false;
+	}
+	// With KYTY_LOG_DRAWS_TRIGGER=<file>, start once that file exists (checked every 256 draws).
+	static const char*           trigger   = std::getenv("KYTY_LOG_DRAWS_TRIGGER");
+	static std::atomic_bool      triggered = trigger == nullptr;
+	static std::atomic<uint32_t> polls {0};
+	if (!triggered) {
+		if ((polls.fetch_add(1, std::memory_order_relaxed) & 255u) != 0u) {
+			return false;
+		}
+		FILE* file = std::fopen(trigger, "rb");
+		if (file == nullptr) {
+			return false;
+		}
+		std::fclose(file);
+		triggered = true;
+	}
+	static std::atomic<uint32_t> used {0};
+	return used.fetch_add(1, std::memory_order_relaxed) < budget;
 }
 
 GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
@@ -915,6 +946,11 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));
+		if (LogIndirectDraw()) {
+			LOGF("Indirect draw: args=0x%010" PRIx64 " vertices=%u instances=%u first=%u\n",
+			     reinterpret_cast<uint64_t>(args_addr), args.vertex_count_per_instance,
+			     args.instance_count, args.start_vertex_location);
+		}
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
@@ -926,6 +962,11 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	DrawIndexedIndirectArgs args {};
 	std::memcpy(&args, args_addr, sizeof(args));
+	if (LogIndirectDraw()) {
+		LOGF("Indirect indexed draw: args=0x%010" PRIx64 " indices=%u instances=%u first=%u\n",
+		     reinterpret_cast<uint64_t>(args_addr), args.index_count_per_instance,
+		     args.instance_count, args.start_index_location);
+	}
 
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
@@ -972,6 +1013,13 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (draw_count > max_count_or_count) {
 			draw_count = max_count_or_count;
 		}
+	}
+	if (LogIndirectDraw()) {
+		LOGF("Indirect multi draw: args=0x%010" PRIx64 " indexed=%d count=%u max=%u count_addr=%p "
+		     "stride=%u\n",
+		     m_draw_indirect_args_base_addr + data_offset, indexed ? 1 : 0, draw_count,
+		     max_count_or_count, static_cast<const void*>(const_cast<const uint32_t*>(count_addr)),
+		     stride_in_bytes);
 	}
 
 	if (draw_count == 0) {

@@ -65,6 +65,9 @@ struct SpirvRequirements {
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	// Dwords the function-scope LDS array needs, from bounds on every LDS address; 0 when some
+	// address is unbounded.
+	uint32_t function_lds_dwords      = 0;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
@@ -109,6 +112,7 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;

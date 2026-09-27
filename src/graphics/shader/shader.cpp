@@ -779,8 +779,10 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
 	EXIT_IF(mesh.primitives_per_group == 0u);
 	mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
+	const auto explicit_threads = (sh.m_geNggSubgrpCntl >> 9u) & 0x1ffu;
+	const auto output_threads = std::max({mesh.max_vertices, mesh.max_primitives, explicit_threads});
 	mesh.threads_num[0] =
-	    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
+	    ((output_threads + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
 	mesh.threads_num[1] = mesh.threads_num[2] = 1u;
 	return params;
 }
@@ -793,6 +795,10 @@ static uint64_t MappedShaderHash(uint64_t addr) {
 	}
 	const auto iter = g_shader_map->find(addr);
 	return iter != g_shader_map->end() ? iter->second.hash : 0;
+}
+
+uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
+	return MappedShaderHash(shader_addr);
 }
 
 // Tessellation program pairs the analysis has already rejected, keyed by the registered LS/HS

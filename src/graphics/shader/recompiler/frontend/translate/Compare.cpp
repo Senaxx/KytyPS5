@@ -63,6 +63,52 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false, cmpx);
 }
 
+// A double as its {low, high} dwords. Inline float constants are f64 values in f64 instructions;
+// 1/(2*pi) has its own f64 encoding. ABS and NEG act on the sign bit, bit 63.
+std::array<IR::U32, 2> Translator::ReadF64Halves(const Decoder::Operand& operand) {
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		const uint64_t bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
+		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	}
+	auto halves = ReadU32Pair(PlainOperand(operand));
+	if (operand.absolute) {
+		halves[1] = ir.BitwiseAnd(halves[1], IR::U32(IR::Value(0x7fffffffu)));
+	}
+	if (operand.negate) {
+		halves[1] = ir.BitwiseXor(halves[1], IR::U32(IR::Value(0x80000000u)));
+	}
+	return halves;
+}
+
+// V_CMP_EQ_F64 on the bit patterns: equal unless either side is NaN, and +0 equals -0.
+void Translator::EmitFloat64EqualCompare(const Decoder::Instruction& inst) {
+	const auto lhs       = ReadF64Halves(inst.src0);
+	const auto rhs       = ReadF64Halves(inst.src1);
+	const auto magnitude = [&](const std::array<IR::U32, 2>& value) {
+		return ir.BitwiseAnd(value[1], IR::U32(IR::Value(0x7fffffffu)));
+	};
+	const auto is_nan = [&](const std::array<IR::U32, 2>& value) {
+		const auto high     = magnitude(value);
+		const auto infinity = IR::U32(IR::Value(0x7ff00000u));
+		return ir.LogicalOr(ir.UGreaterThan(high, infinity),
+		                    ir.LogicalAnd(ir.IEqual(high, infinity),
+		                                  ir.INotEqual(value[0], IR::U32(IR::Value(0u)))));
+	};
+	const auto is_zero = [&](const std::array<IR::U32, 2>& value) {
+		return ir.IEqual(ir.BitwiseOr(magnitude(value), value[0]), IR::U32(IR::Value(0u)));
+	};
+	const auto same_bits =
+	    ir.LogicalAnd(ir.IEqual(lhs[0], rhs[0]), ir.IEqual(lhs[1], rhs[1]));
+	const auto equal =
+	    ir.LogicalAnd(ir.LogicalNot(ir.LogicalOr(is_nan(lhs), is_nan(rhs))),
+	                  ir.LogicalOr(same_bits, ir.LogicalAnd(is_zero(lhs), is_zero(rhs))));
+	EmitCompareResult(inst, equal, false, false);
+}
+
 void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx) {
 	const auto lhs       = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
 	const auto rhs       = IR::F32(ReadOperand(inst.src1, IR::Type::F32));

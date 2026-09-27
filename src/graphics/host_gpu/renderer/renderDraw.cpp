@@ -35,8 +35,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -882,6 +884,62 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
 }
 
+// KYTY_LOG_DRAWS=<first_frame>:<count>: from that frame on, log count draws with their shader
+// hashes, counts and whether their programs exist (-1: not resolved, the draw is empty). A census
+// of what a scene submits.
+static void LogDrawCensusLine(CommandBuffer& buffer, const char* kind, uint32_t count,
+                              uint32_t instances, int vs_program, int ps_program, int ps_active) {
+	static const auto setting = [] {
+		struct Setting {
+			uint64_t first_frame = 0;
+			uint32_t count       = 0;
+		} result;
+		if (const char* value = std::getenv("KYTY_LOG_DRAWS"); value != nullptr) {
+			char* end          = nullptr;
+			result.first_frame = std::strtoull(value, &end, 10);
+			if (end != nullptr && *end == ':') {
+				result.count = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 10));
+			}
+		}
+		return result;
+	}();
+	static std::atomic<uint32_t> used {0};
+	if (setting.count == 0) {
+		return;
+	}
+	const auto frame = static_cast<uint64_t>(buffer.GetContext().GetGpu().GetFrameNum());
+	// KYTY_LOG_DRAWS_TRIGGER=<file>: also wait until that file exists (checked once per frame), so
+	// the census can start at a screen reached by hand.
+	static const char*           trigger    = std::getenv("KYTY_LOG_DRAWS_TRIGGER");
+	static std::atomic<uint64_t> checked    = UINT64_MAX;
+	static std::atomic_bool      triggered  = trigger == nullptr;
+	if (!triggered && checked.exchange(frame) != frame) {
+		if (FILE* file = std::fopen(trigger, "rb"); file != nullptr) {
+			std::fclose(file);
+			triggered = true;
+			LOGF("Draw census: triggered at frame %" PRIu64 "\n", frame);
+		}
+	}
+	if (!triggered || frame < setting.first_frame ||
+	    used.fetch_add(1, std::memory_order_relaxed) >= setting.count) {
+		return;
+	}
+	const auto& sh_ctx = buffer.GetShaders();
+	const auto  hash   = [](uint64_t addr) { return addr != 0 ? ShaderDeclaredHash(addr) : 0ull; };
+	LOGF("Draw census: frame=%" PRIu64 " %s es=%016" PRIx64 " gs=%016" PRIx64 " ps=%016" PRIx64
+	     " count=%u instances=%u vs_program=%d ps_program=%d ps_active=%d\n",
+	     frame, kind, hash(sh_ctx.GetVs().es_regs.data_addr),
+	     hash(sh_ctx.GetVs().gs_regs.data_addr), hash(sh_ctx.GetPs().ps_regs.data_addr), count,
+	     instances, vs_program, ps_program, ps_active);
+}
+
+static void LogDrawCensus(CommandBuffer& buffer, const DrawCallInfo& draw,
+                          const DrawRenderState& state) {
+	LogDrawCensusLine(buffer, draw.Name(), draw.index_count, draw.instance_count,
+	                  state.programs.vertex[0] ? 1 : 0, state.programs.pixel ? 1 : 0,
+	                  state.ps_active ? 1 : 0);
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -891,6 +949,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	LogDrawCensus(buffer, draw, state);
 	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
 		return false;
 	}
@@ -1188,6 +1247,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.index_count == 0 || args.instance_count == 0) {
+		LogDrawCensusLine(buffer, "DrawIndex-empty", args.index_count, args.instance_count, -1, -1,
+		                  -1);
 		return;
 	}
 
@@ -1299,6 +1360,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (args.vertex_count == 0 || args.instance_count == 0) {
+		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
+		                  -1, -1);
 		return;
 	}
 

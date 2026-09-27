@@ -124,6 +124,8 @@ private:
 	                        bool scalar, bool cmpx);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
+	std::array<IR::U32, 2> ReadF64Halves(const Decoder::Operand& operand);
+	void                   EmitFloat64EqualCompare(const Decoder::Instruction& inst);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
 	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);

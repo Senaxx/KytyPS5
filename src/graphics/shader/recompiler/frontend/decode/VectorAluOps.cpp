@@ -952,7 +952,9 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
+    // Bitwise: byte destinations write the low 8 result bits into the selected byte, the same
+    // insertion WriteRawU32 already performs for the integer profiles.
+    {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
               static_cast<size_t>(Vop2SdwaProfile::Count));

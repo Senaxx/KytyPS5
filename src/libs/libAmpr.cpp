@@ -1852,6 +1852,13 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_e
 					return OK;
 				}
 
+				// KYTY_TRACE_APR_READS=1: log every file read (path, offset, size), to map the
+				// assets a scene loads back to the game's table of contents.
+				static const bool trace_reads = std::getenv("KYTY_TRACE_APR_READS") != nullptr;
+				if (trace_reads) {
+					LOGF("APRREAD path=%s offset=0x%" PRIx64 " size=0x%" PRIx64 "\n",
+					     host_path.c_str(), command.file_offset, command.size);
+				}
 				uint64_t bytes_read = 0;
 				auto result = ReadHostFileToGuest(host_path, command.file_offset,
 				                                  command.destination, command.size, &bytes_read);

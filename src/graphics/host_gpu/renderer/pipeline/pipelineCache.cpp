@@ -27,10 +27,12 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <unordered_set>
@@ -193,6 +195,36 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 		return false;
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+// KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of these guest shaders,
+// the same way a shader that fails to compile is skipped. A diagnostic, to see what one shader
+// contributes or to step past one that loses the device.
+bool SkipShaderRequested(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		if (const char* value = std::getenv("KYTY_SKIP_SHADER_HASHES"); value != nullptr) {
+			const std::string_view list(value);
+			size_t                 start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.push_back(
+					    std::strtoull(std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
+				}
+				start = end + 1;
+			}
+		}
+		return result;
+	}();
+	if (std::ranges::find(hashes, shader_hash) == hashes.end()) {
+		return false;
+	}
+	static std::atomic<uint32_t> reported = 0;
+	if (reported.fetch_add(1) < 16) {
+		LOGF("ProgramCache: skipping hash=0x%016" PRIx64 ": KYTY_SKIP_SHADER_HASHES\n", shader_hash);
+	}
 	return true;
 }
 
@@ -378,6 +410,9 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		if (SkipShaderRequested(params.hash)) {
+			return ShaderProgram {};
+		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -399,6 +434,7 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderGuestMemoryRaw,
 		    .userdata                   = &clean_read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
 		if (entry != programs.end()) {
 			{

@@ -19,11 +19,36 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
 #include <limits>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
+
+// KYTY_DISABLE_OPTIMIZATION_HASHES="hash,hash,...": build the pipelines of these guest shaders
+// with VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT, to tell driver code-generation problems apart
+// from emulation problems.
+static bool DisableOptimizationFor(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		if (const char* value = std::getenv("KYTY_DISABLE_OPTIMIZATION_HASHES"); value != nullptr) {
+			std::string list(value);
+			size_t      start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.push_back(std::strtoull(list.substr(start, end - start).c_str(), nullptr, 16));
+				}
+				start = end + 1;
+			}
+		}
+		return result;
+	}();
+	return std::ranges::find(hashes, shader_hash) != hashes.end();
+}
 
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
@@ -641,6 +666,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	if (DisableOptimizationFor(input_info.stage.program->shader_hash)) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		LOGF("PipelineTrace: compute shader 0x%016" PRIx64 " built without optimization\n",
+		     input_info.stage.program->shader_hash);
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 

@@ -42,6 +42,10 @@ void DumpDeviceLossDiagnostics(GraphicContext& graphics);
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
+	// KYTY_ADDRESS_BINDING_REPORT=1: logs every GPU address range bound or unbound, so a
+	// device-fault address can be matched to the object that owned it.
+	vk::DebugUtilsMessengerEXT         address_binding_messenger             = nullptr;
+	bool                               address_binding_report_enabled        = false;
 	vk::PhysicalDevice                 physical_device                       = nullptr;
 	vk::PhysicalDeviceProperties       physical_device_properties            = {};
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};

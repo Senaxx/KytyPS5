@@ -454,6 +454,7 @@ enum class Opcode {
 	V_CMPX_NE_I64,
 	V_CMPX_LE_U64,
 	V_CMPX_NE_U64,
+	V_CMP_EQ_F64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
 	V_CMPX_LE_U32,

@@ -14032,6 +14032,15 @@ public:
       write.pBufferInfo = buffer_infos.data();
       writes.push_back(write);
     }
+    // Shader data carries each storage buffer's bound length in dwords, as
+    // RenderExecutor::RebindBuffers does; shaders bound buffer accesses with it.
+    std::vector<u32> shader_data = compiled.packed_user_data;
+    for (u32 i = 0; i < buffer_infos.size(); i++) {
+      const auto slot = layout.BufferLengthDword() + i;
+      if (slot < shader_data.size()) {
+        shader_data[slot] = static_cast<u32>(buffer_infos[i].range / sizeof(u32));
+      }
+    }
     if (const auto *flattened = Binding(Kind::FlattenedSrt);
         flattened != nullptr) {
       flattened_buffer =
@@ -14049,8 +14058,7 @@ public:
     }
     if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
       user_data_buffer =
-          CreateStorageBuffer(test.name, compiled.packed_user_data,
-                              compiled.packed_user_data.size());
+          CreateStorageBuffer(test.name, shader_data, shader_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -14222,8 +14230,7 @@ public:
                            1, &descriptor_set, 0, nullptr);
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(compiled.packed_user_data.begin(),
-                compiled.packed_user_data.end(),
+      std::copy(shader_data.begin(), shader_data.end(),
                 push_data.dwords.begin() + layout.push_data_start_dword);
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
@@ -20303,6 +20310,34 @@ TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
           {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop2SdwaOrByteDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0xaabbccddu);
+  // Captured: v_or_b32_sdwa v0, v0, v1 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE
+  // src0_sel:BYTE_0 src1_sel:BYTE_2 (0x380002f9 0x02001300).
+  code.push_back(EncodeVop2(0x1c, 0, 249, 1));
+  code.push_back(EncodeVop2Sdwa(0, 3, 2, 0, 2));
+  AppendStoreVgpr(&code, 0, 0);
+  // Every byte destination: (byte 0 of v2) | (byte 1 of v1), the other bytes preserved.
+  AppendVMovLiteral(&code, 2, 0x000000f0u);
+  for (u32 sel = 0; sel < 4; sel++) {
+    AppendVMovLiteral(&code, 10 + sel, 0xa1b2c3d4u);
+    code.push_back(EncodeVop2(0x1c, 10 + sel, 249, 1));
+    code.push_back(EncodeVop2Sdwa(2, sel, 2, 0, 1));
+    AppendStoreVgpr(&code, 10 + sel, 1 + sel);
+  }
+  AppendEnd(&code);
+
+  return {"Vop2SdwaOrByteDestinations",
+          code,
+          {},
+          {0xff223344u, 0xa1b2c3fcu, 0xa1b2fcd4u, 0xa1fcc3d4u, 0xfcb2c3d4u},
+          {O::V_MOV_B32, O::V_OR_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase Vop3CvtPkI16I32Captured() {
   using O = ShaderOpcode;
 
@@ -23652,6 +23687,45 @@ TestCase VectorVop3CompareEqU64OnGpu() {
                  O::S_ENDPGM}};
   test.decoded_counts = {{"V_CMP_EQ_U64 vcc_lo, exec_lo, vcc_lo", 2}};
   return test;
+}
+
+TestCase VectorVop3CompareEqF64OnGpu() {
+  using O = ShaderOpcode;
+
+  struct Case {
+    u32 lo0, hi0, lo1, hi1;
+    u32 src0, src1; // 100: s[100:101], 102: s[102:103], 128: inline 0, 242: inline 1.0
+  };
+  constexpr Case cases[] = {
+      {0, 0x00000000u, 0, 0, 128, 100},           // captured: 0 == +0.0
+      {0, 0x80000000u, 0, 0, 128, 100},           // 0 == -0.0
+      {0, 0x3ff00000u, 0, 0, 128, 100},           // 0 == 1.0
+      {0, 0x7ff80000u, 0, 0x7ff80000u, 100, 102}, // NaN == NaN
+      {0, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // 1.0 == 1.0
+      {0, 0x3ff00000u, 0, 0, 242, 100},           // inline 1.0 is the f64 1.0
+      {1, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // low dwords differ
+  };
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+  u32 index = 0;
+  for (const auto &c : cases) {
+    AppendSMovLiteral(&code, 100, c.lo0);
+    AppendSMovLiteral(&code, 101, c.hi0);
+    AppendSMovLiteral(&code, 102, c.lo1);
+    AppendSMovLiteral(&code, 103, c.hi1);
+    code.push_back(0xd422006au); // v_cmp_eq_f64 vcc_lo, src0, src1
+    code.push_back(c.src0 | (c.src1 << 9u));
+    code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+    AppendStoreVgpr(&code, 2, index++);
+  }
+  AppendEnd(&code);
+
+  return {"VectorVop3CompareEqF64OnGpu",
+          code,
+          {},
+          {1, 1, 0, 0, 1, 1, 0},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_EQ_F64, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
 TestCase VectorVop3CompareNeU64OnGpu() {
@@ -31466,6 +31540,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
+  AddCase(Vop2SdwaOrByteDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
@@ -31556,6 +31631,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
+  AddCase(VectorVop3CompareEqF64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVopcCompareLtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);

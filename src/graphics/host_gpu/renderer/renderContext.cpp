@@ -28,8 +28,11 @@ RenderContext::~RenderContext() {
 	m_command_scheduler.Shutdown();
 }
 
+void WarmUpLocalMemory(GraphicContext& graphics, CommandScheduler& scheduler);
+
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
 	EXIT_IF(m_gpu != nullptr);
+	WarmUpLocalMemory(m_graphics, m_command_scheduler);
 	m_video_out = video_out;
 	m_gpu       = std::make_unique<GuestGpu>(*this);
 }

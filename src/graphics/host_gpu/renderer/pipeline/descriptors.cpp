@@ -326,11 +326,15 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
+	const bool raw_atomic_storage = resource.atomic && uint_resource &&
+	                                (format == Prospero::BufferFormat::k32UInt ||
+	                                 format == Prospero::BufferFormat::k32SInt ||
+	                                 format == Prospero::BufferFormat::k32Float);
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic;
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_float_atomic || raw_atomic_storage ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -377,15 +381,38 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			break;
 		default: EXIT("null image has unsupported numeric class\n");
 	}
+	// The view must match the dimension the shader declares (Vulkan requires the view type to
+	// match the OpTypeImage), so 1D and 3D slots get 1D and 3D null images.
+	auto image_type = Prospero::ImageType::kColor2D;
+	auto view_type  = vk::ImageViewType::e2D;
+	switch (resource.dimension) {
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1D:
+			image_type = Prospero::ImageType::kColor1D;
+			view_type  = vk::ImageViewType::e1D;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim1DArray:
+			image_type = Prospero::ImageType::kColor1D;
+			view_type  = vk::ImageViewType::e1DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DArray:
+		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray:
+			view_type = vk::ImageViewType::e2DArray;
+			break;
+		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
+			image_type = Prospero::ImageType::kColor3D;
+			view_type  = vk::ImageViewType::e3D;
+			break;
+		default: break;
+	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
-	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.type            = image_type;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = 4;
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	desc.view_info.type       = view_type;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -666,6 +693,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
+	// Raw sint stores and all image atomics run as uint operations on the texel bits
 	const auto storage_view_format = storage && (resource.atomic ||
 	                                            format == Prospero::BufferFormat::k32SInt)
 	                                     ? vk::Format::eR32Uint
@@ -1102,6 +1130,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[resource],
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+		prepared.shader_data[layout.BufferLengthDword() + i] =
+		    static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

@@ -1534,9 +1534,14 @@ namespace LibNpEntitlementAccess {
 
 LIB_VERSION("NpEntitlementAccess", 1, "NpEntitlementAccess", 1, 1);
 
-constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER      = -2122514430; /* 0x817D0002 */
-constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT = -2122514425; /* 0x817D0007 */
-constexpr uint32_t NP_ENTITLEMENT_ACCESS_SKU_FLAG_FULL        = 3;
+constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER         = -2122514430; /* 0x817D0002 */
+constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT    = -2122514425; /* 0x817D0007 */
+constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND = -2122514411; /* 0x817D0015 */
+constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_ABORTED           = -2122514410; /* 0x817D0016 */
+constexpr int      NP_ENTITLEMENT_ACCESS_POLL_RET_FINISHED       = 0;
+constexpr int32_t  NP_ENTITLEMENT_ACCESS_INVALID_OFFSET          = -1;
+constexpr int64_t  NP_ENTITLEMENT_ACCESS_REQUEST_ID_OFFSET       = 0x10000000;
+constexpr uint32_t NP_ENTITLEMENT_ACCESS_SKU_FLAG_FULL           = 3;
 
 struct NpEntitlementAccessInitParam {
 	char reserved[32];
@@ -1556,6 +1561,40 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  package_type;
 	uint32_t                  download_status;
 };
+
+struct NpEntitlementAccessRequestEntitlementInfoListParam {
+	size_t   size;
+	uint32_t entitlement_type;
+	int32_t  offset;
+	int32_t  limit;
+	uint32_t sort;
+	uint32_t direction;
+	uint32_t package_type;
+};
+
+struct NpEntitlementAccessUnifiedEntitlementInfo {
+	NpUnifiedEntitlementLabel entitlement_label;
+	uint64_t                  active_date;
+	uint64_t                  inactive_date;
+	uint32_t                  entitlement_type;
+	int32_t                   use_count;
+	int32_t                   use_limit;
+	uint32_t                  package_type;
+	bool                      active_flag;
+	int8_t                    reserved[3];
+};
+
+static_assert(sizeof(NpEntitlementAccessRequestEntitlementInfoListParam) == 32);
+static_assert(sizeof(NpEntitlementAccessUnifiedEntitlementInfo) == 64);
+
+// There is no entitlement server, so a request has already finished when it is created.
+struct NpEntitlementAccessRequest {
+	bool aborted = false;
+};
+
+static std::mutex                                    g_np_entitlement_access_request_mutex;
+static int64_t                                       g_np_entitlement_access_request_count = 0;
+static std::map<int64_t, NpEntitlementAccessRequest> g_np_entitlement_access_requests;
 
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
@@ -1643,12 +1682,127 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfoList(
+    int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* list, uint32_t list_num,
+    const NpEntitlementAccessRequestEntitlementInfoListParam* param, int64_t* request_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_id       = %d\n", user_id);
+	LOGF("\t service_label = %" PRIu32 "\n", service_label);
+	LOGF("\t list          = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(list));
+	LOGF("\t list_num      = %" PRIu32 "\n", list_num);
+	LOGF("\t param         = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("\t request_id    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(request_id));
+
+	if (param == nullptr || request_id == nullptr || (list == nullptr && list_num != 0)) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	LOGF("\t param->size             = %" PRIu64 "\n", static_cast<uint64_t>(param->size));
+	LOGF("\t param->entitlement_type = %" PRIu32 "\n", param->entitlement_type);
+	LOGF("\t param->offset           = %d\n", param->offset);
+	LOGF("\t param->limit            = %d\n", param->limit);
+	LOGF("\t param->sort             = %" PRIu32 "\n", param->sort);
+	LOGF("\t param->direction        = %" PRIu32 "\n", param->direction);
+	LOGF("\t param->package_type     = %" PRIu32 "\n", param->package_type);
+
+	std::scoped_lock lock(g_np_entitlement_access_request_mutex);
+
+	const int64_t id =
+	    NP_ENTITLEMENT_ACCESS_REQUEST_ID_OFFSET + ++g_np_entitlement_access_request_count;
+
+	g_np_entitlement_access_requests[id] = {};
+	*request_id                          = id;
+
+	LOGF("\t *request_id = %" PRId64 "\n", id);
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfoList(
+    int64_t request_id, int* result, NpEntitlementAccessUnifiedEntitlementInfo* list,
+    uint32_t list_num, uint32_t* hit_num, int32_t* next_offset, int32_t* previous_offset) {
+	PRINT_NAME();
+
+	LOGF("\t request_id      = %" PRId64 "\n", request_id);
+	LOGF("\t result          = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(result));
+	LOGF("\t list            = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(list));
+	LOGF("\t list_num        = %" PRIu32 "\n", list_num);
+	LOGF("\t hit_num         = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(hit_num));
+	LOGF("\t next_offset     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(next_offset));
+	LOGF("\t previous_offset = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(previous_offset));
+
+	if (result == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	std::scoped_lock lock(g_np_entitlement_access_request_mutex);
+
+	auto request = g_np_entitlement_access_requests.find(request_id);
+	if (request == g_np_entitlement_access_requests.end()) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
+	}
+
+	// The console owns no unified entitlements (consumables, virtual currency, subscriptions), so
+	// every list is empty. Add-ons are reported by GetAddcontEntitlementInfoList instead. The
+	// offsets must be INVALID_OFFSET: callers page by feeding *next_offset into the next request.
+	*result = (request->second.aborted ? NP_ENTITLEMENT_ACCESS_ERROR_ABORTED : 0);
+	if (hit_num != nullptr) {
+		*hit_num = 0;
+	}
+	if (next_offset != nullptr) {
+		*next_offset = NP_ENTITLEMENT_ACCESS_INVALID_OFFSET;
+	}
+	if (previous_offset != nullptr) {
+		*previous_offset = NP_ENTITLEMENT_ACCESS_INVALID_OFFSET;
+	}
+
+	return NP_ENTITLEMENT_ACCESS_POLL_RET_FINISHED;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessAbortRequest(int64_t request_id) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+
+	std::scoped_lock lock(g_np_entitlement_access_request_mutex);
+
+	auto request = g_np_entitlement_access_requests.find(request_id);
+	if (request == g_np_entitlement_access_requests.end()) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
+	}
+
+	request->second.aborted = true;
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+
+	std::scoped_lock lock(g_np_entitlement_access_request_mutex);
+
+	if (g_np_entitlement_access_requests.erase(request_id) == 0) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_REQUEST_NOT_FOUND;
+	}
+
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
 	LIB_FUNC("TFyU+KFBv54",
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
+	LIB_FUNC("uCZf2L27th8",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfoList);
+	LIB_FUNC("nAEqawEZG5s",
+	         LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfoList);
+	LIB_FUNC("HFcQl9TMcFQ", LibNpEntitlementAccess::NpEntitlementAccessAbortRequest);
+	LIB_FUNC("Z0eQj8m7XA8", LibNpEntitlementAccess::NpEntitlementAccessDeleteRequest);
 }
 
 } // namespace LibNpEntitlementAccess

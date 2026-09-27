@@ -1,0 +1,26 @@
+#version 450
+
+// Diagnostic (KYTY_LOCAL_MEMORY_WARMUP): a dispatch whose per-thread array is indexed at run time,
+// so the driver must place it in local memory. Running it once at start-up makes the driver size its
+// local-memory area for ARRAY_SIZE dwords per thread before any guest work is recorded.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(constant_id = 0) const uint ARRAY_SIZE = 1024u;
+
+layout(std430, binding = 0) buffer result_buf {
+    uint result[];
+};
+
+void main() {
+    float scratch[ARRAY_SIZE];
+    const uint id = gl_GlobalInvocationID.x;
+    for (uint i = 0u; i < ARRAY_SIZE; ++i) {
+        scratch[(i * 7u + id) % ARRAY_SIZE] = float(i ^ id);
+    }
+    float sum = 0.0;
+    for (uint i = 0u; i < 16u; ++i) {
+        sum += scratch[(i * 13u + id * 3u) % ARRAY_SIZE];
+    }
+    result[id & 63u] = floatBitsToUint(sum);
+}

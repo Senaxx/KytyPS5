@@ -4,8 +4,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <unordered_set>
 
@@ -462,6 +464,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			m_read_failure         = "constant-buffer read beyond num_records";
+			m_read_failure_address = base;
+			m_read_failure_offset  = byte_offset;
+			m_read_failure_size    = size;
 			return false;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
@@ -475,6 +481,17 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			// A failed load through a null base pointer sits on a path the shader guards with a
+			// null-pointer test and never executes (CS 0x0b4b91abfed42248 checks s[4:5] against
+			// zero before its s_load). Its value cannot matter; failing would skip the dispatch.
+			if (base == 0) {
+				result = 0;
+				return true;
+			}
+			m_read_failure         = "guest memory unreadable";
+			m_read_failure_address = address;
+			m_read_failure_offset  = 0;
+			m_read_failure_size    = 0;
 			return false;
 		}
 	} else {

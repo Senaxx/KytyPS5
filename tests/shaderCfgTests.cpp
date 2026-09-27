@@ -1326,6 +1326,42 @@ void TestSpirvRequirementsAnalysis() {
             requirements.pixel_valid_mask,
         "consolidated SPIR-V requirements missed an IR dependency");
 
+  Check(requirements.function_lds_dwords == 1u,
+        "a constant LDS address did not size the function LDS array");
+
+  {
+    // LDS in a non-compute stage is a function-scope array per invocation, which NVIDIA keeps
+    // in local memory. A lane-private slot at lane * 4 + 1792 (PS 0x4fa6faa57bc9a97a) needs 512
+    // dwords, not the 8192-dword default that cost 32 KB per pixel.
+    Program lane_private;
+    lane_private.stage = ShaderType::Pixel;
+    lane_private.block_storage.push_back(std::make_unique<Block>());
+    auto *lane_block = lane_private.block_storage.back().get();
+    lane_private.blocks.push_back(lane_block);
+    lane_private.memory_info.push_back({.kind = ResourceKind::Lds, .offset = 1792});
+    lane_private.memory_info.push_back({.kind = ResourceKind::Lds});
+    auto &lane = lane_block->AppendNewInst(ValueOpcode::LaneId);
+    auto &address = lane_block->AppendNewInst(ValueOpcode::ShiftLeftLogical32,
+                                              {Value(&lane), Value(2u)});
+    auto &store = lane_block->AppendNewInst(
+        ValueOpcode::WriteSharedU32, {Value(&address), Value(0u), Value(true)});
+    store.SetFlags(MemoryFlags{.index = 0});
+    Check(ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(lane_private)
+                  .function_lds_dwords == 512u,
+          "a lane-private LDS address was not bounded by the wave size");
+
+    // An address loaded from memory cannot be bounded: keep the default size.
+    auto &loaded = lane_block->AppendNewInst(ValueOpcode::LoadSharedU32,
+                                             {Value(&address), Value(true)});
+    loaded.SetFlags(MemoryFlags{.index = 0});
+    auto &dependent = lane_block->AppendNewInst(ValueOpcode::LoadSharedU32,
+                                                {Value(&loaded), Value(true)});
+    dependent.SetFlags(MemoryFlags{.index = 1});
+    Check(ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(lane_private)
+                  .function_lds_dwords == 0u,
+          "an unbounded LDS address shrank the function LDS array");
+  }
+
   program.stage = ShaderType::Compute;
   const auto compute_requirements =
       ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
@@ -6813,7 +6849,9 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check((source.find("OpArrayLength") != std::string::npos),
+  // The bound buffer length now comes from shader data (rendering_menu.patch: NVIDIA can
+  // report OpArrayLength as zero for ranges over 2 GiB), and the store compares against it.
+  Check((source.find("OpULessThan") != std::string::npos),
         "formatted store SPIR-V lacks runtime storage-buffer bounds check");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
@@ -7818,6 +7856,96 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
               "compilation");
 }
 #endif
+
+// Every conditional branch that Structurize leaves without a selection merge must be SPIR-V loop
+// control: one of its targets is the innermost loop's merge or continue block.
+void CheckLoopControlTargetsMergeOrContinue(const ShaderRecompiler::CFG::Graph &graph) {
+  for (const auto &block : graph.blocks) {
+    const auto &term = block.terminator;
+    if (term.kind != ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch ||
+        term.loop_header || term.merge_block != UINT32_MAX) {
+      continue;
+    }
+    const ShaderRecompiler::CFG::NaturalLoop *innermost = nullptr;
+    for (const auto &loop : graph.natural_loops) {
+      if (std::find(loop.body_blocks.begin(), loop.body_blocks.end(), block.id) !=
+              loop.body_blocks.end() &&
+          (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
+        innermost = &loop;
+      }
+    }
+    Check(innermost != nullptr, "unmerged conditional branch outside any loop");
+    const auto is_control = [&](uint32_t target) {
+      return target == innermost->merge || target == innermost->continue_block ||
+             (block.id == innermost->continue_block && target == innermost->header);
+    };
+    Check(is_control(term.true_block) || is_control(term.false_block),
+          "unmerged conditional branch leaves the loop through a block that is not its merge");
+  }
+}
+
+// Captured CS 0x637ad82dbee9dfa9: a binary search whose loop has several exits. One conditional
+// leaves through an exit block that is not the loop's merge, which produced invalid SPIR-V
+// ("Selection must be structured").
+void TestCapturedLoopExitThroughNonMergeBlock() {
+  const uint32_t shader[] = {
+      0xbfa00003u, 0xf4201a84u, 0xfa000004u, 0xbf8cc07fu, 0xbf096a10u, 0xbf85011fu,
+      0xf4200284u, 0xfa000000u, 0xbf8cc07fu, 0xbf0a0a02u, 0xbf840001u, 0xbf920001u,
+      0xbeeb0380u, 0xbf086b0au, 0xbf850003u, 0xbf920001u, 0xbe8b0380u, 0xbf820015u,
+      0x816a6b0au, 0x900b816au, 0x936a8c0bu, 0xf4240200u, 0xd4000000u, 0xbf8cc07fu,
+      0x816a0908u, 0xbf0a0810u, 0xbf800000u, 0x8509807eu, 0xbf096a10u, 0xbf800000u,
+      0x856a807eu, 0x886a096au, 0xbf860006u, 0x816a810bu, 0xbf0a0810u, 0xbf800000u,
+      0x856b6a6bu, 0x850a0a0bu, 0xbf82ffe6u, 0x936a8c0bu, 0xf4280206u, 0xfa000620u,
+      0xf4200440u, 0xd4000008u, 0xf4201a80u, 0xd4000000u, 0xbf8cc07fu, 0x8f6b8611u,
+      0x81906a10u, 0xf4200484u, 0xd6000014u, 0xbf8cc07fu, 0x97ea1210u, 0xf4280006u,
+      0xfa0005a0u, 0xbf8cc07fu, 0xf4200500u, 0xd4000000u, 0xbf8cc07fu, 0x93eaff14u,
+      0x00070011u, 0x816a816au, 0x7d8600f9u, 0x0686eb6au, 0xbeea076bu, 0xbefe036au,
+      0xbf8800e2u, 0x7e020280u, 0xbe93446bu, 0xbf880017u, 0x34000081u, 0x8f6a8414u,
+      0x8f6b8611u, 0x8715ff6au, 0x001ffff0u, 0x906a9814u, 0xf4201ac4u, 0xd6000018u,
+      0x976a156au, 0xbf8cc07fu, 0x9314986bu, 0x816b826au, 0x816a1412u, 0xd76d0001u,
+      0x0400d66au, 0x360002c4u, 0x34020283u, 0xe0301000u, 0x80000000u, 0x36020298u,
+      0xbf8c3f70u, 0xd5480001u, 0x02420300u, 0x8f6b8611u, 0xbefe0313u, 0xf4201a84u,
+      0xd6000000u, 0xbf8cc07fu, 0xd7470000u, 0x0206026au, 0xf4280006u, 0xfa0002e0u,
+      0xf4201a84u, 0xd600001cu, 0xbf8cc07fu, 0xbf0d846au, 0xe00c2000u, 0x80000000u,
+      0xbf8c3f70u, 0xd5480003u, 0x02110b03u, 0x34000103u, 0x34080303u, 0x34060503u,
+      0xbf840010u, 0x8f008611u, 0xf4241a84u, 0x00000020u, 0xbf8cc07fu, 0x8f6a906au,
+      0x8f6b906bu, 0x916a886au, 0x916b886bu, 0x4a00006au, 0xf4201a84u, 0x00000028u,
+      0xbf8cc07fu, 0x8f6a906au, 0x4a08086bu, 0x916a886au, 0x4a06066au, 0x7e020b00u,
+      0x8f6a8611u, 0x7e040b04u, 0xf4240004u, 0xd4000038u, 0x7e000b03u, 0xbf8cc07fu,
+      0x10080201u, 0x81081000u, 0x100a0401u, 0x10060001u, 0xbeea407eu, 0x021008ffu,
+      0x7f800000u, 0x1e1010fau, 0xff011108u, 0x1e1010fau, 0xff011208u, 0x1e1010fau,
+      0xff011408u, 0x1e1010fau, 0xff011808u, 0xbefe036au, 0xd7600002u, 0x00011f08u,
+      0xd7600003u, 0x00013f08u, 0x1e0c06f9u, 0x86860602u, 0xbeea406au, 0x021208ffu,
+      0xff800000u, 0x02180affu, 0xff800000u, 0x201212fau, 0xff011109u, 0x201818fau,
+      0xff01110cu, 0x201212fau, 0xff011209u, 0x201818fau, 0xff01120cu, 0x201212fau,
+      0xff011409u, 0x201818fau, 0xff01140cu, 0x201212fau, 0xff011809u, 0x201818fau,
+      0xff01180cu, 0xbefe036au, 0xd760000au, 0x00011f09u, 0xd760000bu, 0x00013f09u,
+      0xd760000cu, 0x00011f0cu, 0xd760000du, 0x00013f0cu, 0x201416f9u, 0x8686060au,
+      0x20161af9u, 0x8686060cu, 0x060c14f9u, 0x0606c606u, 0xbeea406au, 0x021e06ffu,
+      0xff800000u, 0x201e1efau, 0xff01110fu, 0x201e1efau, 0xff01120fu, 0x201e1efau,
+      0xff01140fu, 0x201e1efau, 0xff01180fu, 0xbefe036au, 0xd760000eu, 0x00011f0fu,
+      0xd760000fu, 0x00013f0fu, 0x201c1ef9u, 0x8686060eu, 0xbeea406au, 0x02220affu,
+      0x7f800000u, 0x022606ffu, 0x7f800000u, 0x1e2222fau, 0xff011111u, 0x1e2626fau,
+      0xff011113u, 0x1e2222fau, 0xff011211u, 0x1e2626fau, 0xff011213u, 0x1e2222fau,
+      0xff011411u, 0x1e2626fau, 0xff011413u, 0x1e2222fau, 0xff011811u, 0x1e2626fau,
+      0xff011813u, 0xbefe036au, 0x7e040506u, 0xd7600010u, 0x00011f11u, 0xd7600011u,
+      0x00013f11u, 0xd7600012u, 0x00011f13u, 0xd7600013u, 0x00013f13u, 0xd5410001u,
+      0x800a0201u, 0x1e0a22f9u, 0x86860610u, 0x1e0626f9u, 0x86860612u, 0x10020301u,
+      0x060816f9u, 0x0606c605u, 0x06061cf9u, 0x0606c603u, 0x7e060504u, 0x7ed60503u,
+      0xd5410002u, 0x800e0401u, 0xd5410000u, 0x81ae0001u, 0x3e020502u, 0x3e020100u,
+      0xbeea406au, 0xbf048008u, 0x020402ffu, 0xff800000u, 0x200404fau, 0xff011102u,
+      0x200404fau, 0xff011202u, 0x200404fau, 0xff011402u, 0x200404fau, 0xff011802u,
+      0xbefe036au, 0xd7600000u, 0x00011f02u, 0xd7600001u, 0x00013f02u, 0x200002f9u,
+      0x86860600u, 0xbf840001u, 0xbf920001u, 0x877e7e81u, 0x7e080208u, 0x7e066700u,
+      0x7e000202u, 0x7e020203u, 0x7e04026bu, 0xe0782000u, 0x80010004u, 0xbf810000u,
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  CheckLoopControlTargetsMergeOrContinue(graph);
+}
 
 void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const uint32_t shader[] = {
@@ -9647,8 +9775,10 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
+  // The bound length comes from shader data rather than OpArrayLength
+  // (rendering_menu.patch); the bounds check is the unsigned compare against it.
   const auto array_length =
-      source.find("OpArrayLength", 0);
+      source.find("OpULessThan", 0);
   const auto bounds_branch = source.find("OpBranchConditional", array_length);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
@@ -9692,8 +9822,9 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
+    // Bound lengths come from shader data, not OpArrayLength (rendering_menu.patch).
     const auto array_length =
-        source.find("OpArrayLength", 0);
+        source.find("OpULessThan", 0);
     const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic = source.find(test.spirv, 0);
     const auto memory_barrier =
@@ -9745,8 +9876,9 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
+    // Bound lengths come from shader data, not OpArrayLength (rendering_menu.patch).
     const auto array_length =
-        source.find("OpArrayLength", 0);
+        source.find("OpULessThan", 0);
     const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic =
         source.find(test.spirv_name, 0);
@@ -14089,7 +14221,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                     .instructions = 211,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    // The buffer length is a shader-data load, not
+                                    // OpArrayLength (rendering_menu.patch).
+                                    .loads = 10,
                                     .stores = 4,
                                     .array_lengths = 2,
                                     .phis = 5,
@@ -14327,6 +14461,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher();
 #endif
   TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured();
+  TestCapturedLoopExitThroughNonMergeBlock();
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();

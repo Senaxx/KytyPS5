@@ -66,6 +66,8 @@ static void PrintUsage() {
 	::printf("  --vulkan-validation <true|false>     Enable Vulkan validation.\n");
 	::printf("  --gpu-assisted-validation <t|f>      Bounds-check shader accesses on the GPU.\n"
 	         "                                       Implies --vulkan-validation; very slow.\n");
+	::printf("  --vulkan-validation-fatal <t|f>      Exit on the first validation error (default\n"
+	         "                                       true); false logs errors and continues.\n");
 	::printf("  --shader-validation <true|false>     Enable shader validation.\n");
 	::printf("  --tessellation                      Draw tessellation patches; skipped by default.\n");
 	::printf("  --shader-optimization-type <value>   None, Size, or Performance.\n");
@@ -82,6 +84,8 @@ static void PrintUsage() {
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 	::printf("  --bindless                           Sample heap-indexed images through bindless arrays.\n");
+	::printf("  --no-float-image-atomics             Skip shaders that run integer image atomics on R32\n"
+	         "                                       float images (they run by default).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
 #endif
@@ -232,6 +236,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			options.config.bindless_images_enabled = true;
 			continue;
 		}
+		if (arg == "--float-image-atomics" || arg == "--no-float-image-atomics") {
+			options.config.float_image_atomics_enabled = arg == "--float-image-atomics";
+			continue;
+		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (arg == "--redzone") {
@@ -356,6 +364,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--gpu-assisted-validation") {
 			if (!ParseBool(value, options.config.gpu_assisted_validation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--vulkan-validation-fatal") {
+			if (!ParseBool(value, options.config.vulkan_validation_fatal)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}

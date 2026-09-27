@@ -28,8 +28,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <limits>
 #include <mutex>
 #include <span>
@@ -37,6 +41,28 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
+// with their user data, to see which guest buffers they would have written.
+static void LogSkippedDispatch(const HW::ComputeShaderInfo& cs, const char* groups) {
+	static const uint32_t budget = [] {
+		const char* value = std::getenv("KYTY_LOG_SKIPPED_DISPATCHES");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	static std::atomic<uint32_t> used {0};
+	if (budget == 0 || used.fetch_add(1, std::memory_order_relaxed) >= budget) {
+		return;
+	}
+	std::string user_data;
+	for (uint32_t i = 0; i < cs.cs_user_sgpr.count && i < HW::UserSgprInfo::SGPRS_MAX; i++) {
+		char word[12];
+		std::snprintf(word, sizeof(word), " %08x", cs.cs_user_sgpr.value[i]);
+		user_data += word;
+	}
+	LOGF("Skipped dispatch: hash=0x%016" PRIx64 " groups=%s user_data=%s\n",
+	     ShaderDeclaredHash(cs.cs_regs.data_addr), groups, user_data.c_str());
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -261,6 +287,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}
 	if (!compute_program) {
+		char groups[48];
+		std::snprintf(groups, sizeof(groups), "%ux%ux%u", thread_group_x, thread_group_y,
+		              thread_group_z);
+		LogSkippedDispatch(cs_regs, groups);
 		ResetBindings();
 		return;
 	}
@@ -426,6 +456,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
+		LogSkippedDispatch(cs_regs, "indirect");
 		ResetBindings();
 		return;
 	}

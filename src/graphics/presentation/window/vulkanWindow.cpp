@@ -10,6 +10,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -24,11 +25,15 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -406,6 +411,8 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
+	// Aftermath must be enabled before the device exists (KYTY_AFTERMATH_DLL, opt-in).
+	Aftermath::Initialize();
 	const auto physical_device = graphics.physical_device;
 	const auto queue_family    = graphics.queue_family;
 	EXIT_IF(physical_device == nullptr);
@@ -674,6 +681,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.shader_device_clock_enabled = true;
 		}
 	}
+	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
+	if (graphics.address_binding_report_enabled) {
+		address_binding.reportAddressBinding = VK_TRUE;
+		address_binding.pNext                = const_cast<void*>(create_info.pNext);
+		create_info.pNext                    = &address_binding;
+		LOGF("Vulkan address binding report: enabled\n");
+	}
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
 	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
@@ -779,6 +793,20 @@ static void VulkanGetExtensions(VulkanExtensions& r) {
 	}
 }
 
+// With --vulkan-validation-fatal false, each message ID is logged at most this many times.
+static bool ShouldLogValidationMessage(const char* message_id) {
+	constexpr uint32_t                               MaxPerMessage = 8;
+	static std::mutex                                mutex;
+	static std::unordered_map<std::string, uint32_t> counts;
+	std::lock_guard                                  lock(mutex);
+	const auto count = ++counts[message_id != nullptr ? message_id : ""];
+	if (count == MaxPerMessage + 1) {
+		LOGF("[Vulkan]: further '%s' messages are not logged\n",
+		     message_id != nullptr ? message_id : "");
+	}
+	return count <= MaxPerMessage;
+}
+
 static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
     vk::DebugUtilsMessageSeverityFlagBitsEXT      message_severity,
     vk::DebugUtilsMessageTypeFlagsEXT             message_types,
@@ -825,14 +853,18 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
-	if (error) {
+	if (error && Config::VulkanValidationFatal()) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
 	}
 
-	if (!skip) {
+	if (!skip && (!error || ShouldLogValidationMessage(callback_data->pMessageIdName))) {
 		LOGF_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
+		if (error) {
+			std::printf("[Vulkan][%s]: %s\n", severity_str, callback_data->pMessage);
+			std::fflush(stdout);
+		}
 	}
 
 	if (debug_printf) {
@@ -842,6 +874,45 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		}
 	}
 
+	return VK_FALSE;
+}
+
+static bool AddressBindingReportRequested() {
+	const char* value = std::getenv("KYTY_ADDRESS_BINDING_REPORT");
+	return value != nullptr && value[0] == '1';
+}
+
+// Logs VK_EXT_device_address_binding_report events: one line per bound or unbound range.
+static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanAddressBindingCallback(
+    vk::DebugUtilsMessageSeverityFlagBitsEXT /*message_severity*/,
+    vk::DebugUtilsMessageTypeFlagsEXT             message_types,
+    const vk::DebugUtilsMessengerCallbackDataEXT* callback_data, void* /*user_data*/) {
+	if (callback_data == nullptr ||
+	    !(message_types & vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding)) {
+		return VK_FALSE;
+	}
+	const auto* next = static_cast<const vk::BaseInStructure*>(callback_data->pNext);
+	while (next != nullptr &&
+	       next->sType != vk::StructureType::eDeviceAddressBindingCallbackDataEXT) {
+		next = next->pNext;
+	}
+	if (next == nullptr) {
+		return VK_FALSE;
+	}
+	const auto* binding  = reinterpret_cast<const vk::DeviceAddressBindingCallbackDataEXT*>(next);
+	const auto  type     = callback_data->objectCount != 0
+	                           ? vk::to_string(callback_data->pObjects[0].objectType)
+	                           : std::string("?");
+	const auto  handle   = callback_data->objectCount != 0 ? callback_data->pObjects[0].objectHandle
+	                                                       : 0ull;
+	LOGF("ADDRBIND %s type=%s handle=0x%016" PRIx64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
+	     " end=0x%016" PRIx64 "%s\n",
+	     binding->bindingType == vk::DeviceAddressBindingTypeEXT::eBind ? "bind" : "unbind",
+	     type.c_str(), handle, static_cast<uint64_t>(binding->baseAddress),
+	     static_cast<uint64_t>(binding->size),
+	     static_cast<uint64_t>(binding->baseAddress + binding->size),
+	     (binding->flags & vk::DeviceAddressBindingFlagBitsEXT::eInternalObject) ? " internal"
+	                                                                           : "");
 	return VK_FALSE;
 }
 
@@ -976,6 +1047,21 @@ void WindowContext::CreateVulkan() {
 			EXIT("Could not create debug messenger");
 		}
 	}
+	if (AddressBindingReportRequested() &&
+	    HasExtension(r.required_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+		vk::DebugUtilsMessengerCreateInfoEXT binding_create_info {};
+		binding_create_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
+		                                      vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose;
+		binding_create_info.messageType =
+		    vk::DebugUtilsMessageTypeFlagBitsEXT::eDeviceAddressBinding;
+		binding_create_info.pfnUserCallback = VulkanAddressBindingCallback;
+		if (VulkanCreateDebugUtilsMessengerEXT(graphic_ctx.instance, &binding_create_info, nullptr,
+		                                       &graphic_ctx.address_binding_messenger) !=
+		    vk::Result::eSuccess) {
+			EXIT("Could not create address binding messenger");
+		}
+		LOGF("Vulkan address binding report: messenger created\n");
+	}
 
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
 	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
@@ -1057,6 +1143,12 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
 		}
+		if (graphic_ctx.address_binding_messenger != nullptr &&
+		    HasExtension(available_extensions,
+		                 VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+			graphic_ctx.address_binding_report_enabled = true;
+		}
 		if (HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
 		}
@@ -1131,6 +1223,11 @@ WindowContext::~WindowContext() {
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
+	}
+	if (graphic_ctx.address_binding_messenger != nullptr) {
+		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.address_binding_messenger,
+		                                                   nullptr);
+		graphic_ctx.address_binding_messenger = nullptr;
 	}
 	if (graphic_ctx.debug_messenger != nullptr) {
 		graphic_ctx.instance.destroyDebugUtilsMessengerEXT(graphic_ctx.debug_messenger, nullptr);

@@ -295,6 +295,22 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(local_memory_warmup_shader_source "${gpu_tiler_shader_dir}/local_memory_warmup.comp")
+set(local_memory_warmup_shader_spv "${gpu_tiler_generated_dir}/local_memory_warmup.spv")
+set(local_memory_warmup_shader_header "${gpu_tiler_generated_dir}/local_memory_warmup_spv.h")
+add_custom_command(
+	OUTPUT "${local_memory_warmup_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${local_memory_warmup_shader_spv}" "${local_memory_warmup_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${local_memory_warmup_shader_spv}
+	        -DOUTPUT=${local_memory_warmup_shader_header}
+	        -DSYMBOL=LOCAL_MEMORY_WARMUP_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${local_memory_warmup_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${local_memory_warmup_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")

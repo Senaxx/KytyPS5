@@ -55,12 +55,52 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
 		    ConstantU32(state, 0xffu));
+		state.memory_dword_lengths[i] =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
 	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	if (workgroup != nullptr) {
+		return workgroup->lds_size_dwords;
+	}
+	return state.requirements.function_lds_dwords != 0 ? state.requirements.function_lds_dwords
+	                                                   : 8192u;
+}
+
+// KYTY_LDS_PAD_DWORDS=<n>, optionally with KYTY_LDS_PAD_HASHES="hash,hash,...": declare the
+// workgroup LDS array with at least n dwords. Accesses are still bounds-checked against the guest
+// LDS size. A diagnostic: NVIDIA's compiler spills registers into workgroup memory the shader
+// leaves unused, and a larger array pushes those spills to local memory instead.
+static uint32_t LdsPadDwords(uint64_t shader_hash) {
+	static const auto setting = [] {
+		struct Setting {
+			uint32_t              dwords = 0;
+			std::vector<uint64_t> hashes;
+		} result;
+		if (const char* value = std::getenv("KYTY_LDS_PAD_DWORDS"); value != nullptr) {
+			result.dwords = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		}
+		if (const char* value = std::getenv("KYTY_LDS_PAD_HASHES"); value != nullptr) {
+			const std::string list(value);
+			size_t            start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.hashes.push_back(
+					    std::strtoull(list.substr(start, end - start).c_str(), nullptr, 16));
+				}
+				start = end + 1;
+			}
+		}
+		return result;
+	}();
+	if (!setting.hashes.empty() &&
+	    std::find(setting.hashes.begin(), setting.hashes.end(), shader_hash) == setting.hashes.end()) {
+		return 0;
+	}
+	return setting.dwords;
 }
 
 void EnsureLdsStorage(EmitterState& state) {
@@ -70,10 +110,11 @@ void EnsureLdsStorage(EmitterState& state) {
 	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
+	const auto dwords = std::max(LdsDwordCount(state), LdsPadDwords(state.program.shader_hash));
 	const auto define = [&](uint32_t type, uint32_t bytes) {
 		const auto array = state.builder.DecoratedType(
 		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,
-		    ConstantU32(state, std::max(LdsDwordCount(state) * 4u / bytes, 1u)));
+		    ConstantU32(state, std::max(dwords * 4u / bytes, 1u)));
 		const auto block = state.builder.DecoratedType(
 		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
 		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
@@ -88,7 +129,7 @@ void EnsureLdsStorage(EmitterState& state) {
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
-		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, dwords),
 		    spv::StorageClassWorkgroup);
 	}
 	state.builder.AddName(state.lds_variable, "lds_dwords");
@@ -111,9 +152,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
+	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB.
+	// Use the actual bound range, including alignment, without truncating guest memory.
+	access.length = state.memory_dword_lengths[array_index];
 	return access;
 }
 

@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/logging/log.h"
+#include "graphics/host_gpu/aftermath.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <array>
@@ -109,6 +110,7 @@ static void DumpDeviceFault(GraphicContext& graphics) {
 }
 
 void DumpDeviceLossDiagnostics(GraphicContext& graphics) {
+	Aftermath::WaitForCrashDump();
 	DumpDeviceFault(graphics);
 	if (!graphics.diagnostic_checkpoints_enabled || graphics.queue == nullptr) {
 		return;

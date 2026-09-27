@@ -2,6 +2,10 @@
 
 #include <SDL3/SDL.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -82,6 +86,31 @@ struct MouseJoystickState {
 
 MouseJoystickState g_mouse;
 SDL_Window*        g_mouse_window = nullptr;
+
+#ifdef _WIN32
+UINT g_diagnostic_key_message = 0;
+
+bool SDLCALL DiagnosticInputMessage(void* userdata, MSG* message) {
+	auto* window = static_cast<SDL_Window*>(userdata);
+	const auto hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+	    SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+	if (message->message != g_diagnostic_key_message || message->hwnd != hwnd) {
+		return true;
+	}
+	if (message->lParam != 0 && message->lParam != 1) {
+		return false;
+	}
+	SDL_Event event {};
+	event.type = message->lParam != 0 ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+	event.key.windowID = SDL_GetWindowID(window);
+	event.key.key = static_cast<SDL_Keycode>(message->wParam);
+	event.key.scancode = SDL_GetScancodeFromKey(event.key.key, nullptr);
+	event.key.down = message->lParam != 0;
+	SDL_PushEvent(&event);
+	return false;
+}
+#endif
+
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -385,9 +414,25 @@ int PollMouse(uint64_t now_ms) {
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
+#ifdef _WIN32
+	// Opt-in local automation follows the normal key mapping without stealing focus.
+	const char* diagnostic_input = std::getenv("KYTY_DIAGNOSTIC_INPUT");
+	if (diagnostic_input != nullptr && std::string_view(diagnostic_input) == "1") {
+		g_diagnostic_key_message = RegisterWindowMessageW(L"Kyty.Diagnostic.Key");
+		if (g_diagnostic_key_message != 0) {
+			SDL_SetWindowsMessageHook(DiagnosticInputMessage, window);
+		}
+	}
+#endif
 }
 
 void HostInputShutdown() {
+#ifdef _WIN32
+	if (g_diagnostic_key_message != 0) {
+		SDL_SetWindowsMessageHook(nullptr, nullptr);
+		g_diagnostic_key_message = 0;
+	}
+#endif
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();

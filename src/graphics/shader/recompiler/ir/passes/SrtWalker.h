@@ -17,6 +17,8 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Accept integer image atomics on k32Float descriptors (run as uint atomics on the raw bits).
+	bool                      float_image_atomics        = false;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -57,6 +59,11 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// The last raw read that failed, for RefreshFlatBuffer's report.
+	const char* m_read_failure         = nullptr;
+	uint64_t    m_read_failure_address = 0;
+	uint64_t    m_read_failure_offset  = 0;
+	uint64_t    m_read_failure_size    = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
