@@ -4,9 +4,29 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
+
+// KYTY_MESH_CULL selects how much of the primitive guard below is emitted, for A/B runs:
+// "off" emits none of it, "zero" only the zero-position test, anything else everything.
+enum class MeshCull { Off, Zero, Full };
+
+MeshCull MeshCullMode() {
+	static const MeshCull mode = [] {
+		const char* value = std::getenv("KYTY_MESH_CULL");
+		if (value != nullptr && std::strcmp(value, "off") == 0) {
+			return MeshCull::Off;
+		}
+		if (value != nullptr && std::strcmp(value, "zero") == 0) {
+			return MeshCull::Zero;
+		}
+		return MeshCull::Full;
+	}();
+	return mode;
+}
 
 uint32_t MeshArray(EmitterState& state, spv::StorageClass storage, uint32_t type, uint32_t count) {
 	const auto array = state.builder.Type(spv::OpTypeArray, type, ConstantU32(state, count));
@@ -37,6 +57,9 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 uint32_t MeshCount(EmitterState& state, uint32_t field, uint32_t maximum) {
 	const auto count  = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
 	                             TypeU32(state), ConstantU32(state, field));
+	if (MeshCullMode() != MeshCull::Full) {
+		return count;
+	}
 	const auto limit  = ConstantU32(state, maximum);
 	const auto within = Binary(state, spv::OpULessThanEqual, TypeBool(state), count, limit);
 	const auto result = state.builder.AllocateId();
@@ -83,6 +106,9 @@ uint32_t UnusableVertex(EmitterState& state, uint32_t vertex, uint32_t vertices)
 	    Binary(state, spv::OpINotEqual, TypeBool(state),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), shifted, ConstantU32(state, 1)),
 	           ConstantU32(state, 0));
+	if (MeshCullMode() != MeshCull::Full) {
+		return marked;
+	}
 	const auto out_of_range = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), out_of_range, in_range);
 	return Binary(state, spv::OpLogicalOr, TypeBool(state), marked, out_of_range);
@@ -141,7 +167,8 @@ void DefineMeshOutputs(EmitterState& state) {
 	// A vertex at (0,0,0,0), which an out-of-bounds vertex fetch exports, leaves nothing of its
 	// primitives on AMD hardware; NVIDIA rasterises them as screen-wide wedges. The vertex-shader
 	// path clips them with its zero-position guard; here a bit per vertex culls the primitives.
-	if (std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+	if (MeshCullMode() != MeshCull::Off &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		    return output.kind == IR::StageOutputKind::Position;
 	    })) {
 		state.mesh_zero_position_words = (mesh.max_vertices + 31u) / 32u;
