@@ -426,19 +426,8 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		lookup_key.function_code.clear();
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			std::string reason;
-			if (!ShaderRecompiler::Decoder::InlineShaderFunctions(
-			        params.code, params.Base(), user_data,
-			        [&](uint64_t address, std::span<uint32_t> words) {
-				        return ReadShaderGuestMemoryRaw(nullptr, address, words);
-			        },
-			        lookup_key.function_code, reason, input_info.wave_size)) {
-				static std::atomic<uint32_t> reports {0};
-				if (reports.fetch_add(1) < 16) {
-					::printf("Shader function expansion hash=%016" PRIx64 ": %s\n",
-					         params.hash, reason.c_str());
-				}
-			}
+			ExpandShaderFunctions(params, user_data, input_info.wave_size,
+			                      lookup_key.function_code);
 		}
 		if (unsupported.contains(lookup_key)) {
 			return ShaderProgram {};
@@ -615,9 +604,29 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
-	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
-	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
-	ProgramKey                                                  lookup_key;
+	// Shader function expansion decodes the shader and every callee, and a shader with table
+	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
+	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
+	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+		std::string reason;
+		if (!function_expander.Expand(
+		        params.code, params.Base(), user_data,
+		        [](uint64_t address, std::span<uint32_t> words) {
+			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
+		        },
+		        expanded, reason, wave_size)) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1) < 16) {
+				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
+				         reason.c_str());
+			}
+		}
+	}
+
+	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash>    programs;
+	std::unordered_set<ProgramKey, ProgramKeyHash>                 unsupported;
+	ShaderRecompiler::Decoder::ShaderFunctionExpander             function_expander;
+	ProgramKey                                                     lookup_key;
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	bool                                                        bindless_images = false;

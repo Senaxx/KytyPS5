@@ -5,10 +5,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
@@ -225,33 +228,46 @@ bool RelocateBranches(std::vector<uint32_t>& code, Branches& branches, std::stri
 	return true;
 }
 
-} // namespace
+// The decoded shader: everything the expansion needs that depends only on its code.
+struct ShaderAnalysis {
+	std::vector<uint32_t> code;
+	Program               program;
+	std::set<uint32_t>    labels;
+	bool                  has_calls = false;
+	bool                  has_setpc = false;
+};
 
-bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
-                           std::span<const uint32_t> user_data, const ShaderCodeReader& read,
-                           std::vector<uint32_t>& expanded, std::string& reason,
-                           uint32_t wave_size) {
-	expanded.clear();
-	reason.clear();
-	if (wave_size != 32u && wave_size != 64u) {
-		reason = "shader calls require a known wave size";
-		return false;
+void AnalyzeShader(std::span<const uint32_t> code, ShaderAnalysis& analysis) {
+	analysis.code.assign(code.begin(), code.end());
+	if (std::none_of(code.begin(), code.end(), IsCall)) return;
+	DecodeProgram(analysis.code, analysis.program);
+	for (const auto& inst: analysis.program.instructions) {
+		analysis.has_calls |= IsCall(inst.raw[0]);
+		if (IsDirectBranch(inst.opcode)) analysis.labels.insert(inst.branch_target);
+		analysis.has_setpc |= inst.opcode == Opcode::S_SETPC_B64;
 	}
-	if (std::none_of(code.begin(), code.end(), IsCall)) return true;
-	Program program;
-	DecodeProgram(code, program);
-	if (std::none_of(program.instructions.begin(), program.instructions.end(),
-	                 [](const auto& inst) { return IsCall(inst.raw[0]); }))
-		return true;
-	std::set<uint32_t> labels;
-	for (const auto& inst: program.instructions) {
-		if (IsDirectBranch(inst.opcode)) labels.insert(inst.branch_target);
-		if (inst.opcode == Opcode::S_SETPC_B64) {
-			reason = "shader calls combined with indirect branches are unsupported";
-			return false;
-		}
-	}
-	std::set<uint32_t> dependencies;
+}
+
+// One call instruction and every address it can reach.
+struct CallSite {
+	uint32_t              pc         = 0;
+	uint32_t              source_reg = 0;
+	uint32_t              return_reg = 0;
+	bool                  dynamic    = false;
+	std::vector<uint64_t> addresses; // ascending
+
+	bool operator==(const CallSite&) const = default;
+};
+
+// Resolves each call's targets from the user data and the memory holding call tables. Which
+// registers it consults depends on the code alone; their values reach the result only through
+// the targets.
+bool ResolveCalls(const ShaderAnalysis& analysis, uint64_t base,
+                  std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+                  uint32_t wave_size, std::vector<CallSite>& sites,
+                  std::set<uint32_t>& dependencies, std::string& reason) {
+	const auto& program = analysis.program;
+	const auto& labels  = analysis.labels;
 	const auto resolve = [&](auto&& self, uint32_t reg, size_t before, size_t first, uint32_t depth,
 	                         bool load_memory = false) -> std::optional<uint32_t> {
 		if (reg >= 128 || depth > 32) return {};
@@ -322,7 +338,6 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 		}
 		return {};
 	};
-	std::map<uint32_t, Call> calls;
 	for (size_t i = 0; i < program.instructions.size(); i++) {
 		const auto& inst = program.instructions[i];
 		if (!IsCall(inst.raw[0])) continue;
@@ -338,9 +353,9 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 			reason = "shader call uses a special scalar register pair";
 			return false;
 		}
-		Call               call {src, dst, !low || !high, {}};
+		const bool         dynamic = !low || !high;
 		std::set<uint64_t> addresses;
-		if (!call.dynamic) {
+		if (!dynamic) {
 			addresses.insert((uint64_t {*high} << 32u) | *low);
 		} else {
 			const auto lo = origin(origin, src, i, first, 0);
@@ -410,16 +425,31 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 				}
 			}
 		}
-		for (const auto address: addresses) {
+		sites.push_back({inst.pc, src, dst, dynamic, {addresses.begin(), addresses.end()}});
+	}
+	return true;
+}
+
+// Reads the callees and emits the expanded program: a function of the code, the resolved
+// targets, the consulted registers and the callee code.
+bool BuildExpansion(const ShaderAnalysis& analysis, uint64_t base,
+                    const std::vector<CallSite>& sites, const std::set<uint32_t>& dependencies,
+                    const ShaderCodeReader& read, uint32_t wave_size,
+                    std::vector<uint32_t>& expanded, std::string& reason) {
+	const auto&              program = analysis.program;
+	std::map<uint32_t, Call> calls;
+	for (const auto& site: sites) {
+		Call call {site.source_reg, site.return_reg, site.dynamic, {}};
+		for (const auto address: site.addresses) {
 			CallTarget target {address, {}};
 			if ((address & 3u) != 0 ||
-			    !ReadFunction(address, dst, read, target.function, reason, wave_size)) {
+			    !ReadFunction(address, site.return_reg, read, target.function, reason, wave_size)) {
 				if (reason.empty()) reason = "shader call target is not DWORD aligned";
 				return false;
 			}
 			call.targets.push_back(std::move(target));
 		}
-		calls.emplace(inst.pc, std::move(call));
+		calls.emplace(site.pc, std::move(call));
 	}
 	const bool has_backedge =
 	    std::any_of(program.instructions.begin(), program.instructions.end(), [](const auto& inst) {
@@ -548,6 +578,162 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 	if (!RelocateBranches(result, relocations, reason)) return false;
 	expanded = std::move(result);
 	return true;
+}
+
+using Reads = std::vector<std::pair<uint64_t, std::vector<uint32_t>>>;
+
+// Merges contiguous and overlapping reads into ranges (overlapping reads saw the same memory),
+// so that validating them takes a few reads instead of one per 64-word chunk.
+void MergeReads(Reads& reads) {
+	std::sort(reads.begin(), reads.end(),
+	          [](const auto& a, const auto& b) { return a.first < b.first; });
+	Reads merged;
+	for (auto& [address, words]: reads) {
+		if (!merged.empty()) {
+			auto&      last = merged.back();
+			const auto end  = last.first + last.second.size() * sizeof(uint32_t);
+			if (address <= end) {
+				const auto skip = (end - address) / sizeof(uint32_t);
+				if (skip < words.size()) {
+					last.second.insert(last.second.end(),
+					                   words.begin() + static_cast<std::ptrdiff_t>(skip),
+					                   words.end());
+				}
+				continue;
+			}
+		}
+		merged.emplace_back(address, std::move(words));
+	}
+	reads = std::move(merged);
+}
+
+} // namespace
+
+bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
+                           std::span<const uint32_t> user_data, const ShaderCodeReader& read,
+                           std::vector<uint32_t>& expanded, std::string& reason,
+                           uint32_t wave_size, std::vector<uint32_t>* consulted_user_data) {
+	expanded.clear();
+	reason.clear();
+	if (consulted_user_data != nullptr) {
+		consulted_user_data->clear();
+	}
+	if (wave_size != 32u && wave_size != 64u) {
+		reason = "shader calls require a known wave size";
+		return false;
+	}
+	ShaderAnalysis analysis;
+	AnalyzeShader(code, analysis);
+	if (!analysis.has_calls) return true;
+	if (analysis.has_setpc) {
+		reason = "shader calls combined with indirect branches are unsupported";
+		return false;
+	}
+	std::vector<CallSite> sites;
+	std::set<uint32_t>    dependencies;
+	const bool            ok =
+	    ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason) &&
+	    BuildExpansion(analysis, base, sites, dependencies, read, wave_size, expanded, reason);
+	if (consulted_user_data != nullptr) {
+		consulted_user_data->assign(dependencies.begin(), dependencies.end());
+	}
+	return ok;
+}
+
+struct ShaderFunctionExpander::Impl {
+	struct Expansion {
+		uint64_t              base            = 0;
+		uint32_t              wave_size       = 0;
+		size_t                user_data_count = 0;
+		std::vector<CallSite> sites;
+		Reads                 reads;  // the callee code, as read
+		Reads                 failed; // reads that failed: (address, requested words)
+		bool                  ok = false;
+		std::string           reason;
+		std::vector<uint32_t> code;
+	};
+	struct Shader {
+		ShaderAnalysis         analysis;
+		std::vector<Expansion> expansions; // most recent last
+	};
+	static constexpr size_t MaxExpansions = 8;
+
+	std::unordered_map<uint64_t, Shader> shaders; // by code address
+	std::vector<uint32_t>                scratch;
+
+	bool StillReads(const Expansion& expansion, const ShaderCodeReader& read) {
+		for (const auto& [address, words]: expansion.reads) {
+			scratch.resize(words.size());
+			if (!read(address, scratch) || scratch != words) return false;
+		}
+		for (const auto& [address, words]: expansion.failed) {
+			scratch.resize(words.size());
+			if (read(address, scratch)) return false;
+		}
+		return true;
+	}
+};
+
+ShaderFunctionExpander::ShaderFunctionExpander(): m_impl(std::make_unique<Impl>()) {}
+ShaderFunctionExpander::~ShaderFunctionExpander() = default;
+
+bool ShaderFunctionExpander::Expand(std::span<const uint32_t> code, uint64_t base,
+                                    std::span<const uint32_t> user_data,
+                                    const ShaderCodeReader& read, std::vector<uint32_t>& expanded,
+                                    std::string& reason, uint32_t wave_size) {
+	expanded.clear();
+	reason.clear();
+	if (wave_size != 32u && wave_size != 64u) {
+		reason = "shader calls require a known wave size";
+		return false;
+	}
+	auto& shader = m_impl->shaders[reinterpret_cast<uint64_t>(code.data())];
+	if (shader.analysis.code.size() != code.size() ||
+	    !std::equal(code.begin(), code.end(), shader.analysis.code.begin())) {
+		shader = {};
+		AnalyzeShader(code, shader.analysis);
+	}
+	const auto& analysis = shader.analysis;
+	if (!analysis.has_calls) return true;
+	if (analysis.has_setpc) {
+		reason = "shader calls combined with indirect branches are unsupported";
+		return false;
+	}
+	std::vector<CallSite> sites;
+	std::set<uint32_t>    dependencies;
+	if (!ResolveCalls(analysis, base, user_data, read, wave_size, sites, dependencies, reason)) {
+		return false;
+	}
+	for (const auto& expansion: shader.expansions) {
+		if (expansion.base == base && expansion.wave_size == wave_size &&
+		    expansion.user_data_count == user_data.size() && expansion.sites == sites &&
+		    m_impl->StillReads(expansion, read)) {
+			expanded = expansion.code;
+			reason   = expansion.reason;
+			return expansion.ok;
+		}
+	}
+	Impl::Expansion expansion;
+	expansion.base            = base;
+	expansion.wave_size       = wave_size;
+	expansion.user_data_count = user_data.size();
+	expansion.sites           = std::move(sites);
+	const ShaderCodeReader recording = [&](uint64_t address, std::span<uint32_t> words) {
+		const bool ok = read(address, words);
+		(ok ? expansion.reads : expansion.failed)
+		    .emplace_back(address, std::vector<uint32_t>(words.begin(), words.end()));
+		return ok;
+	};
+	expansion.ok = BuildExpansion(analysis, base, expansion.sites, dependencies, recording,
+	                              wave_size, expansion.code, expansion.reason);
+	MergeReads(expansion.reads);
+	expanded = expansion.code;
+	reason   = expansion.reason;
+	if (shader.expansions.size() >= Impl::MaxExpansions) {
+		shader.expansions.erase(shader.expansions.begin());
+	}
+	shader.expansions.push_back(std::move(expansion));
+	return shader.expansions.back().ok;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
