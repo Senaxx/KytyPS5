@@ -4,10 +4,14 @@
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
 #include <array>
 #include <cstdlib>
 
@@ -30,7 +34,10 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	                             vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
 	// The buffers are written once, here, so they need no update-after-bind.
 	constexpr auto buffer_flags = vk::DescriptorBindingFlags {};
-	const std::array<vk::DescriptorSetLayoutBinding, 6> bindings {{
+	// A device without update-after-bind samplers still gets a one-entry array, holding the
+	// default sampler, so every bindless pipeline sees the same layout.
+	m_samplers_per_array = std::min(MaxSamplers, graphics.bindless_max_samplers);
+	const std::array<vk::DescriptorSetLayoutBinding, 7> bindings {{
 	    {Images2D, vk::DescriptorType::eSampledImage, m_images_per_array, vk::ShaderStageFlagBits::eAll,
 	     nullptr},
 	    {Images2DArray, vk::DescriptorType::eSampledImage, m_images_per_array,
@@ -41,9 +48,11 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	     nullptr},
 	    {Translation, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
 	    {Feedback, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eAll, nullptr},
+	    {Samplers, vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u),
+	     vk::ShaderStageFlagBits::eAll, nullptr},
 	}};
-	const std::array<vk::DescriptorBindingFlags, 6> binding_flags {
-	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags};
+	const std::array<vk::DescriptorBindingFlags, 7> binding_flags {
+	    image_flags, image_flags, image_flags, image_flags, buffer_flags, buffer_flags, image_flags};
 	vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info {};
 	flags_info.bindingCount  = static_cast<uint32_t>(binding_flags.size());
 	flags_info.pBindingFlags = binding_flags.data();
@@ -55,9 +64,10 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_layout),
 	                     "create bindless descriptor layout");
 
-	const std::array<vk::DescriptorPoolSize, 2> sizes {{
+	const std::array<vk::DescriptorPoolSize, 3> sizes {{
 	    {vk::DescriptorType::eSampledImage, m_images_per_array * ImageArrays},
 	    {vk::DescriptorType::eStorageBuffer, 2},
+	    {vk::DescriptorType::eSampler, std::max(m_samplers_per_array, 1u)},
 	}};
 	vk::DescriptorPoolCreateInfo pool_info {};
 	pool_info.flags         = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind;
@@ -109,8 +119,100 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	CreatePlaceholders(scheduler);
 	graphics.bindless_layout = m_layout;
 	graphics.bindless_set    = m_set;
-	LOGF("Bindless table: %u images per array, %u translation entries\n", m_images_per_array,
-	     TranslationEntries);
+	LOGF("Bindless table: %u images per array, %u translation entries, %u samplers\n",
+	     m_images_per_array, TranslationEntries, m_samplers_per_array);
+}
+
+BindlessTable::SamplerHeap* BindlessTable::FindOrCreateSamplerHeap(uint64_t base,
+                                                                   uint32_t table_offset,
+                                                                   uint32_t flags) {
+	for (auto& heap: m_sampler_heaps) {
+		if (heap.base == base && heap.table_offset == table_offset && heap.flags == flags) {
+			return &heap;
+		}
+	}
+	auto& heap        = m_sampler_heaps.emplace_back();
+	heap.base         = base;
+	heap.table_offset = table_offset;
+	heap.flags        = flags;
+	return &heap;
+}
+
+void BindlessTable::WriteDefaultSampler(vk::Sampler sampler) {
+	if (m_default_sampler_written || m_set == nullptr) {
+		return;
+	}
+	vk::DescriptorImageInfo info {sampler, nullptr, vk::ImageLayout::eUndefined};
+	vk::WriteDescriptorSet  write {};
+	write.dstSet          = m_set;
+	write.dstBinding      = Samplers;
+	write.dstArrayElement = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eSampler;
+	write.pImageInfo      = &info;
+	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	m_default_sampler_written = true;
+}
+
+bool BindlessTable::MirrorSamplerHeap(SamplerHeap&                              heap,
+                                      std::span<const std::array<uint32_t, 4>> records,
+                                      SamplerCache&                             cache) {
+	const auto same_prefix =
+	    records.size() >= heap.records.size() &&
+	    std::equal(heap.records.begin(), heap.records.end(), records.begin());
+	if (same_prefix && records.size() == heap.records.size()) {
+		return true;
+	}
+	uint32_t first = static_cast<uint32_t>(heap.records.size());
+	if (!same_prefix || records.size() > heap.capacity || heap.region == 0) {
+		const auto capacity = std::max<uint32_t>(64u, static_cast<uint32_t>(records.size()) * 2u);
+		if (m_samplers_per_array <= 1u || capacity > m_samplers_per_array - m_next_sampler_slot) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 8) {
+				LOGF("Bindless samplers: array full (%u of %u slots), heap 0x%016" PRIx64
+				     " keeps %zu records\n",
+				     m_next_sampler_slot, m_samplers_per_array, heap.base, heap.records.size());
+			}
+			return false;
+		}
+		heap.region   = m_next_sampler_slot;
+		heap.capacity = capacity;
+		m_next_sampler_slot += capacity;
+		first = 0;
+	}
+	std::vector<vk::DescriptorImageInfo> infos;
+	infos.reserve(records.size() - first);
+	for (size_t key = first; key < records.size(); key++) {
+		ShaderSamplerResource descriptor;
+		std::copy(records[key].begin(), records[key].end(), descriptor.fields);
+		if ((heap.flags & SamplerDepthCompare) == 0u) {
+			descriptor.fields[0] &= ~(0x7u << 12u);
+		}
+		if ((heap.flags & SamplerPointFiltering) != 0u) {
+			descriptor.SetPointFiltering();
+		}
+		infos.push_back({cache.GetSampler(descriptor, (heap.flags & SamplerIntegerBorder) != 0u),
+		                 nullptr, vk::ImageLayout::eUndefined});
+	}
+	if (!infos.empty()) {
+		vk::WriteDescriptorSet write {};
+		write.dstSet          = m_set;
+		write.dstBinding      = Samplers;
+		write.dstArrayElement = heap.region + first;
+		write.descriptorCount = static_cast<uint32_t>(infos.size());
+		write.descriptorType  = vk::DescriptorType::eSampler;
+		write.pImageInfo      = infos.data();
+		m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	}
+	static std::atomic<uint32_t> logged = 0;
+	if (logged.fetch_add(1) < 32) {
+		LOGF("Bindless samplers: heap 0x%016" PRIx64 "+0x%x flags=%u region=%u records=%zu"
+		     " (%u new)\n",
+		     heap.base, heap.table_offset, heap.flags, heap.region, records.size(),
+		     static_cast<uint32_t>(infos.size()));
+	}
+	heap.records.assign(records.begin(), records.end());
+	return true;
 }
 
 void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {

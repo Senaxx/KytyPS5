@@ -313,6 +313,7 @@ public:
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectImages();
+		PlanBindlessSamplers();
 		PlanDefaultSamplers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -341,6 +342,19 @@ public:
 			for (const auto index: plan.memory) {
 				if (IsIndirectPlanningMemory(index)) {
 					m_program.memory_info[index].planning_only = true;
+				}
+			}
+		}
+		// A bindless sampler handle carries its key (read by the shader) and the first three dwords
+		// of the heap V#, which keeps the plan values alive; the S# reads it strands are dead.
+		for (const auto& plan: m_bindless_samplers) {
+			plan.handle->SetArg(0, plan.key);
+			for (uint32_t dword = 0; dword < 3u; dword++) {
+				plan.handle->SetArg(dword + 1u, plan.table_roots[dword]);
+			}
+			for (uint32_t i = 0; i < plan.reads.size(); i++) {
+				if (plan.exclusive[i]) {
+					m_program.memory_info[plan.memory[i]].planning_only = true;
 				}
 			}
 		}
@@ -377,6 +391,16 @@ private:
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
 		std::array<bool, 8>        planning_only {};
+	};
+
+	struct BindlessSamplerPlan {
+		Inst*                      handle = nullptr;
+		uint32_t                   source = 0;
+		Value                      key;
+		std::array<Value, 3>       table_roots {};
+		std::array<uint32_t, 4>    memory {};
+		std::array<const Inst*, 4> reads {};
+		std::array<bool, 4>        exclusive {};
 	};
 
 	// A non-fatal compile gives the shader up instead: the failure unwinds to TrackResources,
@@ -1174,7 +1198,10 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset) const {
+	// The byte offset of a table read as (key << record_shift) + immediate: 32-byte T# records for
+	// image heaps, 16-byte S# records for sampler heaps.
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset,
+	                      uint32_t record_shift = 5u) const {
 		offset = 0;
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
@@ -1183,7 +1210,7 @@ private:
 			}
 			uint32_t immediate;
 			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
-			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
+			    ImmediateU32(inst->Arg(1), immediate) && immediate == record_shift) {
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
 			}
@@ -1971,6 +1998,116 @@ private:
 		return found;
 	}
 
+	const BindlessSamplerPlan* FindBindlessSampler(const Inst& handle) const {
+		const auto found =
+		    std::ranges::find(m_bindless_samplers, &handle, &BindlessSamplerPlan::handle);
+		return found == m_bindless_samplers.end() ? nullptr : &*found;
+	}
+
+	// A bindless sampler: all four S# dwords are scalar reads of one sampler heap (a buffer of
+	// 16-byte records) at (key << 4) + record offset, with a GPU-computed key and a heap V# the
+	// host can evaluate. The shader keeps the key and indexes the bindless sampler array, which
+	// the host mirrors from the heap.
+	bool TryMakeBindlessSampler(Inst& handle, BindlessSamplerPlan& plan) {
+		Inst*    table_handle = nullptr;
+		Value    key;
+		uint32_t table_offset = 0;
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			auto* read = ResolveInvariantPhi(m_program, handle.Arg(dword)).TryInstruction();
+			if (read == nullptr) {
+				return false;
+			}
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+			    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
+			    !MemoryIndexBelongsTo(memory_index, *read)) {
+				return false;
+			}
+			auto*    current_handle = read->Arg(0).Resolve().TryInstruction();
+			Value    current_key;
+			uint32_t offset = 0;
+			if (current_handle == nullptr ||
+			    current_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    (table_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, 4u) ||
+			    memory->offset > UINT32_MAX - offset) {
+				return false;
+			}
+			offset += memory->offset;
+			if (dword == 0u) {
+				key          = current_key;
+				table_offset = offset;
+			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
+				return false;
+			}
+			table_handle          = current_handle;
+			plan.reads[dword]     = read;
+			plan.memory[dword]    = memory_index;
+			plan.exclusive[dword] =
+			    !read->Uses().empty() && std::ranges::all_of(read->Uses(), [](const Use& use) {
+				    return use.user->GetOpcode() == ValueOpcode::GetSamplerResource ||
+				           FeedsOnlyDeadPhis(*use.user);
+			    });
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*plan.reads[0], table_source) ||
+		    table_source.dword_count != 4u) {
+			return false;
+		}
+		DescriptorSource source;
+		source.dword_count = 4u;
+		source.dwords.fill(Value(0u));
+		for (uint32_t dword = 0; dword < 3u; dword++) {
+			source.dwords[dword]    = table_source.dwords[dword];
+			plan.table_roots[dword] = table_source.dwords[dword];
+		}
+		source.bindless_sampler = DescriptorSource::BindlessSampler {.table_offset = table_offset};
+		plan.handle             = &handle;
+		plan.key                = key;
+		plan.source             = InternSource(source);
+		return true;
+	}
+
+	void PlanBindlessSamplers() {
+		// Opt-in while a regression is investigated: with the game's own samplers the title's
+		// fog shows a bright arch (DEBUGGING.md, 2026-09-28). KYTY_BINDLESS_SAMPLERS=1 enables them.
+		static const bool enabled = std::getenv("KYTY_BINDLESS_SAMPLERS") != nullptr &&
+		                            std::getenv("KYTY_BINDLESS_SAMPLERS")[0] == '1';
+		if (!m_program.bindless_images || !enabled) {
+			return;
+		}
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+				    inst.NumArgs() < 2u) {
+					continue;
+				}
+				auto* sampler = inst.Arg(1).Resolve().TryInstruction();
+				if (sampler == nullptr || sampler->GetOpcode() != ValueOpcode::GetSamplerResource ||
+				    sampler->NumArgs() != 4u || FindBindlessSampler(*sampler) != nullptr) {
+					continue;
+				}
+				const auto       flags  = inst.Flags<MemoryFlags>();
+				const auto&      memory = m_program.memory_info[flags.index];
+				DescriptorSource descriptor;
+				MakeSource(*sampler, 4u, true,
+				           (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
+				           memory.sampler * 4u, descriptor, flags.pc);
+				uint32_t bad_dword = 0;
+				if (ValidateSource(descriptor, bad_dword)) {
+					continue;
+				}
+				BindlessSamplerPlan plan;
+				if (TryMakeBindlessSampler(*sampler, plan)) {
+					m_bindless_samplers.push_back(plan);
+				}
+			}
+		}
+	}
+
 	// Stopgap: a bindless sampler (selected per material from a sampler heap, like
 	// the image beside it) has no indirect plan. Before the walk, give it one fixed sampler
 	// (trilinear, wrap, full LOD range) and make the heap reads it strands planning-only, as
@@ -1994,7 +2131,7 @@ private:
 				}
 				auto* sampler = inst.Arg(1).Resolve().TryInstruction();
 				if (sampler == nullptr || sampler->GetOpcode() != ValueOpcode::GetSamplerResource ||
-				    sampler->NumArgs() != 4u) {
+				    sampler->NumArgs() != 4u || FindBindlessSampler(*sampler) != nullptr) {
 					continue;
 				}
 				const auto       flags  = inst.Flags<MemoryFlags>();
@@ -2227,7 +2364,10 @@ private:
 		if (m_info.samplers.size() >= ShaderInfo::MaxSamplers) {
 			return UINT32_MAX;
 		}
-		m_info.samplers.push_back({source, pc});
+		SamplerResource sampler {.source = source, .first_use_pc = pc};
+		const auto*     descriptor = Source(source);
+		sampler.bindless = descriptor != nullptr && descriptor->bindless_sampler.has_value();
+		m_info.samplers.push_back(sampler);
 		return static_cast<uint32_t>(m_info.samplers.size() - 1);
 	}
 
@@ -2389,8 +2529,15 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-			          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+			auto*       candidate = inst.Arg(1).Resolve().TryInstruction();
+			const auto* bindless  = candidate != nullptr ? FindBindlessSampler(*candidate) : nullptr;
+			if (bindless != nullptr) {
+				sampler_handle = candidate;
+				sampler_source = bindless->source;
+			} else {
+				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -2442,6 +2589,7 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::vector<BindlessSamplerPlan>           m_bindless_samplers;
 	std::map<const Inst*, int>                 m_indirect_rejects;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;

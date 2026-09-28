@@ -1070,6 +1070,55 @@ void RenderExecutor::ResolveBindlessRequests() {
 	table.RecordFeedbackSnapshot(scheduler);
 }
 
+// Bindless samplers: the S# records of each sampler heap a draw indexes are mirrored into the
+// sampler array of set 1, once per frame per heap, and the shader gets the region base and record
+// count. Keys outside it, and heaps that cannot be read, use the default sampler in slot 0.
+void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
+                                             PreparedBindings&         prepared) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	if (snapshot.bindless_sampler_heaps.empty()) {
+		return;
+	}
+	auto& table = m_context.GetBindlessTable();
+	auto& cache = m_context.GetSamplerCache();
+	{
+		ShaderSamplerResource default_sampler;
+		std::ranges::copy(ShaderRecompiler::IR::BindlessDefaultSampler, default_sampler.fields);
+		table.WriteDefaultSampler(cache.GetSampler(default_sampler, false));
+	}
+	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	constexpr uint64_t MaxRecords = 1024;
+	for (const auto& use: snapshot.bindless_sampler_heaps) {
+		uint32_t region  = 0;
+		uint32_t entries = 0;
+		if (table.SamplersEnabled() && use.sampler < program.info.samplers.size()) {
+			const auto&    sampler = program.info.samplers[use.sampler];
+			const uint32_t flags =
+			    (sampler.depth_compare ? BindlessTable::SamplerDepthCompare : 0u) |
+			    (sampler.force_point_filtering ? BindlessTable::SamplerPointFiltering : 0u) |
+			    (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u);
+			auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, flags);
+			if (heap->checked_frame != frame) {
+				heap->checked_frame = frame;
+				const uint64_t available =
+				    use.size > use.table_offset ? (use.size - use.table_offset) / 16u : 0u;
+				std::vector<std::array<uint32_t, 4>> records(std::min(available, MaxRecords));
+				const uint64_t address = use.base + use.table_offset;
+				const uint64_t bytes   = records.size() * sizeof(records[0]);
+				if (!records.empty() &&
+				    !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes) &&
+				    Libs::LibKernel::Memory::TryReadBacking(address, records.data(), bytes)) {
+					(void)table.MirrorSamplerHeap(*heap, records, cache);
+				}
+			}
+			region  = heap->region;
+			entries = region != 0 ? static_cast<uint32_t>(heap->records.size()) : 0u;
+		}
+		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
+	}
+}
+
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
 	prepared.bindless_patches.clear();
@@ -1077,7 +1126,12 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	auto&       table    = m_context.GetBindlessTable();
-	if (snapshot.bindless_heaps.empty() || !table.Enabled()) {
+	if ((snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty()) ||
+	    !table.Enabled()) {
+		return;
+	}
+	PrepareBindlessSamplers(runtime, prepared);
+	if (snapshot.bindless_heaps.empty()) {
 		return;
 	}
 	ResolveBindlessRequests();

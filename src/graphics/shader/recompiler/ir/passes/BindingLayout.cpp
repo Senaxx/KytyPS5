@@ -92,7 +92,7 @@ bool UsesFlattenedSrt(const Program& program) {
 		});
 	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
 		return image.indirect_search_iterations != 0u || image.bindless;
-	});
+	}) || std::ranges::any_of(program.info.samplers, &SamplerResource::bindless);
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {

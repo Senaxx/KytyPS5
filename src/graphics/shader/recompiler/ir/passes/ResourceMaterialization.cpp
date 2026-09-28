@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -654,6 +655,12 @@ bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan&
 		bool       first   = true;
 		for (uint32_t type = 0; type < mapping.size(); type++) {
 			if ((classes & (1u << type)) == 0u) continue;
+			// A bindless sampler is one slot of the host's table for all of its uses: its other
+			// classes share the first one's binding rather than adding copies.
+			if (!first && base.samplers[index].bindless) {
+				mapping[type] = index;
+				continue;
+			}
 			const auto target = first ? index : plan.sampler_count++;
 			if (target >= ShaderInfo::MaxSamplers) return false;
 			mapping[type]         = target;
@@ -987,8 +994,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
 	for (const auto& source: program.descriptor_sources) {
 		auto& target          = plan.descriptor_sources.emplace_back();
-		target.dword_count    = source.dword_count;
-		target.indirect_image = source.indirect_image;
+		target.dword_count      = source.dword_count;
+		target.indirect_image   = source.indirect_image;
+		target.bindless_sampler = source.bindless_sampler;
 		if (target.indirect_image.has_value()) {
 			target.indirect_image->key_count = Clone(target.indirect_image->key_count);
 			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
@@ -1058,6 +1066,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 		}
 	}
+	for (const auto& sampler: plan.info.samplers) {
+		const auto* source = Source(plan, sampler.source);
+		if (source == nullptr || !source->bindless_sampler.has_value()) {
+			continue;
+		}
+		plan.requires_specialization_memory = true;
+		MarkCleanFlatSlots(plan, source, plan.clean_flat_slots);
+	}
 	plan.capture_specialization_reads = capture_image_reads || !plan.control_flow.empty();
 	// Writable descriptor addresses must come from clean backing for the alias proof.
 	for (const auto& buffer: plan.info.buffers) {
@@ -1078,6 +1094,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	g_indirect_failure_line = 0;
 	snapshot.bindless_heaps.clear();
+	snapshot.bindless_sampler_heaps.clear();
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		return FailIndirect(__LINE__);
@@ -1199,8 +1216,34 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.samplers.resize(program.info.samplers.size());
+	specialization.samplers.assign(program.info.samplers.size(), {});
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+		const auto  source_index = program.info.samplers[i].source;
+		const auto* source       = Source(program, source_index);
+		if (source != nullptr && source->bindless_sampler.has_value()) {
+			// The shader indexes the host's mirror of the heap with two patched words (region
+			// base, entry count); zeros select the default sampler in slot 0. Set 0 still binds
+			// the default sampler for this resource.
+			const auto mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+			snapshot.flattened_srt.resize(mapping_offset + 2u, 0u);
+			snapshot.samplers[i].dword_count = 4u;
+			std::ranges::copy(BindlessDefaultSampler, snapshot.samplers[i].dwords.begin());
+			specialization.samplers[i] = {.bindless = true, .bindless_mapping_offset = mapping_offset};
+			DescriptorValue      table;
+			ShaderBufferResource heap;
+			if ((active.empty() || active[source_index]) &&
+			    clean.EvaluateDescriptor(source_index, table) &&
+			    DecodeBufferDescriptor(table, heap) && heap.Base48() != 0) {
+				snapshot.bindless_sampler_heaps.push_back(
+				    {.base           = heap.Base48(),
+				     .size           = heap.GetSize(),
+				     .table_offset   = source->bindless_sampler->table_offset,
+				     .sampler        = i,
+				     .mapping_offset = mapping_offset});
+			}
+			continue;
+		}
+		if (!evaluate(source_index, snapshot.samplers[i])) {
 			return FailIndirect(__LINE__);
 		}
 	}
@@ -1259,6 +1302,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	auto& samplers      = program.info.samplers;
 	auto& sampled_pairs = program.info.sampled_pairs;
 	const auto original_sampler_count = samplers.size();
+	for (uint32_t index = 0; index < original_sampler_count && index < specialization.samplers.size();
+	     index++) {
+		samplers[index].bindless                = specialization.samplers[index].bindless;
+		samplers[index].bindless_mapping_offset = specialization.samplers[index].bindless_mapping_offset;
+	}
 	samplers.reserve(sampler_plan.sampler_count);
 	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
 		const auto& binding = sampler_plan.bindings[index];

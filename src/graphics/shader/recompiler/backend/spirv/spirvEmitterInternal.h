@@ -132,6 +132,8 @@ struct EmitterState {
 	uint32_t                                         bindless_translation_variable = 0;
 	uint32_t                                         bindless_feedback_variable    = 0;
 	uint32_t                                         bindless_slot                 = 0;
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;

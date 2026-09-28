@@ -534,6 +534,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	graphics.bindless_max_sampled_images =
 	    graphics.bindless_enabled ? properties12.maxDescriptorSetUpdateAfterBindSampledImages : 0u;
+	graphics.bindless_max_samplers =
+	    graphics.bindless_enabled
+	        ? std::min(properties12.maxDescriptorSetUpdateAfterBindSamplers,
+	                   properties12.maxPerStageDescriptorUpdateAfterBindSamplers)
+	        : 0u;
 	LOGF("Vulkan bindless images: %s (update-after-bind sampled images %u)\n",
 	     graphics.bindless_enabled ? "enabled" : "unsupported",
 	     graphics.bindless_max_sampled_images);
