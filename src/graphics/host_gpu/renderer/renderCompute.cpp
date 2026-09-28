@@ -65,6 +65,46 @@ static void LogSkippedDispatch(const HW::ComputeShaderInfo& cs, const char* grou
 }
 namespace {
 
+// The rollback below drains the GPU twice per dispatch and almost never fires once a shader's
+// pages are resident (one retry in a whole run, against ~2500 protected dispatches a frame). A
+// shader is trusted after trust_runs clean attempts and dispatched without it; any fault that
+// unprotected work reports re-arms every shader. KYTY_DISPATCH_RECOVERY=always keeps it on every
+// dispatch; KYTY_DISPATCH_RECOVERY_TRUST=<n> sets the clean runs needed.
+struct DispatchRecoveryPolicy {
+	std::unordered_map<uint64_t, uint32_t> clean_runs;
+	uint64_t                               seen_faults          = 0;
+	uint32_t                               trust_runs           = 4;
+	bool                                   always               = false;
+	uint64_t                               protected_dispatches = 0;
+	uint64_t                               trusted_dispatches   = 0;
+	uint64_t                               retries              = 0;
+	uint64_t                               rearms               = 0;
+
+	void Count(bool trusted) {
+		(trusted ? trusted_dispatches : protected_dispatches)++;
+		if (((protected_dispatches + trusted_dispatches) & 0x3fff) == 0) {
+			LOGF("DispatchRecovery: protected=%" PRIu64 " trusted=%" PRIu64 " retries=%" PRIu64
+			     " rearms=%" PRIu64 " shaders=%zu\n",
+			     protected_dispatches, trusted_dispatches, retries, rearms, clean_runs.size());
+		}
+	}
+};
+
+// Dispatches are recorded on the GPU thread only.
+DispatchRecoveryPolicy& RecoveryPolicy() {
+	static DispatchRecoveryPolicy policy = [] {
+		DispatchRecoveryPolicy p;
+		if (const char* value = std::getenv("KYTY_DISPATCH_RECOVERY")) {
+			p.always = std::strcmp(value, "always") == 0;
+		}
+		if (const char* value = std::getenv("KYTY_DISPATCH_RECOVERY_TRUST")) {
+			p.trust_runs = static_cast<uint32_t>(std::strtoul(value, nullptr, 0));
+		}
+		return p;
+	}();
+	return policy;
+}
+
 // A missing BDA page returns zero during the first attempt. Preserve every
 // externally writable buffer, including atomic destinations, so that attempt
 // can be rolled back before any dependent dispatch observes its results.
@@ -80,6 +120,20 @@ public:
 		if (!m_enabled) return;
 		auto& cache     = context.GetBufferCache();
 		auto& scheduler = context.GetCommandScheduler();
+		auto& policy    = RecoveryPolicy();
+		if (!policy.always) {
+			if (const auto faults = cache.UnattributedFaults(); faults != policy.seen_faults) {
+				policy.seen_faults = faults;
+				policy.clean_runs.clear();
+				policy.rearms++;
+			}
+			if (policy.clean_runs[shader_address] >= policy.trust_runs) {
+				m_enabled = false;
+				policy.Count(true);
+				return;
+			}
+		}
+		policy.Count(false);
 		// Reports from earlier work cannot be attributed to this transaction.
 		cache.ProcessFaultBuffer();
 		scheduler.Finish();
@@ -110,6 +164,7 @@ public:
 		if (!m_enabled) return false;
 		auto&      cache  = m_context.GetBufferCache();
 		const auto report = cache.CollectFaults();
+		auto&      policy = RecoveryPolicy();
 		if (report.page_count == 0) {
 			if (report.trap.claimed != 0) {
 				const auto hash =
@@ -118,8 +173,13 @@ public:
 				     " pc=0x%08x code=0x%02x\n",
 				     hash, report.trap.pc, report.trap.code);
 			}
+			if (m_attempts == 0) {
+				policy.clean_runs[m_shader_address]++;
+			}
 			return false;
 		}
+		policy.clean_runs[m_shader_address] = 0;
+		policy.retries++;
 		if (++m_attempts > 128) {
 			EXIT("GPU shader paging did not converge: shader=0x%016" PRIx64 " pages=%" PRIu64 "\n",
 			     m_shader_address, report.page_count);

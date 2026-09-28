@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 
 namespace Libs::Graphics {
@@ -39,6 +40,11 @@ public:
 	[[nodiscard]] Buffer*           GetFaultBuffer() noexcept;
 	void                            ProcessFaultBuffer();
 	[[nodiscard]] ShaderFaultReport CollectFaults();
+	// Page faults reported while no dispatch transaction was collecting (for example by a
+	// dispatch that ran without recovery). A change re-arms dispatch recovery.
+	[[nodiscard]] uint64_t UnattributedFaults() const noexcept {
+		return m_unattributed_faults.load(std::memory_order_acquire);
+	}
 
 private:
 	void                                   ProcessFaultBufferImpl(ShaderFaultReport* report);
@@ -54,6 +60,7 @@ private:
 	vk::DescriptorSetLayout                m_fault_process_desc_layout     = nullptr;
 	vk::Pipeline                           m_fault_process_pipeline        = nullptr;
 	vk::PipelineLayout                     m_fault_process_pipeline_layout = nullptr;
+	std::atomic<uint64_t>                  m_unattributed_faults {0};
 };
 
 } // namespace Libs::Graphics

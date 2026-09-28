@@ -202,6 +202,8 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 		if (report != nullptr) {
 			report->page_count = faults[0];
 			report->trap       = trap;
+		} else if (faults[0] != 0) {
+			m_unattributed_faults.fetch_add(1, std::memory_order_release);
 		}
 		// The parser's counter can exceed its bounded output array. Never consume
 		// unrecorded addresses as pages (or read beyond the mapped readback area).

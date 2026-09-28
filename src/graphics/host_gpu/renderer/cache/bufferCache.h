@@ -82,6 +82,9 @@ public:
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
+	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
+		return m_fault_manager.UnattributedFaults();
+	}
 	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
 
