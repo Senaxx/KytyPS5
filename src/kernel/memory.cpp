@@ -909,6 +909,12 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+
+	return size == 0 || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	const auto clamped_size = TryClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {

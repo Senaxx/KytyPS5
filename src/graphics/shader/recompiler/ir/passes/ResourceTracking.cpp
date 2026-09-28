@@ -524,14 +524,13 @@ private:
 	// CPU-evaluable pointers, and for a descriptor word (`descriptor`) any CPU-evaluable read at
 	// a fixed offset. A branch condition's s_buffer_load stays a GPU read.
 	bool UsesOnlyDescriptorSnapshots(Value value, bool descriptor) const {
-		std::vector<Value>       pending {value};
-		std::vector<const Inst*> visited;
+		std::vector<Value>              pending {value};
+		std::unordered_set<const Inst*> visited;
 		while (!pending.empty()) {
 			const auto current = pending.back().Resolve();
 			pending.pop_back();
 			const auto* inst = current.TryInstruction();
-			if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) continue;
-			visited.push_back(inst);
+			if (inst == nullptr || !visited.insert(inst).second) continue;
 			if (inst->GetOpcode() == ValueOpcode::ReadConst) continue;
 			uint32_t index = 0;
 			if (ScalarReadMemory(*inst, index) != nullptr && inst->Arg(1).Resolve().IsImmediate() &&
@@ -989,22 +988,33 @@ private:
 		           : nullptr;
 	}
 
+	static bool IsMemoryAccess(const Inst& inst) {
+		const auto op = inst.GetOpcode();
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// Whether no memory access other than owner uses memory_info[index]. Only the indirect-image
+	// and bindless-sampler planning asks, after PlanScalarReads and dead-code elimination, and
+	// it adds, removes and re-indexes no memory accesses, so each index's users are counted once
+	// per shader; scanning the whole program per call made tracking quadratic (seconds per title
+	// load).
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_program.blocks) {
-			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+		if (!m_memory_users_counted) {
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					if (IsMemoryAccess(inst)) {
+						m_memory_users[inst.Flags<MemoryFlags>().index]++;
+					}
 				}
 			}
+			m_memory_users_counted = true;
 		}
-		return true;
+		const auto     users = m_memory_users.find(index);
+		const uint32_t count = users == m_memory_users.end() ? 0u : users->second;
+		const bool     owned = IsMemoryAccess(owner) && owner.Flags<MemoryFlags>().index == index;
+		return count == (owned ? 1u : 0u);
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -1029,9 +1039,9 @@ private:
 	// values only come from vector sources and lane selects on per-lane conditions. Anything
 	// not listed counts as per-lane.
 	bool IsWaveUniform(Value value) const {
-		std::vector<const Inst*> pending;
-		std::vector<const Inst*> visited;
-		const auto               push = [&](Value operand) {
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> visited;
+		const auto                      push = [&](Value operand) {
 			operand = operand.Resolve();
 			if (operand.IsImmediate()) {
 				return true;
@@ -1040,8 +1050,7 @@ private:
 			if (inst == nullptr) {
 				return false;
 			}
-			if (std::ranges::find(visited, inst) == visited.end()) {
-				visited.push_back(inst);
+			if (visited.insert(inst).second) {
 				pending.push_back(inst);
 			}
 			return true;
@@ -2593,6 +2602,10 @@ private:
 	std::map<const Inst*, int>                 m_indirect_rejects;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+
+	// MemoryIndexBelongsTo's count of memory accesses per memory_info index, built on first use.
+	mutable std::unordered_map<uint32_t, uint32_t> m_memory_users;
+	mutable bool                                   m_memory_users_counted = false;
 };
 
 } // namespace

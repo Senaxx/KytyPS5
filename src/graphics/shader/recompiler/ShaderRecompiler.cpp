@@ -642,6 +642,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
+	const auto passes_begin = std::chrono::steady_clock::now();
+	const auto ms_since     = [](std::chrono::steady_clock::time_point begin) {
+		return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+		                                 std::chrono::steady_clock::now() - begin)
+		                                 .count());
+	};
 	IR::RewriteToSsa(ir.blocks);
 	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 	IR::ResolveControlFlowIdentities(ir);
@@ -686,8 +692,16 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	ir.bindless_images = options.bindless_images;
-	if (!IR::TrackResources(ir, decoded, native_cfg) && options.non_fatal) {
+	ir.bindless_images        = options.bindless_images;
+	const auto tracking_begin = std::chrono::steady_clock::now();
+	const bool tracked        = IR::TrackResources(ir, decoded, native_cfg);
+	const auto tracking_ms    = ms_since(tracking_begin);
+	// The IR passes after translation, resource tracking among them, which the phases above miss.
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR passes tracking_ms=%" PRIu64
+	     " passes_ms=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash, tracking_ms,
+	     ms_since(passes_begin), phase_ms());
+	if (!tracked && options.non_fatal) {
 		DumpGaveUpCode(options, code);
 		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
 		     options.shader_hash);
