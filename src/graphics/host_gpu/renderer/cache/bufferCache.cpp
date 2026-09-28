@@ -694,6 +694,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 		m_gpu_modified_ranges.Add(vaddr, size);
+		// Diagnostics: KYTY_WATCH_GPU_WRITE=<address> names the bindings that mark it GPU-written.
+		static const uint64_t watch = [] {
+			const char* value = std::getenv("KYTY_WATCH_GPU_WRITE");
+			return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+		}();
+		static std::atomic<uint32_t> watched {0};
+		if (watch != 0 && watch >= vaddr && watch - vaddr < size && watched.fetch_add(1) < 24) {
+			LOGF("GPU write covers watched 0x%016" PRIx64 ": range=0x%016" PRIx64 " size=0x%" PRIx64
+			     "\n%s",
+			     watch, vaddr, size, Common::HostBacktrace().c_str());
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
