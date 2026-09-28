@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -23,6 +24,14 @@ namespace {
 
 // Thrown by a non-fatal Fail; TrackResources catches it and gives the shader up.
 struct TrackingFailure {};
+
+// KYTY_SRT_RAW_READS_ON_GPU=1 leaves scalar loads through CPU-evaluable pointers to the shader
+// (BDA) for A/B runs instead of the SRT snapshot: a load of memory the GPU just wrote drains
+// the GPU when the host evaluates it.
+bool SrtRawReadsOnGpu() {
+	static const bool on_gpu = std::getenv("KYTY_SRT_RAW_READS_ON_GPU") != nullptr;
+	return on_gpu;
+}
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
@@ -502,7 +511,8 @@ private:
 			if (inst->GetOpcode() == ValueOpcode::ReadConst) continue;
 			uint32_t index = 0;
 			if (ScalarReadMemory(*inst, index) != nullptr && inst->Arg(1).Resolve().IsImmediate() &&
-			    (descriptor || inst->GetOpcode() == ValueOpcode::LoadAddressU32) &&
+			    (descriptor ||
+			     (inst->GetOpcode() == ValueOpcode::LoadAddressU32 && !SrtRawReadsOnGpu())) &&
 			    ValidateRuntimeValue(m_program, Value(const_cast<Inst*>(inst))))
 				continue;
 			if (BufferAccessOf(inst->GetOpcode()) != BufferAccess::None ||
@@ -764,6 +774,7 @@ private:
 			}
 		}
 		for (auto* block: m_program.blocks) {
+			if (SrtRawReadsOnGpu()) break;
 			for (auto& inst: *block) {
 				uint32_t index = 0;
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&

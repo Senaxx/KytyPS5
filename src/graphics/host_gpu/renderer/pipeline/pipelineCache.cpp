@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -150,13 +151,49 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	return false;
 }
 
+// Diagnostics: the shader whose resources are being evaluated, and how often its SRT reads
+// hit memory the GPU owns (each such read drains the GPU).
+thread_local uint64_t t_srt_shader_hash = 0;
+void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
+	struct Entry {
+		uint64_t count   = 0;
+		uint64_t address = 0;
+		uint32_t bytes   = 0;
+	};
+	static std::unordered_map<uint64_t, Entry> counts;
+	static uint64_t                            total = 0;
+	auto& entry   = counts[t_srt_shader_hash];
+	entry.count++;
+	entry.address = address;
+	entry.bytes   = bytes;
+	if (++total % 4096 == 0) {
+		LOGF("GpuOwnedSrtReads: total=%" PRIu64 " shaders=%zu\n", total, counts.size());
+		for (const auto& [hash, e]: counts) {
+			LOGF("\t hash=0x%016" PRIx64 " count=%" PRIu64 " last=0x%016" PRIx64 " bytes=%u\n",
+			     hash, e.count, e.address, e.bytes);
+		}
+	}
+}
+
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
 bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
-	if (values.empty() ||
-	    !Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+	if (values.empty()) {
 		return false;
+	}
+	// Bytes the GPU has not written are current in the backing store. Reading them there skips
+	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
+	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
+	                                                    values.size_bytes())) {
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		return false;
+	}
+	if (t_srt_shader_hash != 0 && Libs::Graphics::GuestGpu::IsGpuThread()) {
+		CountGpuOwnedSrtRead(address, static_cast<uint32_t>(values.size_bytes()));
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
@@ -449,9 +486,12 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
-				if (!ShaderRecompiler::IR::MaterializeResources(
-				        entry->second.resource_plan, runtime, entry->second.resources,
-				        entry->second.specialization)) {
+				t_srt_shader_hash = params.hash;
+				const bool materialized = ShaderRecompiler::IR::MaterializeResources(
+				    entry->second.resource_plan, runtime, entry->second.resources,
+				    entry->second.specialization);
+				t_srt_shader_hash = 0;
+				if (!materialized) {
 					// A descriptor source that cannot be read right now (memory the guest has
 					// not mapped or filled yet) skips this draw rather than the session; the
 					// next one re-evaluates from scratch.
