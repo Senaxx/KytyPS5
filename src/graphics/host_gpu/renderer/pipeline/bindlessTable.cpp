@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -73,13 +74,21 @@ BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& schedul
 	RequireVulkanSuccess(graphics.device.allocateDescriptorSets(&allocate_info, &m_set),
 	                     "allocate bindless descriptor set");
 
-	// Both live in host-visible device memory: the host writes translations and reads the
-	// feedback flags directly, while shaders access them at device speed.
+	// Both live in host-visible device memory: the host writes translations and clears feedback
+	// flags directly, while shaders access them at device speed. The host reads the flags from
+	// a host-cached snapshot (RecordFeedbackSnapshot).
 	m_translation = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0,
 	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
 	m_feedback    = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Stream, 0,
 	                                         AllFlags, TranslationEntries * sizeof(uint32_t));
-	EXIT_IF(m_translation->Mapped().empty() || m_feedback->Mapped().empty());
+	m_feedback_snapshot = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+	                                               AllFlags, TranslationEntries * sizeof(uint32_t));
+	EXIT_IF(m_translation->Mapped().empty() || m_feedback->Mapped().empty() ||
+	        m_feedback_snapshot->Mapped().empty());
+	// A region allocated after a snapshot was recorded reads as "no requests" until the next.
+	std::fill(m_feedback_snapshot->Mapped().begin(), m_feedback_snapshot->Mapped().end(),
+	          uint8_t {0});
+	m_feedback_snapshot->Flush(0, m_feedback_snapshot->Size());
 	SetVulkanObjectNameF(graphics.device, m_translation->Handle(), "Bindless Translation");
 	SetVulkanObjectNameF(graphics.device, m_feedback->Handle(), "Bindless Feedback");
 
@@ -181,13 +190,15 @@ void BindlessTable::CreatePlaceholders(CommandScheduler& /*scheduler*/) {
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 0, nullptr,
 	                        Placeholders, to_transfer.data());
-	// Slot 0 grey (not resident), slot 1 red (key outside its heap), slot 2 blue (pending): the
-	// colours say which case a surface is in while the table fills.
-	const std::array<vk::ClearColorValue, PlaceholderColors> colors {{
-	    vk::ClearColorValue {std::array<float, 4> {0.5f, 0.5f, 0.5f, 1.0f}},
-	    vk::ClearColorValue {std::array<float, 4> {0.8f, 0.1f, 0.1f, 1.0f}},
-	    vk::ClearColorValue {std::array<float, 4> {0.1f, 0.2f, 0.8f, 1.0f}},
-	}};
+	// Transparent black by default. KYTY_BINDLESS_DEBUG_COLORS=1: slot 0 grey (not resident), slot
+	// 1 red (key outside its heap), slot 2 blue (pending), to see which case a surface is in.
+	const bool debug_colors = std::getenv("KYTY_BINDLESS_DEBUG_COLORS") != nullptr;
+	const auto color        = [debug_colors](float r, float g, float b) {
+        return debug_colors ? vk::ClearColorValue {std::array<float, 4> {r, g, b, 1.0f}}
+		                           : vk::ClearColorValue {std::array<float, 4> {0.0f, 0.0f, 0.0f, 0.0f}};
+	};
+	const std::array<vk::ClearColorValue, PlaceholderColors> colors {
+	    color(0.5f, 0.5f, 0.5f), color(0.8f, 0.1f, 0.1f), color(0.1f, 0.2f, 0.8f)};
 	for (uint32_t i = 0; i < Placeholders; i++) {
 		command.clearColorImage(m_placeholders[i].image, vk::ImageLayout::eTransferDstOptimal,
 		                        &colors[i / ImageArrays], 1, &to_transfer[i].subresourceRange);
@@ -259,6 +270,7 @@ BindlessTable::~BindlessTable() {
 	}
 	m_translation.reset();
 	m_feedback.reset();
+	m_feedback_snapshot.reset();
 	if (m_pool != nullptr) {
 		m_graphics.device.destroyDescriptorPool(m_pool, nullptr);
 	}
@@ -353,26 +365,67 @@ void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot
 	}
 }
 
+void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
+	// Regions are allocated contiguously after word 0, so one copy covers every heap.
+	const vk::DeviceSize size = vk::DeviceSize {m_next_region} * sizeof(uint32_t);
+	scheduler.EndRendering();
+	auto                    command = scheduler.Current().Handle();
+	vk::BufferMemoryBarrier flags_written {};
+	flags_written.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
+	flags_written.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	flags_written.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	flags_written.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	flags_written.buffer              = m_feedback->Handle();
+	flags_written.offset              = 0;
+	flags_written.size                = size;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+	                        &flags_written, 0, nullptr);
+	const vk::BufferCopy copy {0, 0, size};
+	command.copyBuffer(m_feedback->Handle(), m_feedback_snapshot->Handle(), 1, &copy);
+	auto snapshot_written          = flags_written;
+	snapshot_written.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	snapshot_written.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	snapshot_written.buffer        = m_feedback_snapshot->Handle();
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+	                        &snapshot_written, 0, nullptr);
+	m_snapshot_tick = scheduler.CurrentTick();
+}
+
+bool BindlessTable::SnapshotReady(CommandScheduler& scheduler) {
+	return m_snapshot_tick != 0 && scheduler.IsFree(m_snapshot_tick);
+}
+
 void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) {
-	auto* feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
-	if (!m_feedback->IsCoherent()) {
-		m_feedback->Invalidate(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
-	}
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(heap.region * sizeof(uint32_t),
+	                                heap.entries * sizeof(uint32_t));
+	bool cleared = false;
 	for (uint32_t key = 0; key < heap.entries; key++) {
-		if (feedback[heap.region + key] != 0) {
+		if (snapshot[heap.region + key] != 0) {
+			// A flag the GPU sets again after the snapshot may be lost here; a key that is
+			// still pending is flagged again by the next draw that samples it.
 			feedback[heap.region + key] = 0;
 			keys.push_back(key);
+			cleared = true;
 		}
+	}
+	if (cleared) {
+		m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
 	}
 }
 
 uint32_t BindlessTable::TakeWordZero() {
-	auto* feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
-	if (!m_feedback->IsCoherent()) {
-		m_feedback->Invalidate(0, sizeof(uint32_t));
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	auto*       feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	m_feedback_snapshot->Invalidate(0, sizeof(uint32_t));
+	const auto value = snapshot[0];
+	if (value != 0) {
+		feedback[0] = 0;
+		m_feedback->Flush(0, sizeof(uint32_t));
 	}
-	const auto value = feedback[0];
-	feedback[0]      = 0;
 	return value;
 }
 

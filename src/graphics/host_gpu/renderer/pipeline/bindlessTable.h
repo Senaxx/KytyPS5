@@ -83,9 +83,18 @@ public:
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
 	void SetTranslation(const Heap& heap, uint32_t key, uint32_t slot);
-	// Pending keys the GPU flagged since the last call; the flags are cleared.
+	// The host reads the feedback flags from a copy in host-cached memory. The feedback buffer
+	// itself is device memory, and reading every key of three heaps from it uncached took a
+	// fifth of the GPU thread. Records that copy at the current point of the command stream.
+	void RecordFeedbackSnapshot(CommandScheduler& scheduler);
+	[[nodiscard]] bool SnapshotRecorded() const noexcept { return m_snapshot_tick != 0; }
+	// Whether the GPU has executed the recorded copy; never waits.
+	[[nodiscard]] bool SnapshotReady(CommandScheduler& scheduler);
+	void               ConsumeSnapshot() noexcept { m_snapshot_tick = 0; }
+	// Pending keys flagged in the snapshot; their flags are cleared.
 	void TakeRequests(const Heap& heap, std::vector<uint32_t>& keys);
-	// Diagnostics: feedback word 0 (the last out-of-range key, top bit set), cleared.
+	// Diagnostics: feedback word 0 (the last out-of-range key, top bit set) in the snapshot,
+	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
@@ -119,6 +128,8 @@ private:
 	uint32_t                m_images_per_array = 0;
 	std::unique_ptr<Buffer> m_translation;
 	std::unique_ptr<Buffer> m_feedback;
+	std::unique_ptr<Buffer> m_feedback_snapshot;
+	uint64_t                m_snapshot_tick = 0; // 0 = none recorded
 };
 
 } // namespace Libs::Graphics

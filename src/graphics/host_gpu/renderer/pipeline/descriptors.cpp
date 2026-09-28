@@ -936,7 +936,19 @@ void RenderExecutor::ResolveBindlessRequests() {
 	if (frame == m_bindless_frame) {
 		return;
 	}
+	auto& table     = m_context.GetBindlessTable();
+	auto& scheduler = m_context.GetCommandScheduler();
+	// The flags come from a snapshot recorded in an earlier frame. Until the GPU has executed
+	// it, check again at the next bindless draw instead of waiting.
+	if (table.SnapshotRecorded() && !table.SnapshotReady(scheduler)) {
+		return;
+	}
 	m_bindless_frame = frame;
+	if (!table.SnapshotRecorded()) {
+		table.RecordFeedbackSnapshot(scheduler);
+		return;
+	}
+	table.ConsumeSnapshot();
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget   = 128;
 	uint32_t           resolved = 0;
@@ -973,6 +985,7 @@ void RenderExecutor::ResolveBindlessRequests() {
 		LOGF("Bindless requests: frame=%" PRIu64 " requested=%u resolved=%u\n", frame,
 		     requested, resolved);
 	}
+	table.RecordFeedbackSnapshot(scheduler);
 }
 
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
