@@ -155,6 +155,10 @@ bool BindlessImagesEnabled() {
 	return g_config->bindless_images_enabled;
 }
 
+const std::string& GetSkipShaderHashes() {
+	return g_config->skip_shader_hashes;
+}
+
 bool FloatImageAtomicsEnabled() {
 	return g_config->float_image_atomics_enabled;
 }

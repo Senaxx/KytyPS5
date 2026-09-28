@@ -236,15 +236,15 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	return true;
 }
 
-// KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of these guest shaders,
-// the same way a shader that fails to compile is skipped. A diagnostic, to see what one shader
-// contributes or to step past one that loses the device.
+// --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
+// these guest shaders, the same way a shader that fails to compile is skipped. To see what one
+// shader contributes, to step past one that loses the device, or to leave out work nothing can
+// use (the ray-tracing BVH updates whose only consumer gives up).
 bool SkipShaderRequested(uint64_t shader_hash) {
 	static const std::vector<uint64_t> hashes = [] {
 		std::vector<uint64_t> result;
-		if (const char* value = std::getenv("KYTY_SKIP_SHADER_HASHES"); value != nullptr) {
-			const std::string_view list(value);
-			size_t                 start = 0;
+		const auto parse = [&result](std::string_view list) {
+			size_t start = 0;
 			while (start < list.size()) {
 				const auto end = std::min(list.find(',', start), list.size());
 				if (end > start) {
@@ -253,17 +253,18 @@ bool SkipShaderRequested(uint64_t shader_hash) {
 				}
 				start = end + 1;
 			}
+		};
+		parse(Config::GetSkipShaderHashes());
+		if (const char* value = std::getenv("KYTY_SKIP_SHADER_HASHES"); value != nullptr) {
+			parse(value);
+		}
+		for (const auto hash: result) {
+			LOGF("ProgramCache: skipping the draws and dispatches of shader 0x%016" PRIx64 "\n",
+			     hash);
 		}
 		return result;
 	}();
-	if (std::ranges::find(hashes, shader_hash) == hashes.end()) {
-		return false;
-	}
-	static std::atomic<uint32_t> reported = 0;
-	if (reported.fetch_add(1) < 16) {
-		LOGF("ProgramCache: skipping hash=0x%016" PRIx64 ": KYTY_SKIP_SHADER_HASHES\n", shader_hash);
-	}
-	return true;
+	return std::ranges::find(hashes, shader_hash) != hashes.end();
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,

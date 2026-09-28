@@ -75,6 +75,8 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	bool                   bindless_images_enabled     = false;
 	bool                   float_image_atomics_enabled = true;
+	// Guest shaders whose draws and dispatches are skipped: hex hashes, comma-separated.
+	std::string            skip_shader_hashes;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -122,6 +124,7 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool BindlessImagesEnabled();
+const std::string& GetSkipShaderHashes();
 bool FloatImageAtomicsEnabled();
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
