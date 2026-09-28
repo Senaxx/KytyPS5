@@ -891,6 +891,12 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&
+	       TryReadBacking(vaddr, data, size);
+}
+
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

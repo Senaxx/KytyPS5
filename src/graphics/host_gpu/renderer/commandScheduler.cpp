@@ -6,6 +6,7 @@
 #include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -294,12 +295,16 @@ void CommandScheduler::Wait(uint64_t tick) {
 			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
 			const auto submitted_tick = Submit();
 			EXIT_IF(submitted_tick != tick);
+			Timeline::Mark("drain-begin", tick);
 			m_master.Wait(tick);
+			Timeline::Mark("drain-end", tick);
 			BeginNext();
 		}
 		RecordWait(timer.GetTimeS(), true);
 	} else {
+		Timeline::Mark("wait-begin", tick);
 		m_master.Wait(tick);
+		Timeline::Mark("wait-end", tick);
 		RecordWait(timer.GetTimeS(), false);
 	}
 }
@@ -379,6 +384,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		m_master.Wait(operation.tick);
+		Timeline::Mark("tick-done", operation.tick);
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -476,6 +482,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	Timeline::Mark("vk-submit", tick);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceLossDiagnostics(graphics);

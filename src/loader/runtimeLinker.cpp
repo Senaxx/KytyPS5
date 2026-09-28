@@ -670,6 +670,7 @@ struct FaultStats {
 		uint64_t gpu     = 0;
 		uint64_t micros  = 0; // time in the handler: downloads and GPU waits show up here
 		uint64_t vaddr   = 0; // last faulting guest address
+		uint64_t emulated = 0; // reads of GPU-clean bytes completed by the handler itself
 	};
 	std::mutex             mutex;
 	std::vector<Site>      sites;
@@ -679,8 +680,8 @@ struct FaultStats {
 FaultStats g_fault_stats;
 
 void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bool gpu_thread,
-                        uint64_t micros) {
-	if (gpu_thread) {
+                        uint64_t micros, bool emulated) {
+	if (gpu_thread && !emulated) {
 		// The GPU thread faulting on GPU-owned memory drains the whole pipeline; the first few
 		// get a full host stack so the command-processor path responsible can be named.
 		static std::atomic<uint32_t> traced = 0;
@@ -696,7 +697,7 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	auto it = std::find_if(stats.sites.begin(), stats.sites.end(),
 	                       [host_pc](const FaultStats::Site& site) { return site.address == host_pc; });
 	if (it == stats.sites.end()) {
-		stats.sites.push_back({host_pc, 0, 0, 0, 0, 0});
+		stats.sites.push_back({host_pc, 0, 0, 0, 0, 0, 0});
 		it = std::prev(stats.sites.end());
 	}
 	it->count++;
@@ -704,6 +705,7 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	it->gpu += gpu_thread ? 1 : 0;
 	it->micros += micros;
 	it->vaddr = guest_vaddr;
+	it->emulated += emulated ? 1 : 0;
 	if (stats.total - stats.reported < 5000) {
 		return;
 	}
@@ -733,8 +735,9 @@ void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bo
 	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 12); i++) {
 		const auto& site = stats.sites[i];
 		LOGF("\t slow pc=0x%016" PRIx64 " ms=%" PRIu64 " count=%" PRIu64 " reads=%" PRIu64
-		     " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "\n",
-		     site.address, site.micros / 1000, site.count, site.reads, site.gpu, site.vaddr);
+		     " emulated=%" PRIu64 " gpu_thread=%" PRIu64 " last_vaddr=0x%016" PRIx64 "\n",
+		     site.address, site.micros / 1000, site.count, site.reads, site.emulated, site.gpu,
+		     site.vaddr);
 	}
 }
 } // namespace
@@ -758,13 +761,29 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		const auto started = std::chrono::steady_clock::now();
+		const auto elapsed = [started] {
+			return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+			                                 std::chrono::steady_clock::now() - started)
+			                                 .count());
+		};
+		// A read of bytes the GPU has not written, on a page protected because it wrote others:
+		// complete the load from the backing store and leave the page protected. Otherwise the
+		// fault waits for the GPU thread, which downloads the page and drains the GPU.
+		// KYTY_NO_CLEAN_READ_EMULATION=1 restores that for every read.
+		static const bool emulate_clean_reads =
+		    std::getenv("KYTY_NO_CLEAN_READ_EMULATION") == nullptr;
+		if (access == GpuAccess::Read && emulate_clean_reads &&
+		    Loader::X64InstructionEmulator::TryEmulateLoad(
+		        info->native_context, info->access_violation_vaddr,
+		        &Libs::LibKernel::Memory::TryReadCleanFaultingBytes)) {
+			RecordTrackedFault(info->exception_address, info->access_violation_vaddr, true,
+			                   Libs::Graphics::GuestGpu::IsGpuThread(), elapsed(), true);
+			return true;
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
-			const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(
-			                        std::chrono::steady_clock::now() - started)
-			                        .count();
 			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
 			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread(),
-			                   static_cast<uint64_t>(micros));
+			                   elapsed(), false);
 			return true;
 		}
 	}

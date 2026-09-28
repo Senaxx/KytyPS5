@@ -91,6 +91,21 @@ public:
 		}
 	}
 
+	// Like ForEachInRange, but passes each overlapping range whole instead of clipped.
+	template <typename Func>
+	void ForEachOverlapping(uint64_t address, uint64_t size, Func&& func) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.upper_bound(address);
+		if (it != m_ranges.begin()) {
+			--it;
+		}
+		for (; it != m_ranges.end() && it->first < end; ++it) {
+			if (it->second > address) {
+				func(it->first, it->second);
+			}
+		}
+	}
+
 	[[nodiscard]] bool Empty() const { return m_ranges.empty(); }
 
 private:

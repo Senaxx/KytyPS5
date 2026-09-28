@@ -11,6 +11,8 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -607,7 +609,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		}
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		GpuTiming::Before(m_context, buffer);
 		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
+		Timeline::Mark("dispatch", program.shader_hash,
+		               (static_cast<uint64_t>(thread_group_x) << 32u) |
+		                   (thread_group_y << 16u) | thread_group_z);
 
 		// The removed host fence also ordered read-only dispatches before later writers.
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -661,7 +668,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	do {
 		RebindImages(bindings);
 		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+		    args_addr, sizeof(vk::DispatchIndirectCommand), false, false, {},
+		    use_thread_dimensions);
 		EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 		vk::Buffer     indirect_buffer = args_buffer->Handle();
 		vk::DeviceSize indirect_offset = args_offset;
@@ -702,7 +710,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		        vk::PipelineStageFlagBits::eTransfer,
 		    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		GpuTiming::Before(m_context, buffer);
 		vk_buffer.dispatchIndirect(indirect_buffer, indirect_offset);
+		GpuTiming::After(m_context, buffer, program.shader_hash, GpuTiming::Dispatch);
+		Timeline::Mark("dispatch-indirect", program.shader_hash, 0);
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	} while (recovery.Retry());
 	ResetBindings();

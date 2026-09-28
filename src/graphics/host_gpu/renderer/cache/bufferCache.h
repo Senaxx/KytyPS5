@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -54,10 +55,13 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// needs_device_address: the caller reads the data through a buffer device address, which
+	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        bool     is_texel_buffer      = false,
+	                                                        BufferId id                   = {},
+	                                                        bool     needs_device_address = false);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -78,14 +82,18 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
+	// memory holds their current value even when their page is protected.
+	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
-	// GPU thread: writes bytes the GPU has not written, on a page protected because the GPU wrote
-	// other bytes of it, without downloading the page: the host copy through the backing store,
-	// the GPU copy in the command stream. False when there is nothing to save (the page is not
-	// protected as GPU-written) or it would be wrong (the bytes are GPU-written, or no cached
-	// buffer covers them); the caller then writes normally.
+	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
+	// downloading the page: the host copy through the backing store, the GPU copy in the command
+	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
+	// sides and no longer need a download. False when there is nothing to save (the page is not
+	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
+	// no cached buffer covers them); the caller then writes normally.
 	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
@@ -95,6 +103,9 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+
+	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
+	inline static thread_local uint64_t s_diag_shader_hash = 0;
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -147,6 +158,11 @@ private:
 	BufferMap                                          m_buffers;
 	PageTable                                          m_page_table;
 	RangeSet                                           m_gpu_modified_ranges;
+	// Bytes whose download is recorded but not yet in guest memory.
+	RangeSet                                           m_downloading_ranges;
+	// Guards changes to both range sets (GPU thread and download completions) against
+	// IsCleanForConcurrentRead; the GPU thread reads them without it.
+	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
 	StreamBuffer                                       m_stream_buffer;

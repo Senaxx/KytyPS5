@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/shader/shader.h"
@@ -136,6 +137,72 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_work_available.Signal();
 }
 
+bool GuestGpu::TrySendCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (IsGpuThread()) {
+		command();
+		return true;
+	}
+	Common::LockGuard lock(m_queue_mutex);
+	if (!m_accepting) {
+		return false;
+	}
+	m_commands.push_back(std::move(command));
+	m_pending_commands.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+	return true;
+}
+
+namespace {
+std::atomic<bool> g_labels_deferred {false};
+} // namespace
+
+bool GuestGpu::LabelsDeferred() noexcept {
+	return g_labels_deferred.load(std::memory_order_relaxed);
+}
+
+bool GuestGpu::LabelsAtCompletion() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LABELS_AT_COMPLETION");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void GuestGpu::DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size) {
+	EXIT_IF(!IsGpuThread() || (size != 4 && size != 8));
+	g_labels_deferred.store(true, std::memory_order_relaxed);
+	const auto sequence        = ++m_label_sequence;
+	m_pending_labels[address] = {value, size, sequence};
+	// The completion runs on the scheduler's priority thread, which must not fault on guest
+	// memory the GPU wrote to; the write itself goes back to the GPU thread.
+	m_renderer.GetCommandScheduler().DeferPriorityOperation([this, address, value, size,
+	                                                         sequence] {
+		(void)TrySendCommand([this, address, value, size, sequence] {
+			Timeline::Mark("label", address, value);
+			std::memcpy(reinterpret_cast<void*>(address), &value, size);
+			const auto pending = m_pending_labels.find(address);
+			if (pending != m_pending_labels.end() && pending->second.sequence == sequence) {
+				m_pending_labels.erase(pending);
+			}
+		});
+	});
+}
+
+template <typename T>
+T GuestGpu::ReadLabel(const volatile T* address) const {
+	if (!m_pending_labels.empty()) {
+		const auto pending = m_pending_labels.find(reinterpret_cast<uint64_t>(address));
+		if (pending != m_pending_labels.end() && pending->second.size >= sizeof(T)) {
+			return static_cast<T>(pending->second.value);
+		}
+	}
+	return *address;
+}
+
+template uint32_t GuestGpu::ReadLabel<uint32_t>(const volatile uint32_t*) const;
+template uint64_t GuestGpu::ReadLabel<uint64_t>(const volatile uint64_t*) const;
+
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
@@ -170,6 +237,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
+	Timeline::Mark("submit-gfx", draw_commands.size(), constant_commands.size());
 	Submission submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
@@ -184,6 +252,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
 	const auto compute_queue = queue - ComputeQueueBase;
+	Timeline::Mark("submit-cq", compute_queue, commands.size());
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
@@ -350,6 +419,14 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 }
 
 template <typename T>
+T CommandProcessor::ReadLabel(const volatile T* addr) const {
+	return GuestGpu::LabelsDeferred() ? m_renderer.GetGpu().ReadLabel(addr) : *addr;
+}
+
+template uint32_t CommandProcessor::ReadLabel<uint32_t>(const volatile uint32_t*) const;
+template uint64_t CommandProcessor::ReadLabel<uint64_t>(const volatile uint64_t*) const;
+
+template <typename T>
 void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll,
                                   uint32_t wait_op) {
 	EXIT_IF(addr == nullptr);
@@ -358,7 +435,7 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	(void)poll;
-	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
+	if (!TestWaitRegMemValue(ReadLabel(addr), ref, mask, func)) {
 		SuspendPm4();
 	}
 }
@@ -386,7 +463,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	}
 
 	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
-	// the page, draining the GPU; WriteClean skips that when these bytes are not GPU-written.
+	// the page, draining the GPU; WriteClean writes both copies instead.
 	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
 		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
@@ -509,7 +586,9 @@ void GuestGpu::ThreadRun(void* data) {
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
+				Timeline::Mark("gpu-idle");
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
+				Timeline::Mark("gpu-wake");
 			}
 			if (gpu->m_stopping && gpu->m_commands.empty() && gpu->m_submission_count == 0) {
 				gpu->m_processing = false;
@@ -531,7 +610,9 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					Timeline::Mark("gpu-blocked");
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					Timeline::Mark("gpu-unblocked");
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
@@ -592,6 +673,14 @@ void GuestGpu::ThreadRun(void* data) {
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
 	auto&      cp          = GetProcessor(submission.queue_id);
+	Timeline::Mark("proc-begin", submission.queue_id, static_cast<uint64_t>(submission.type));
+	struct EndMark {
+		const Submission& submission;
+		~EndMark() {
+			Timeline::Mark("proc-end", submission.queue_id,
+			               submission.command_complete ? 1u : 0u);
+		}
+	} end_mark {submission};
 
 	if (first_slice) {
 		submission.started = true;
@@ -1210,10 +1299,17 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		default: EXIT("unknown interrupt_selector\n");
 	}
 
+	const bool at_completion = !with_interrupt && GuestGpu::LabelsAtCompletion();
+
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		if (at_completion) {
+			m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst), data,
+			                                    sizeof(data));
+		} else {
+			std::memcpy(dst, &data, sizeof(data));
+		}
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1267,7 +1363,12 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					if (at_completion) {
+						m_renderer.GetGpu().DeferLabelWrite(reinterpret_cast<uint64_t>(dst),
+						                                    value, sizeof(value));
+					} else {
+						std::memcpy(dst, &value, sizeof(value));
+					}
 
 					if (with_interrupt) {
 						if (with_writeback) {

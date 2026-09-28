@@ -7,6 +7,8 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/gpuTiming.h"
+#include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -948,7 +950,10 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
-	m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
+	const auto presented =
+	    m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+	Timeline::Present(presented);
+	GpuTiming::Present(presented);
 	m_impl->Present();
 }
 

@@ -127,6 +127,13 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// Diagnostics: names the shader whose bindings are prepared, for KYTY_WATCH_GPU_WRITE.
+struct DiagShaderScope {
+	explicit DiagShaderScope(uint64_t hash) { BufferCache::s_diag_shader_hash = hash; }
+	~DiagShaderScope() { BufferCache::s_diag_shader_hash = 0; }
+	KYTY_CLASS_NO_COPY(DiagShaderScope);
+};
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
@@ -1024,6 +1031,35 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
+	const DiagShaderScope diag_shader_scope(program.shader_hash);
+	// Diagnostics: KYTY_WATCH_SHADER=<hash> logs the buffer and texture descriptors a shader is
+	// bound with (first few uses).
+	static const uint64_t watch_shader = [] {
+		const char* value = std::getenv("KYTY_WATCH_SHADER");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	static std::atomic<uint32_t> watched_uses {0};
+	if (watch_shader != 0 && program.shader_hash == watch_shader && watched_uses.fetch_add(1) < 4) {
+		LOGF("WatchShader 0x%016" PRIx64 " stage=%u buffers=%zu images=%zu\n", program.shader_hash,
+		     static_cast<uint32_t>(program.stage), program.info.buffers.size(),
+		     program.info.images.size());
+		for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
+			const auto r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+			LOGF("  buffer[%zu]: formatted=%d written=%d base=0x%012" PRIx64
+			     " stride=%u records=%u format=%u dst_sel=%u%u%u%u\n",
+			     i, program.info.buffers[i].formatted ? 1 : 0,
+			     program.info.buffers[i].written ? 1 : 0, r.Base48(), r.Stride(), r.NumRecords(),
+			     r.RawFormat(), r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW());
+		}
+		for (size_t i = 0; i < program.info.images.size() && i < snapshot.images.size(); i++) {
+			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
+			LOGF("  image[%zu]: bindless=%d format=%u dst_sel=%u%u%u%u type=%u extent=%ux%u\n", i,
+			     program.info.images[i].bindless ? 1 : 0, static_cast<uint32_t>(r.Format()),
+			     r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW(),
+			     static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Width5()) + 1u,
+			     static_cast<uint32_t>(r.Height5()) + 1u);
+		}
+	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -1125,6 +1161,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != layout.memory_offset_count);
+	const DiagShaderScope diag_shader_scope(program.shader_hash);
 
 	prepared.buffers.clear();
 	prepared.buffers.reserve(layout.memory_offset_count);
