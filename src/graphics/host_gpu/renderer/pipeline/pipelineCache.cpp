@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
@@ -7,6 +8,7 @@
 #include "common/profiler.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -31,11 +33,17 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+bool ShaderFailureNonFatal() {
+	static const bool value = true;
+	return value;
+}
 
 namespace {
 
@@ -93,9 +101,99 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+// Caches TryReadGpuCleanBacking's per-page dirty verdict for the lifetime of a single
+// MaterializeResources call (see ReadShaderGuestMemory below, which the caller wires up as this
+// scratch space's owner via SrtRuntime::userdata). A shader's SRT resource-specialization reads
+// commonly pull several adjacent 4-byte descriptor words out of the same buffer, all landing in
+// the same TRACKER_PAGE_SIZE page -- every one of them currently pays the same mutex-guarded
+// buffer/texture-cache dirty query for an answer that cannot have changed since the previous read
+// a few nanoseconds earlier in the same synchronous, single-threaded evaluation (this only runs on
+// the GPU thread, and nothing this evaluation does submits GPU work that could mark a page dirty
+// mid-pass). Small fixed capacity: a shader's resource plan touches only a handful of distinct
+// pages in practice; anything past capacity just falls back to the uncached path.
+struct GpuCleanReadCache {
+	static constexpr size_t Capacity = 8;
+	std::array<uint64_t, Capacity> pages {};
+	std::array<bool, Capacity>     dirty {};
+	size_t                         count = 0;
+
+	[[nodiscard]] bool Find(uint64_t page, bool& out_dirty) const {
+		for (size_t i = 0; i < count; i++) {
+			if (pages[i] == page) {
+				out_dirty = dirty[i];
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Insert(uint64_t page, bool is_dirty) {
+		if (count < Capacity) {
+			pages[count] = page;
+			dirty[count] = is_dirty;
+			count++;
+		}
+	}
+};
+
+bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
+	for (auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadClockRealtime64) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
+// mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
+// whatever address a descriptor chain produced, including 0 on a path the shader never takes.
+bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty() ||
+	    !Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		return false;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	auto*      cache     = static_cast<GpuCleanReadCache*>(userdata);
+	const auto page      = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto last_page = Common::AlignDown(address + values.size_bytes() - 1, TRACKER_PAGE_SIZE);
+	// A read spanning two pages skips the cache rather than reason about two pages' verdicts
+	// at once.
+	bool dirty = false;
+	if (cache == nullptr || page != last_page) {
+		if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes())) {
+			return true;
+		}
+	} else if (cache->Find(page, dirty)) {
+		if (!dirty) {
+			return Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
+		}
+	} else {
+		const bool ok =
+		    Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+		cache->Insert(page, !ok);
+		if (ok) {
+			return true;
+		}
+	}
+	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
+	// tracked-page fault, which drains the GPU and refreshes the page, so the value read is
+	// the one the shader would see. Before, this only ever succeeded because the aggressive
+	// garbage collector happened to have downloaded the range first.
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		return false;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -286,16 +384,44 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if (unsupported.contains(lookup_key)) {
+			return ShaderProgram {};
+		}
+		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		auto                                         entry = programs.find(lookup_key);
+		// Scoped to this call only -- see GpuCleanReadCache's comment for why a page's dirty
+		// verdict can be safely reused across every read within one synchronous evaluation but
+		// must never survive past it.
+		GpuCleanReadCache                            clean_read_cache;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = &clean_read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			{
+				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
+				if (!ShaderRecompiler::IR::MaterializeResources(
+				        entry->second.resource_plan, runtime, entry->second.resources,
+				        entry->second.specialization)) {
+					// A descriptor source that cannot be read right now (memory the guest has
+					// not mapped or filled yet) skips this draw rather than the session; the
+					// next one re-evaluates from scratch.
+					if (!ShaderFailureNonFatal()) {
+						EXIT("shader resource materialization failed\n");
+					}
+					static std::atomic<uint32_t> reported = 0;
+					if (reported.fetch_add(1) < 16) {
+						LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+						     ": resource materialization failed (materialization line %d)\n",
+						     static_cast<uint32_t>(stage), params.hash,
+						     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+					}
+					return ShaderProgram {};
+				}
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -353,13 +479,46 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		options.non_fatal = ShaderFailureNonFatal();
+		options.bindless_images = bindless_images;
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.unsupported) {
+			// Remember the refusal: a skipped shader is dispatched again every frame, and
+			// re-deriving the same answer costs as much as a compile each time.
+			unsupported.insert(lookup_key);
+			return ShaderProgram {};
+		}
+		if (!shader_clock && UsesShaderClock(translated.program)) {
+			if (!ShaderFailureNonFatal()) {
+				EXIT("S_MEMREALTIME needs shaderDeviceClock\n");
+			}
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 16) {
+				LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+				     ": S_MEMREALTIME needs shaderDeviceClock\n",
+				     static_cast<uint32_t>(stage), params.hash);
+			}
+			unsupported.insert(lookup_key);
+			return ShaderProgram {};
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				if (!ShaderFailureNonFatal()) {
+					EXIT("shader resource materialization failed\n");
+				}
+				static std::atomic<uint32_t> reported = 0;
+				if (reported.fetch_add(1) < 16) {
+					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+					     ": resource materialization failed on first use (materialization line %d)\n",
+					     static_cast<uint32_t>(stage), params.hash,
+					     ShaderRecompiler::IR::LastIndirectImageFailureLine());
+				}
+				return ShaderProgram {};
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
@@ -383,7 +542,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images)
+	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -396,13 +556,19 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	bool                                                        shader_clock = false;
+	bool                                                        bindless_images = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(
+          graphics.device, graphics.shader_device_clock_enabled,
+          graphics.bindless_enabled && Config::BindlessImagesEnabled())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }
@@ -576,7 +742,12 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
-		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+		if (!PrepareTessellationPrograms(vertex_regs, context, vertex_info, vertex_params)) {
+			if (!ShaderFailureNonFatal()) {
+				EXIT("unsupported tessellation programs\n");
+			}
+			return {};
+		}
 	} else {
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
 	}
@@ -649,6 +820,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (!result.vertex[i]) {
+			return {};
+		}
 	}
 	return result;
 }

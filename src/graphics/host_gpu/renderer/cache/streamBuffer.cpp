@@ -322,9 +322,16 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
 			return false;
 		}
-		Scheduler().Wait(watch.tick);
-		if (Usage() == MemoryUsage::Download) {
-			Scheduler().WaitPriorityOperations(watch.tick);
+		// Profiling-only zone: a stream-buffer ring wrap forcing the CPU to wait for the GPU to
+		// finish with the memory it's about to reclaim. Scheduler().IsFree() above is the fast,
+		// non-blocking path -- only reaching Wait() itself means the GPU genuinely hasn't caught
+		// up yet.
+		{
+			KYTY_PROFILER_BLOCK("StreamBuffer::WaitPendingOperations (ring wrap wait)");
+			Scheduler().Wait(watch.tick);
+			if (Usage() == MemoryUsage::Download) {
+				Scheduler().WaitPriorityOperations(watch.tick);
+			}
 		}
 		wait_bound = watch.upper_bound;
 		++wait_cursor;

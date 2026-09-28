@@ -6,7 +6,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Resolves native descriptor sources, plans their scalar reads, and assigns dense resource bindings.
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg);
+// False when a non-fatal compile could not track the resources: the shader gives up.
+bool TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

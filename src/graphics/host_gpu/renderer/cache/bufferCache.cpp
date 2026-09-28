@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -14,7 +15,9 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -71,7 +74,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -94,7 +98,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, LruClock());
 	}
 }
 
@@ -112,6 +116,17 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
+	// windows; a window that does not fit drains the ring before it is mapped.
+	const auto capacity = m_download_buffer.Size();
+	bool       any      = false;
+	for (uint64_t offset = 0; offset < size; offset += capacity) {
+		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+	}
+	return any;
+}
+
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -129,8 +144,35 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	const auto capacity = m_download_buffer.Size();
+	for (size_t first = 0; first < copies.size();) {
+		const auto base       = copies[first].dstOffset;
+		auto       last       = first;
+		uint64_t   batch_size = 0;
+		while (last < copies.size()) {
+			const auto end = copies[last].dstOffset - base + Common::AlignUp(copies[last].size, 64);
+			if (end > capacity) {
+				break;
+			}
+			batch_size = end;
+			last++;
+		}
+		EXIT_IF(last == first);
+		std::vector<vk::BufferCopy> batch(copies.begin() + static_cast<std::ptrdiff_t>(first),
+		                                  copies.begin() + static_cast<std::ptrdiff_t>(last));
+		for (auto& copy: batch) {
+			copy.dstOffset -= base;
+		}
+		DownloadBufferCopies(buffer, std::move(batch), batch_size);
+		first = last;
+	}
+	return true;
+}
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+                                       uint64_t total_size) {
+	const auto buffer_address = buffer.CpuAddress();
+	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
 		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
@@ -247,6 +289,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -275,6 +318,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -356,12 +400,40 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	if (vaddr < CACHING_PAGESIZE) {
+		// Guest page 0 is never mapped; a request here is a garbage or null descriptor that
+		// slipped past the null checks. The memory tracker cannot hold address 0, so name the
+		// caller now rather than in the garbage collector later.
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 8) {
+			LOGF("BufferCache: buffer requested in guest page 0: vaddr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n%s",
+			     vaddr, size, Common::HostBacktrace().c_str());
+		}
+	}
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
 
+	// A mirror far larger than the request means the merge, not a descriptor, chose this
+	// size: buffers only ever grow here, so one that swallows its neighbours as a title
+	// streams across its heap ends up spanning it. Name the request that did it.
+	if (overlap.end - overlap.begin >= 256ull * 1024 * 1024) {
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 12) {
+			size_t absorbed = 0;
+			for (auto it = overlap.first; it != overlap.last; ++it) {
+				absorbed++;
+			}
+			LOGF("BufferCache: large mirror %" PRIu64 "MB at 0x%016" PRIx64
+			     " for request 0x%016" PRIx64 "+%" PRIu64 "KB, absorbing %zu buffers, leap=%d\n",
+			     (overlap.end - overlap.begin) >> 20u, overlap.begin, vaddr, size >> 10u, absorbed,
+			     overlap.has_stream_leap ? 1 : 0);
+		}
+	}
 	const auto id = m_slot_buffers.insert(
 	    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, overlap.begin,
 	    AllFlags | vk::BufferUsageFlagBits::eShaderDeviceAddress, overlap.end - overlap.begin);
@@ -377,19 +449,71 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	return id;
 }
 
+namespace {
+// What the per-draw synchronization is asked to cover. A giant raw descriptor makes every
+// draw walk the tracker for hundreds of regions; the histogram says whether that is the case.
+struct SyncStats {
+	uint64_t calls      = 0;
+	uint64_t uploads    = 0;
+	uint64_t bytes      = 0;
+	uint64_t buckets[6] = {}; // <=4K, <=64K, <=1M, <=16M, <=256M, larger
+	uint64_t written_buckets[6] = {};
+	uint64_t written    = 0;
+	double   walk_s     = 0.0;
+};
+SyncStats g_sync_stats;
+
+void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
+	auto& st = g_sync_stats;
+	st.calls++;
+	st.uploads += uploaded ? 1 : 0;
+	st.bytes += size;
+	st.written += is_written ? 1 : 0;
+	st.walk_s += walk_s;
+	const int bucket = size <= 0x1000 ? 0 : size <= 0x10000 ? 1 : size <= 0x100000 ? 2
+	                 : size <= 0x1000000 ? 3 : size <= 0x10000000 ? 4 : 5;
+	st.buckets[bucket]++;
+	if (is_written) {
+		st.written_buckets[bucket]++;
+	}
+	if (st.calls % 200000 == 0) {
+		LOGF("SyncStats: calls=%" PRIu64 " uploads=%" PRIu64 " written=%" PRIu64
+		     " avg_bytes=%" PRIu64 " walk_total=%.1fms sizes(<=4K,64K,1M,16M,256M,>)=%" PRIu64
+		     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 " written_sizes=%" PRIu64
+		     ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64 "\n",
+		     st.calls, st.uploads, st.written, st.bytes / st.calls, st.walk_s * 1000.0,
+		     st.buckets[0], st.buckets[1], st.buckets[2], st.buckets[3], st.buckets[4],
+		     st.buckets[5], st.written_buckets[0], st.written_buckets[1], st.written_buckets[2],
+		     st.written_buckets[3], st.written_buckets[4], st.written_buckets[5]);
+		st = {};
+	}
+}
+} // namespace
+
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	KYTY_PROFILER_FUNCTION();
+	Common::Timer               walk_timer;
+	walk_timer.Start();
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
-	m_memory_tracker.ForEachUploadRange(
-	    vaddr, size, is_written,
-	    [&](uint64_t address, uint64_t bytes) noexcept {
-		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
-		    total_size += bytes;
-	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	{
+		KYTY_PROFILER_BLOCK("Sync::Tracker");
+		m_memory_tracker.ForEachUploadRange(
+		    vaddr, size, is_written,
+		    [&](uint64_t address, uint64_t bytes) noexcept {
+			    copies.emplace_back(total_size, buffer.Offset(address), bytes);
+			    total_size += bytes;
+		    },
+		    [&]() noexcept {
+			    KYTY_PROFILER_BLOCK("Sync::Upload");
+			    source = UploadCopies(buffer, copies, total_size);
+		    });
+	}
+	RecordSync(size, is_written, static_cast<bool>(source), walk_timer.GetTimeS());
 	if (source) {
+		KYTY_PROFILER_BLOCK("Sync::Copy");
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto native = command.Handle();
@@ -416,6 +540,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
 	}
 	if (is_texel_buffer && !is_written) {
+		KYTY_PROFILER_BLOCK("Sync::TexelImage");
 		return SynchronizeBufferFromImage(buffer, vaddr, size);
 	}
 	return false;
@@ -438,6 +563,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return m_staging_buffer.Handle();
 	}
 
+	KYTY_PROFILER_BLOCK("BufferCache::UploadCopies(temporary)");
 	auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
@@ -479,6 +605,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -502,8 +629,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: staging reservation failed for guest image\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+		std::memset(staging, 0, static_cast<size_t>(size));
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
@@ -595,9 +725,20 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+uint64_t BufferCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
 void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
+	KYTY_PROFILER_FUNCTION();
+	m_gc_tick++;
+	const auto clock = LruClock();
+	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images
+	// spilled to host memory, which on a 6 GB card keeps it above the critical mark forever
+	// and has the collector destroy and recreate every buffer twice a second (a third of
+	// the GPU thread's time in the world). KYTY_GC_DEVICE_BYTES=1 restores that policy.
+	static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
+	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
@@ -605,20 +746,33 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
+	// never a candidate, whatever the submission count.
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	static uint64_t       gc_runs = 0, gc_visited = 0, gc_retained = 0, gc_deleted = 0;
+	static double         gc_seconds = 0.0;
+	Common::Timer         gc_timer;
+	gc_timer.Start();
+	gc_runs++;
+	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
-		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
-		                                           buffer.Size(), "garbage collection");
-		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
+		gc_visited++;
+		if (buffer.CpuAddress() == 0) {
+			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
 		}
+		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
+		                                           buffer.Size(), "garbage collection");
+		// An aged GPU-dirty buffer is downloaded and dropped under either policy. Retaining it
+		// (the non-aggressive rule before) leaves its GPU-written bytes owning the pages
+		// forever, and the images that share those pages are then re-sourced from the
+		// buffer's stale contents: the world renders black. Measured 2026-09-21.
+		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty) {
 			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
@@ -626,13 +780,41 @@ void BufferCache::RunGarbageCollector() {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 		}
+		gc_deleted++;
 		return ++retire_count == limit;
 	});
+	gc_seconds += gc_timer.GetTimeS();
+	if (gc_runs % 500 == 0) {
+		LOGF("GcStats: runs=%" PRIu64 " visited=%" PRIu64 " retained=%" PRIu64 " deleted=%" PRIu64
+		     " scan_total=%.1fms buffers=%zu used=%" PRIu64 "MB trigger=%" PRIu64 "MB aggressive=%d\n",
+		     gc_runs, gc_visited, gc_retained, gc_deleted, gc_seconds * 1000.0, m_buffers.size(),
+		     m_total_used_memory >> 20u, m_trigger_gc_memory >> 20u, static_cast<int>(aggressive));
+		gc_visited = gc_retained = gc_deleted = 0;
+		gc_seconds = 0.0;
+		// The largest buffers: the whole-heap descriptors of a title mirror as whole device
+		// buffers, and a handful of them can be most of the cache.
+		std::vector<std::pair<uint64_t, uint64_t>> largest;
+		for (const auto& [address, id]: m_buffers) {
+			const auto* buffer = m_slot_buffers.try_get(id);
+			if (buffer != nullptr && !buffer->is_deleted) {
+				largest.emplace_back(buffer->Size(), address);
+			}
+		}
+		std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(largest.size(), 6),
+		                  largest.end(), std::greater<>());
+		for (size_t i = 0; i < std::min<size_t>(largest.size(), 6); i++) {
+			LOGF("\t largest[%zu] = %" PRIu64 "MB at 0x%016" PRIx64 "\n", i, largest[i].first >> 20u,
+			     largest[i].second);
+		}
+	}
 	if (dirty_buffers.empty()) {
 		return;
 	}
 
-	// Publish all queued downloads before releasing their tracked pages and owners.
+	// Publish all queued downloads before releasing their tracked pages and owners. Must be
+	// CurrentTick(): DownloadBufferMemory above queued copy-out commands into the currently open
+	// recording, so that recording has to actually submit and complete -- see ReadMemory's wait
+	// for why waiting on an older per-buffer tick here would skip that entirely.
 	const auto completion_tick = m_scheduler.CurrentTick();
 	m_scheduler.Wait(completion_tick);
 	m_scheduler.WaitPriorityOperations(completion_tick);

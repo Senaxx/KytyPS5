@@ -71,7 +71,11 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	if (data.input_semantics == nullptr) {
 		return ShaderError::Fail(error, "missing vertex input semantics");
 	}
-	next.input_semantics = {data.input_semantics, data.num_input_semantics};
+	// The span points at the table copied when the shader was registered, not at guest memory:
+	// the header shares a page with memory the GPU writes each frame, and reading it per draw
+	// faults and drains the pipeline. It lives as long as `data`.
+	static_assert(ShaderVertexInputInfo::RES_MAX <= ShaderMappedData::MaxInputSemantics);
+	next.input_semantics = {data.input_semantics_snapshot.data(), data.num_input_semantics};
 	metadata                   = next;
 	return true;
 }

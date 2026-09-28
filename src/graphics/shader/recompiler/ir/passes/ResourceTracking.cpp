@@ -1,6 +1,8 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -16,6 +18,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
+
+// Thrown by a non-fatal Fail; TrackResources catches it and gives the shader up.
+struct TrackingFailure {};
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
@@ -297,6 +302,7 @@ public:
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectImages();
+		PlanDefaultSamplers();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				Collect(inst);
@@ -360,10 +366,16 @@ private:
 		std::array<const Inst*, 8> reads {};
 	};
 
+	// A non-fatal compile gives the shader up instead: the failure unwinds to TrackResources,
+	// which returns false.
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
 		    fmt::format("shader resource tracking: hash=0x{:016x} stage={} pc=0x{:08x} {}",
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
+		if (Frontend::TranslationNonFatal()) {
+			LOGF("%s\n", message.c_str());
+			throw TrackingFailure {};
+		}
 		EXIT("%s", message.c_str());
 		std::abort();
 	}
@@ -763,6 +775,8 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
+				    a.key_shift != b.key_shift || a.key_mask != b.key_mask ||
+				    a.bindless != b.bindless ||
 				    a.table_offset != b.table_offset || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
@@ -790,9 +804,33 @@ private:
 		return true;
 	}
 
+	// A phi web with no user outside itself is never read: the register merge at a join keeps
+	// a dead loop-carried copy of a scalar alive, and dead-code elimination cannot break the
+	// cycle.
+	static bool FeedsOnlyDeadPhis(const Inst& user) {
+		std::vector<const Inst*> pending {&user};
+		std::vector<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto* current = pending.back();
+			pending.pop_back();
+			if (std::ranges::find(visited, current) != visited.end()) {
+				continue;
+			}
+			if (current->GetOpcode() != ValueOpcode::Phi) {
+				return false;
+			}
+			visited.push_back(current);
+			for (const auto& use: current->Uses()) {
+				pending.push_back(use.user);
+			}
+		}
+		return true;
+	}
+
 	static bool UsesOnly(const Inst& value, std::span<const Inst* const> users) {
 		return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
-			return std::ranges::find(users, use.user) != users.end();
+			return std::ranges::find(users, use.user) != users.end() ||
+			       FeedsOnlyDeadPhis(*use.user);
 		});
 	}
 
@@ -856,6 +894,96 @@ private:
 		return ValidateSource(descriptor, bad_dword);
 	}
 
+	// A value computed only from scalar sources is the same in every lane: every IR branch
+	// condition is scalar (SCC, VCCZ, EXECZ), so a phi of such values is too, and per-lane
+	// values only come from vector sources and lane selects on per-lane conditions. Anything
+	// not listed counts as per-lane.
+	bool IsWaveUniform(Value value) const {
+		std::vector<const Inst*> pending;
+		std::vector<const Inst*> visited;
+		const auto push = [&](Value operand) {
+			operand = operand.Resolve();
+			if (operand.IsImmediate()) {
+				return true;
+			}
+			const auto* inst = operand.TryInstruction();
+			if (inst == nullptr) {
+				return false;
+			}
+			if (std::ranges::find(visited, inst) == visited.end()) {
+				visited.push_back(inst);
+				pending.push_back(inst);
+			}
+			return true;
+		};
+		if (!push(value)) {
+			return false;
+		}
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			switch (inst->GetOpcode()) {
+				case ValueOpcode::ReadFirstLane:
+				case ValueOpcode::ReadLane:
+				case ValueOpcode::GetUserData:
+				case ValueOpcode::GetShaderBase:
+				case ValueOpcode::GetSrtResource:
+				case ValueOpcode::ReadConst:
+				case ValueOpcode::UndefU1:
+				case ValueOpcode::UndefU32: continue;
+				case ValueOpcode::LoadAddressU32: {
+					uint32_t index = 0;
+					if (ScalarReadMemory(*inst, index) == nullptr) {
+						return false;
+					}
+				} break;
+				case ValueOpcode::ReadConstBuffer:
+				case ValueOpcode::GetBufferResource:
+				case ValueOpcode::GetAddressResource:
+				case ValueOpcode::Phi:
+				case ValueOpcode::IAdd32:
+				case ValueOpcode::ISub32:
+				case ValueOpcode::IMul32:
+				case ValueOpcode::ShiftLeftLogical32:
+				case ValueOpcode::ShiftRightLogical32:
+				case ValueOpcode::ShiftRightArithmetic32:
+				case ValueOpcode::BitwiseAnd32:
+				case ValueOpcode::BitwiseOr32:
+				case ValueOpcode::BitwiseXor32:
+				case ValueOpcode::BitwiseNot32:
+				case ValueOpcode::BitFieldUExtract:
+				case ValueOpcode::BitCount32:
+				case ValueOpcode::FindILsb32:
+				case ValueOpcode::FindUMsb32:
+				case ValueOpcode::SMin32:
+				case ValueOpcode::UMin32:
+				case ValueOpcode::SMax32:
+				case ValueOpcode::UMax32:
+				case ValueOpcode::SLessThan32:
+				case ValueOpcode::ULessThan32:
+				case ValueOpcode::IEqual32:
+				case ValueOpcode::INotEqual32:
+				case ValueOpcode::SLessThanEqual32:
+				case ValueOpcode::ULessThanEqual32:
+				case ValueOpcode::SGreaterThanEqual32:
+				case ValueOpcode::UGreaterThanEqual32:
+				case ValueOpcode::LogicalAnd:
+				case ValueOpcode::LogicalOr:
+				case ValueOpcode::LogicalNot:
+				case ValueOpcode::ConditionRef:
+				case ValueOpcode::SelectU1:
+				case ValueOpcode::SelectU32: break;
+				default: return false;
+			}
+			for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+				if (!push(inst->Arg(arg))) {
+					return false;
+				}
+			}
+		}
+		return true;
+	}
+
 	bool MatchMaterialOffset(Value value, Value& selector, uint32_t& stride,
 	                         uint32_t& offset) const {
 		value           = value.Resolve();
@@ -874,6 +1002,17 @@ private:
 			offset = immediate;
 		}
 		const auto* multiply = value.TryInstruction();
+		uint32_t    shift    = 0;
+		if (multiply != nullptr && multiply->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+		    multiply->NumArgs() == 2u && ImmediateU32(multiply->Arg(1), shift) && shift < 32u) {
+			// A power-of-two record size is usually a shift, not a multiply.
+			stride   = 1u << shift;
+			selector = multiply->Arg(0).Resolve();
+			const auto* selector_inst = selector.TryInstruction();
+			return selector_inst != nullptr &&
+			       (selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane ||
+			        IsWaveUniform(selector));
+		}
 		if (multiply == nullptr || multiply->GetOpcode() != ValueOpcode::IMul32 ||
 		    multiply->NumArgs() != 2u) {
 			return false;
@@ -887,7 +1026,8 @@ private:
 		}
 		const auto* selector_inst = selector.TryInstruction();
 		return stride != 0u && selector_inst != nullptr &&
-		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
+		       (selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane ||
+		        IsWaveUniform(selector));
 	}
 
 	enum class LaneQuantifier { Any, All };
@@ -1357,6 +1497,13 @@ private:
 		return {};
 	}
 
+	// Diagnostics: the source line of the check that turned an image down as an
+	// indirect image, appended to its "not a valid runtime value" failure.
+	bool RejectIndirect(const Inst& handle, int line) {
+		m_indirect_rejects[&handle] = line;
+		return false;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -1367,13 +1514,13 @@ private:
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
-				return false;
+				return RejectIndirect(handle, __LINE__);
 			}
 			uint32_t memory_index = 0;
 			const auto* memory = ScalarReadMemory(*read, memory_index);
 			if (memory == nullptr || memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
 			    !MemoryIndexBelongsTo(memory_index, *read)) {
-				return false;
+				return RejectIndirect(handle, __LINE__);
 			}
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
@@ -1387,7 +1534,7 @@ private:
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
 			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
 			    memory->offset > UINT32_MAX - offset) {
-				return false;
+				return RejectIndirect(handle, __LINE__);
 			}
 			offset += memory->offset;
 			if (dword == 0u) {
@@ -1395,12 +1542,18 @@ private:
 				table_offset = offset;
 			} else if (!EquivalentValue(m_program, key, current_key) ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
-				return false;
+				return RejectIndirect(handle, __LINE__);
 			}
 			table_handle = current_handle;
-			const std::array<const Inst*, 1> image_users {&handle};
-			if (!UsesOnly(*read, image_users)) {
-				return false;
+			// Samples of the same texture share the (deduplicated) descriptor reads; each image
+			// handle gets its own plan over them. Any other user needs the descriptor's value.
+			const bool image_users_only =
+			    !read->Uses().empty() && std::ranges::all_of(read->Uses(), [](const Use& use) {
+				    return use.user->GetOpcode() == ValueOpcode::GetImageResource ||
+				           FeedsOnlyDeadPhis(*use.user);
+			    });
+			if (!image_users_only) {
+				return RejectIndirect(handle, __LINE__);
 			}
 			plan.memory[dword] = memory_index;
 			plan.reads[dword] = read;
@@ -1408,56 +1561,108 @@ private:
 
 		DescriptorSource table_source;
 		if (!MakeRuntimeTableSource(*plan.reads[0], table_source)) {
-			return false;
+			return RejectIndirect(handle, __LINE__);
 		}
 		DescriptorSource material_source;
 		DescriptorSource::IndirectImage indirect;
 		indirect.table_offset = table_offset;
-		if (table_source.dword_count == 2u) {
-			const auto* selector = key.Resolve().TryInstruction();
-			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
-			    selector->NumArgs() == 1u && !m_shader_writes &&
-			    NonzeroOnEntry(selector->Arg(0), handle.Parent());
-			if (bitscan) {
-				indirect.key_count = Value(32u);
+		// Enumerate the keys the table can reach (upstream's plan), or, when bindless images are
+		// enabled and the heap is a buffer, look the key up at run time: an enumeration that
+		// passes here can still fail per draw (a material table of more records than the probe
+		// cap, or more textures than a shader binds), and a compiled shader cannot switch plans.
+		const auto enumerable = [&]() -> bool {
+			if (m_program.bindless_images && table_source.dword_count == 4u) {
+				return false;
+			}
+			if (table_source.dword_count == 2u) {
+				const auto* selector = key.Resolve().TryInstruction();
+				const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
+				    selector->NumArgs() == 1u && !m_shader_writes &&
+				    NonzeroOnEntry(selector->Arg(0), handle.Parent());
+				if (bitscan) {
+					indirect.key_count = Value(32u);
+				} else {
+					indirect.key_count = BoundedLoopCount(key, handle.Parent());
+				}
+				if (indirect.key_count.IsEmpty() &&
+				    !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
+					return RejectIndirect(handle, __LINE__);
+				}
+				if ((table_offset & 3u) != 0u ||
+				    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u)))
+					return RejectIndirect(handle, __LINE__);
 			} else {
-				indirect.key_count = BoundedLoopCount(key, handle.Parent());
+				auto* material_read = key.Resolve().TryInstruction();
+				// A key packed in the material word. Peeling from the outside keeps
+				// key = (inner >> key_shift) & key_mask exact:
+				//   inner = y >> n            ->  shift += n
+				//   inner = y & c             ->  mask  &= c >> shift
+				//   inner = bfe(y, off, cnt)  ->  mask  &= ((1 << cnt) - 1) >> shift, shift += off
+				for (uint32_t level = 0; level < 3u && material_read != nullptr; level++) {
+					const auto op        = material_read->GetOpcode();
+					uint32_t   immediate = 0;
+					uint32_t   count     = 0;
+					if (op == ValueOpcode::ShiftRightLogical32 && material_read->NumArgs() == 2u &&
+					    ImmediateU32(material_read->Arg(1), immediate) &&
+					    indirect.key_shift + immediate < 32u) {
+						indirect.key_shift += immediate;
+						material_read = material_read->Arg(0).Resolve().TryInstruction();
+					} else if (op == ValueOpcode::BitwiseAnd32 && material_read->NumArgs() == 2u &&
+					           (ImmediateU32(material_read->Arg(1), immediate) ||
+					            ImmediateU32(material_read->Arg(0), immediate))) {
+						const auto operand = ImmediateU32(material_read->Arg(1), immediate) ? 0u : 1u;
+						indirect.key_mask &= immediate >> indirect.key_shift;
+						material_read = material_read->Arg(operand).Resolve().TryInstruction();
+					} else if (op == ValueOpcode::BitFieldUExtract && material_read->NumArgs() == 3u &&
+					           ImmediateU32(material_read->Arg(1), immediate) &&
+					           ImmediateU32(material_read->Arg(2), count) && count > 0u && count < 32u &&
+					           indirect.key_shift + immediate < 32u) {
+						indirect.key_mask &= ((1u << count) - 1u) >> indirect.key_shift;
+						indirect.key_shift += immediate;
+						material_read = material_read->Arg(0).Resolve().TryInstruction();
+					} else {
+						break;
+					}
+				}
+				uint32_t material_memory_index = 0;
+				const auto* memory = material_read != nullptr
+				                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
+				if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+				    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+					return RejectIndirect(handle, __LINE__);
+				}
+				Value selector;
+				if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
+				                         indirect.selector_offset)) {
+					return RejectIndirect(handle, __LINE__);
+				}
+				const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+				indirect.selector_offset =
+				    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
+				// The key read stays in the shader (only the table reads become planning-only), so
+				// it may have other users, such as a check that a texture is assigned at all.
+				const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
+				if (!UsesOnly(*shift, plan.reads)) {
+					return RejectIndirect(handle, __LINE__);
+				}
+				const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+				if (material_handle == nullptr ||
+				    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+				    !MakeRuntimeTableSource(*material_read, material_source)) {
+					return RejectIndirect(handle, __LINE__);
+				}
+				indirect.material_source = InternSource(material_source);
 			}
-			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
+			return true;
+		};
+		if (!enumerable()) {
+			if (!m_program.bindless_images || table_source.dword_count != 4u) {
 				return false;
 			}
-			if ((table_offset & 3u) != 0u ||
-			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
-		} else {
-			auto* material_read = key.Resolve().TryInstruction();
-			uint32_t material_memory_index = 0;
-			const auto* memory = material_read != nullptr
-			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
-			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-				return false;
-			}
-			Value selector;
-			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
-			                         indirect.selector_offset)) {
-				return false;
-			}
-			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-			indirect.selector_offset =
-			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
-			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
-			const std::array<const Inst*, 1> material_users {shift};
-			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
-				return false;
-			}
-			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-			if (material_handle == nullptr ||
-			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_read, material_source)) {
-				return false;
-			}
-			indirect.material_source = InternSource(material_source);
+			indirect              = {};
+			indirect.table_offset = table_offset;
+			indirect.bindless     = true;
+			material_source       = {};
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -1638,6 +1843,100 @@ private:
 		});
 	}
 
+	// Stopgap: a bindless sampler (selected per material from a sampler heap, like
+	// the image beside it) has no indirect plan. Before the walk, give it one fixed sampler
+	// (trilinear, wrap, full LOD range) and make the heap reads it strands planning-only, as
+	// an indirect image's table reads are: registered as buffers, they would bind a
+	// descriptor that dead-code elimination then deletes. Only the filtering and edge
+	// addressing can differ from the material's own sampler.
+	void PlanDefaultSamplers() {
+		if (!Frontend::TranslationNonFatal()) {
+			return;
+		}
+		constexpr std::array<uint32_t, 4> DefaultSampler {
+		    0x00000000u,                             // wrap on every axis
+		    0xfffu << 12u,                           // max_lod 255.9
+		    (1u << 20u) | (1u << 22u) | (2u << 26u), // bilinear mag/min, linear mip
+		    0x00000000u};
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+				    inst.NumArgs() < 2u) {
+					continue;
+				}
+				auto* sampler = inst.Arg(1).Resolve().TryInstruction();
+				if (sampler == nullptr || sampler->GetOpcode() != ValueOpcode::GetSamplerResource ||
+				    sampler->NumArgs() != 4u) {
+					continue;
+				}
+				const auto       flags  = inst.Flags<MemoryFlags>();
+				const auto&      memory = m_program.memory_info[flags.index];
+				DescriptorSource descriptor;
+				MakeSource(*sampler, 4u, true,
+				           (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
+				           memory.sampler * 4u, descriptor, flags.pc);
+				uint32_t bad_dword = 0;
+				if (ValidateSource(descriptor, bad_dword)) {
+					continue;
+				}
+				// The scalar reads behind the descriptor, through phis and selects.
+				std::vector<const Inst*> reads;
+				std::vector<const Inst*> pending;
+				std::vector<const Inst*> visited;
+				bool                     exclusive = true;
+				for (uint32_t dword = 0; dword < 4u; dword++) {
+					if (const auto* arg = sampler->Arg(dword).Resolve().TryInstruction()) {
+						pending.push_back(arg);
+					}
+				}
+				while (!pending.empty() && exclusive) {
+					const auto* current = pending.back();
+					pending.pop_back();
+					if (std::ranges::find(visited, current) != visited.end()) {
+						continue;
+					}
+					visited.push_back(current);
+					uint32_t index = 0;
+					if (ScalarReadMemory(*current, index) != nullptr) {
+						exclusive = std::ranges::all_of(current->Uses(), [&](const Use& use) {
+							return use.user->GetOpcode() == ValueOpcode::GetSamplerResource ||
+							       use.user->GetOpcode() == ValueOpcode::Phi ||
+							       use.user->GetOpcode() == ValueOpcode::SelectU32 ||
+							       FeedsOnlyDeadPhis(*use.user);
+						});
+						reads.push_back(current);
+						continue;
+					}
+					if (current->GetOpcode() == ValueOpcode::Phi ||
+					    current->GetOpcode() == ValueOpcode::SelectU32) {
+						for (size_t arg = 0; arg < current->NumArgs(); arg++) {
+							if (const auto* next = current->Arg(arg).Resolve().TryInstruction()) {
+								pending.push_back(next);
+							}
+						}
+					}
+				}
+				if (!exclusive) {
+					continue;
+				}
+				for (const auto* read: reads) {
+					uint32_t index = 0;
+					(void)ScalarReadMemory(*read, index);
+					m_program.memory_info[index].planning_only = true;
+				}
+				for (uint32_t dword = 0; dword < 4u; dword++) {
+					sampler->SetArg(dword, Value(DefaultSampler[dword]));
+				}
+				// The walk resolves the handle again, from the fixed words.
+				std::erase_if(m_resolved_handles,
+				              [&](const ResolvedHandle& entry) { return entry.handle == sampler; });
+				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x bindless sampler: "
+				     "using a default sampler (%zu heap reads planning-only)\n",
+				     m_program.shader_hash, flags.pc, reads.size());
+			}
+		}
+	}
+
 	void PlanIndirectImages() {
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -1673,8 +1972,34 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
+			// Stopgap: a bindless sampler (selected per material from a sampler heap,
+			// like the image beside it) has no indirect plan. Sample with one fixed sampler
+			// (trilinear, wrap, full LOD range) rather than giving up the whole shader; only the
+			// filtering and edge addressing can differ from the material's own sampler.
+			if (expected == ValueOpcode::GetSamplerResource && width == 4u &&
+			    Frontend::TranslationNonFatal()) {
+				constexpr std::array<uint32_t, 4> DefaultSampler {
+				    0x00000000u,                               // wrap on every axis
+				    0xfffu << 12u,                             // max_lod 255.9
+				    (1u << 20u) | (1u << 22u) | (2u << 26u),   // bilinear mag/min, linear mip
+				    0x00000000u};
+				for (uint32_t dword = 0; dword < 4u; dword++) {
+					handle->SetArg(dword, Value(DefaultSampler[dword]));
+					descriptor.dwords[dword] = Value(DefaultSampler[dword]);
+				}
+				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x bindless sampler: "
+				     "using a default sampler\n",
+				     m_program.shader_hash, pc);
+				source = InternSource(descriptor);
+				return true;
+			}
+			const auto reject = m_indirect_rejects.find(handle);
+			Fail(pc, fmt::format("{} dword {} is not a valid runtime value{}",
+			                     ValueOpcodeName(expected), bad_dword,
+			                     reject == m_indirect_rejects.end()
+			                         ? std::string {}
+			                         : fmt::format(" (indirect image rejected at line {})",
+			                                       reject->second)));
 		}
 		source = InternSource(descriptor);
 		return true;
@@ -1983,14 +2308,20 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
+	std::map<const Inst*, int>                 m_indirect_rejects;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 };
 
 } // namespace
 
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
-	Tracker(program, decoded, native_cfg).Run();
+bool TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
+	try {
+		Tracker(program, decoded, native_cfg).Run();
+	} catch (const TrackingFailure&) {
+		return false;
+	}
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

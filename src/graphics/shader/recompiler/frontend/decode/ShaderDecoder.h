@@ -471,6 +471,7 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX4,
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
+	// SMEM 0x25: no address, writes the 64-bit real-time counter to SDST.
 	S_MEMREALTIME,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
@@ -635,7 +636,9 @@ enum class Opcode {
 	S_CBRANCH_EXECZ,
 	S_CBRANCH_EXECNZ,
 	S_CBRANCH_CDBGSYS,
+	S_CBRANCH_CDBGUSER,
 	S_CBRANCH_CDBGSYS_OR_USER,
+	S_CBRANCH_CDBGSYS_AND_USER,
 	S_SENDMSG,
 	S_SETREG_B32,
 	S_SLEEP,
@@ -666,6 +669,9 @@ enum class OperandKind {
 	PrivateBase,
 	Null,
 	Vgpr,
+	// A special register the recompiler does not model (the memory aperture bases and limits);
+	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
+	Unsupported,
 };
 
 enum ImageSampleFlag : uint32_t {

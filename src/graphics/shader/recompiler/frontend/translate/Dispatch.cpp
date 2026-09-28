@@ -4,6 +4,11 @@
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 void Translator::FailMissingTranslation(const Decoder::Instruction& inst) {
+	// A non-fatal compile gives up on the shader instead: its draws or dispatches are skipped.
+	if (TranslationNonFatalFlag()) {
+		TranslationUnsupportedFlag() = true;
+		return;
+	}
 	EXIT("opcode %s at pc 0x%08x has no IR translation",
 	     Decoder::InstructionToString(inst).c_str(), inst.pc);
 }
@@ -15,6 +20,10 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::UNKNOWN:
 		case Decoder::Opcode::COUNT:
+			if (TranslationNonFatalFlag()) {
+				TranslationUnsupportedFlag() = true;
+				return;
+			}
 			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
 		case Decoder::Opcode::UNSUPPORTED:
 			EXIT("unsupported decoded instruction: %s", Decoder::InstructionToString(inst).c_str());

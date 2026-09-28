@@ -2,12 +2,15 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -15,6 +18,10 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// A/B switch for the clean-region skip (KYTY_TRACKER_SKIP_CLEAN=0 disables it).
+inline const bool g_tracker_skip_clean =
+    std::getenv("KYTY_TRACKER_SKIP_CLEAN") == nullptr || std::getenv("KYTY_TRACKER_SKIP_CLEAN")[0] == '1';
 
 class MemoryTracker final {
 public:
@@ -85,7 +92,19 @@ public:
 		Iterate<true>(vaddr, size, [](RegionManager*, uint64_t, uint64_t) {});
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			const bool summary_clean = !manager->MaybeModified<DirtySource::Cpu>();
+			if (!is_written && g_tracker_skip_clean && summary_clean) {
+				return;
+			}
 			manager->lock.lock();
+			if (summary_clean && manager->IsModified<DirtySource::Cpu>(offset, bytes)) {
+				static std::atomic<uint32_t> misses = 0;
+				if (misses.fetch_add(1) < 32) {
+					LOGF("Tracker: CPU summary miss region=0x%016" PRIx64 " offset=0x%" PRIx64
+					     " bytes=0x%" PRIx64 " written=%d\n",
+					     manager->GetCpuAddr(), offset, bytes, static_cast<int>(is_written));
+				}
+			}
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
 			                                                      bytes, range_func);
 			if (!is_written) {

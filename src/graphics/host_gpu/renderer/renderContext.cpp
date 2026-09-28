@@ -15,8 +15,12 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_bindless_table(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+		m_bindless_table.OnImageUnregistered(id);
+	};
 }
 
 RenderContext::~RenderContext() {
@@ -123,10 +127,17 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	// Every cached buffer is synchronized so a global-memory shader sees the CPU's writes.
+	// That walk touched every buffer per dispatch (a quarter of the GPU thread in the
+	// world); it only has to repeat once something became CPU-dirty or a buffer appeared.
+	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+	if (epoch != m_bda_synced_epoch) {
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		});
+		m_bda_synced_epoch = epoch;
+	}
 	m_fault_process_pending = true;
 }
 

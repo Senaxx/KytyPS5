@@ -91,7 +91,7 @@ bool UsesFlattenedSrt(const Program& program) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
 	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		return image.indirect_search_iterations != 0u;
+		return image.indirect_search_iterations != 0u || image.bindless;
 	});
 }
 

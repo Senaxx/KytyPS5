@@ -144,12 +144,23 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
+	// table (TextureCache::on_bindless_unregister) to repoint the slot.
+	bool             bindless_pinned = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// CommandScheduler tick, and metadata slices, MaterializeDccClear last resolved this image's
+	// DCC metadata for. UINT64_MAX means never checked. Lets repeated FindImage lookups within
+	// the same still-unsubmitted recording (i.e. many draws to the same bound render target) skip
+	// the synchronous GPU readback after the first one -- a real re-clear in a later recording
+	// still gets caught because the tick will have advanced by then.
+	uint64_t         dcc_clear_checked_tick  = UINT64_MAX;
+	uint32_t         dcc_clear_checked_first = 0;
+	uint32_t         dcc_clear_checked_count = 0;
 
 private:
 	friend struct ImageTestAccess;

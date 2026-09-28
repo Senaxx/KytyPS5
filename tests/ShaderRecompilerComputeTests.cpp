@@ -160,6 +160,11 @@ struct BufferCacheTestAccess {
     cache.m_critical_gc_memory = critical;
   }
 
+  // The caches age their entries by presented frames; the tests present them here.
+  static void PresentFrames(BufferCache &cache, uint64_t frames) {
+    cache.m_graphics.presented_frames.fetch_add(frames);
+  }
+
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
   }
@@ -229,6 +234,9 @@ struct TextureCacheTestAccess {
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
+    // A fresh scenario: the per-frame eviction budget starts empty, as at a new frame.
+    cache.m_gc_freed_bytes_frame = 0;
+    cache.m_gc_freed_images_frame = 0;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
@@ -2814,13 +2822,14 @@ public:
         const bool gds_waited_once =
             gpu_scheduler.CurrentTick() == gds_tick + 1;
 
+        // An interrupt-only event is queued for its tick and batched a few events deep.
         auto interrupt_only = make_release_mem(0, 4, nullptr, 0);
         Pm4Execution interrupt_execution;
         const auto interrupt_tick = gpu_scheduler.CurrentTick();
         const auto interrupt_result =
             processor->Process(interrupt_execution, interrupt_only);
-        const bool interrupt_split_once =
-            gpu_scheduler.CurrentTick() == interrupt_tick + 1;
+        const bool interrupt_batched =
+            gpu_scheduler.CurrentTick() == interrupt_tick;
 
         auto gds_interrupt = make_release_mem(5, 2, &gds_label, 1ull << 16u);
         Pm4Execution gds_interrupt_execution;
@@ -2833,7 +2842,7 @@ public:
         release_mem_submission_counts =
             gds_result == Pm4ProcessResult::Complete &&
             gds_waited_once && interrupt_result == Pm4ProcessResult::Complete &&
-            interrupt_split_once &&
+            interrupt_batched &&
             gds_interrupt_result == Pm4ProcessResult::Complete &&
             gds_interrupt_waited_once;
       });
@@ -2845,8 +2854,8 @@ public:
               release_mem_submission_counts &&
                   static_cast<uint32_t>(release_label) == 0x11223344u &&
                   static_cast<uint32_t>(gds_label) == 0,
-              "RELEASE_MEM lost its required split/readback or retained a "
-              "redundant GPU wait");
+              "RELEASE_MEM lost its required readback, retained a redundant GPU "
+              "wait, or split a batchable fence write");
     }
 
     alignas(uint32_t) uint32_t packet_marker_a = 0;
@@ -4266,6 +4275,7 @@ public:
       cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
                        false);
 
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4284,20 +4294,48 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + second_offset,
                                               &second_before_completion,
                                               sizeof(second_before_completion));
-      Require(name, "normal dirty retention",
-              first_before_completion == first_stale &&
-                  second_before_completion == second_stale &&
-                  cache.IsRegionRegistered(base, allocation_size) &&
-                  cache.IsRegionGpuModified(base + first_offset,
-                                            sizeof(first_value)) &&
-                  cache.IsRegionGpuModified(base + second_offset,
-                                            sizeof(second_value)) &&
+      // An aged dirty Buffer is published and dropped under normal pressure as well: a
+      // retained one keeps owning its pages, and images sharing them are re-sourced from
+      // its stale bytes.
+      Require(name, "normal dirty publication",
+              first_before_completion == first_value &&
+                  second_before_completion == second_value &&
+                  !cache.IsRegionRegistered(base, allocation_size) &&
+                  !cache.IsRegionGpuModified(base + first_offset,
+                                             sizeof(first_value)) &&
+                  !cache.IsRegionGpuModified(base + second_offset,
+                                             sizeof(second_value)) &&
+                  !cache.HasGpuDirtyBytes(base + first_offset,
+                                          sizeof(first_value)) &&
+                  !cache.HasGpuDirtyBytes(base + second_offset,
+                                          sizeof(second_value)) &&
+                  scheduler.CurrentTick() > gc_submission_tick,
+              "normal GC retained or failed to publish an aged dirty Buffer");
+
+      // Re-arm the same dirty state, aged past the critical policy's 80 ticks, for the
+      // publication-ordering check below.
+      Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
+                                            sizeof(first_stale));
+      Libs::LibKernel::Memory::WriteBacking(base + second_offset, &second_stale,
+                                            sizeof(second_stale));
+      MarkGpuWrite(base + first_offset, sizeof(first_value));
+      MarkGpuWrite(base + second_offset, sizeof(second_value));
+      cache.FillBuffer(base + first_offset, sizeof(first_value), first_value,
+                       false);
+      cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
+                       false);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+      BufferCacheTestAccess::PresentFrames(cache, 8);
+      for (uint32_t tick = 0; tick < 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "re-armed dirty Buffer",
+              cache.IsRegionRegistered(base, allocation_size) &&
                   cache.HasGpuDirtyBytes(base + first_offset,
-                                         sizeof(first_value)) &&
-                  cache.HasGpuDirtyBytes(base + second_offset,
-                                         sizeof(second_value)) &&
-                  scheduler.CurrentTick() == gc_submission_tick,
-              "normal GC retired or synchronized a dirty Buffer");
+                                         sizeof(first_value)),
+              "the re-armed dirty Buffer was reclaimed without pressure");
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto older_publication_tick = scheduler.CurrentTick();
       std::binary_semaphore older_publication_entered{0};
@@ -4360,6 +4398,7 @@ public:
         cache.FillBuffer(address, sizeof(starvation_value), starvation_value,
                          false);
       }
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4370,37 +4409,42 @@ public:
       Require(name, "normal-GC clean candidate",
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
+      const auto starvation_retired =
+          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
+      // Aged dirty owners are published and dropped under normal pressure, at most 32 per
+      // run, so the 33 dirty ones and the clean candidate take two runs; none of them may
+      // be retained, and the clean candidate must not be hidden behind them.
       cache.RunGarbageCollector();
+      cache.RunGarbageCollector();
+      uint32_t starvation_first_backing = 0;
+      uint32_t starvation_last_backing = 0;
+      std::memcpy(&starvation_first_backing, memory + starvation_offset,
+                  sizeof(starvation_first_backing));
+      std::memcpy(&starvation_last_backing,
+                  memory + starvation_offset +
+                      (starvation_count - 1) * starvation_stride,
+                  sizeof(starvation_last_backing));
       Require(
-          name, "normal-GC dirty bypass",
-          cache.IsRegionRegistered(base + starvation_offset,
-                                   sizeof(starvation_value)) &&
-              cache.IsRegionRegistered(
+          name, "normal-GC dirty publication",
+          starvation_first_backing == starvation_value &&
+              starvation_last_backing == starvation_value &&
+              !cache.IsRegionRegistered(base + starvation_offset,
+                                        sizeof(starvation_value)) &&
+              !cache.IsRegionRegistered(
                   base + starvation_offset +
                       (starvation_count - 1) * starvation_stride,
                   sizeof(starvation_value)) &&
               !cache.IsRegionRegistered(base + starvation_clean_offset,
-                                        sizeof(starvation_value)),
-          "old dirty owners hid an eligible clean Buffer from normal GC");
-      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
-      const auto starvation_retired =
-          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
-      Require(name, "critical-GC starvation cleanup",
-              !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
-                  !cache.IsRegionRegistered(
-                      base + starvation_offset +
-                          (starvation_count - 1) * starvation_stride,
-                      sizeof(starvation_value)) &&
-                  !BufferCacheTestAccess::IsBufferAllocated(
-                      cache, starvation_retired),
-              "critical GC did not immediately free the skipped dirty owners");
+              !BufferCacheTestAccess::IsBufferAllocated(cache,
+                                                        starvation_retired),
+          "normal GC retained aged dirty owners or hid the clean Buffer");
 
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;
@@ -4413,6 +4457,7 @@ public:
           base + lookup_only_offset, residency_size);
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4523,6 +4568,7 @@ public:
                 "failed to allocate the large dirty native buffer");
         cache.FillBuffer(base + large_offset, large_size, large_value, false);
         const auto large_submission_tick = scheduler.CurrentTick();
+        BufferCacheTestAccess::PresentFrames(cache, 8);
         for (uint32_t tick = 0; tick <= 160; tick++) {
           cache.RunGarbageCollector();
         }
@@ -4584,6 +4630,7 @@ public:
                        grouped_first_value, false);
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4686,6 +4733,7 @@ public:
                       cache, base + sparse_offset + sparse_owner_stride),
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; ++tick) {
         cache.RunGarbageCollector();
       }
@@ -4714,6 +4762,7 @@ public:
                                sizeof(disjoint_value), true, false);
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4776,6 +4825,7 @@ public:
                                sizeof(reacquire_value), true, false);
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -32049,9 +32099,9 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                                   .domain = 1,
                                   .partitioning = 2,
                                   .output_topology = 2};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          AnalyzeTessellationPrograms(local, control, tess) &&
+              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,

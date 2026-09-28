@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <functional>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -30,6 +31,8 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Called before a bindless-pinned image is unregistered.
+	std::function<void(ImageId)> on_bindless_unregister;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -181,6 +184,14 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.
+	uint64_t         m_gc_budget_frame        = 0;
+	uint64_t         m_gc_freed_bytes_frame   = 0;
+	size_t           m_gc_freed_images_frame  = 0;
+	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
+	// stretch without presents (a loading screen) still ages its entries.
+	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 

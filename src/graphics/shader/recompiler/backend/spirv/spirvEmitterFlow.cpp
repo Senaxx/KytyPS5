@@ -760,6 +760,34 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
 
+uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx) {
+	// S_MEMREALTIME is a free-running counter at 100 MHz. Read the device clock once as a
+	// uvec2 so the two halves cannot tear, then bring it down toward the guest's rate: the
+	// host clock is ~1 GHz, and a shift by 3 lands near 125 MHz without a 64-bit divide. Guest
+	// timeouts computed from it then expire slightly early rather than 10x early.
+	auto&      state = ctx.state;
+	const auto clock = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpReadClockKHR, TypeU32Vector(state, 2), clock,
+	                          ConstantU32(state, spv::ScopeDevice));
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, clock, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, clock, 1);
+	constexpr uint32_t ClockShift = 3;
+	const auto low_shifted = Binary(state, spv::OpShiftRightLogical, TypeU32(state), low,
+	                                ConstantU32(state, ClockShift));
+	const auto high_carried = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high,
+	                                 ConstantU32(state, 32u - ClockShift));
+	const auto low_result =
+	    Binary(state, spv::OpBitwiseOr, TypeU32(state), low_shifted, high_carried);
+	const auto high_result = Binary(state, spv::OpShiftRightLogical, TypeU32(state), high,
+	                                ConstantU32(state, ClockShift));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low_result,
+	                          high_result);
+	return result;
+}
+
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Fail(inst, "must be lowered before SPIR-V emission");
 }

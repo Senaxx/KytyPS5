@@ -29,6 +29,28 @@ public:
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	void           Finish();
+	// Bounds how many no-interrupt RELEASE_MEM fence writes accumulate in one command buffer
+	// before it is submitted, so consecutive fence updates that nothing is blocked waiting on
+	// don't each pay a host vkQueueSubmit. Only safe for a RELEASE_MEM whose guest-visible write
+	// already happened synchronously and that scheduled no interrupt callback -- see the call
+	// site in pm4Handlers.cpp CpOpReleaseMem for the exact condition. Never waits itself.
+	void           CompleteReleaseMemWrite();
+	// Same idea, but for a RELEASE_MEM that DOES request a guest interrupt/event (a guest thread
+	// may be waiting on it via an event queue) -- deferring the flush delays real event delivery,
+	// so this uses a much smaller batch bound than CompleteReleaseMemWrite as a hedge, trading
+	// some of the possible win for less added latency. Never waits itself.
+	void           CompleteReleaseMemInterrupt();
+	// Called after every DrawIndex/DrawAuto. Long chains of draws with no intervening
+	// RELEASE_MEM/wait can otherwise sit fully recorded but unsubmitted for a long time, leaving
+	// the GPU idle until something else finally forces a flush -- this periodically calls Flush()
+	// (non-blocking: Submit() + BeginNext(), same as CompleteReleaseMemWrite) every
+	// KYTY_DRAW_FLUSH_INTERVAL draws to keep the queue fed instead. Submitting while the GPU is
+	// still executing earlier work is always legal (vkQueueSubmit never waits on prior submissions
+	// completing), so this never blocks the CPU. Defaults to 16, validated against real gameplay --
+	// override via KYTY_DRAW_FLUSH_INTERVAL (0 disables) if a different workload needs retuning:
+	// too small reintroduces per-submit overhead, too large leaves the same idle bubbles this
+	// exists to remove.
+	void           CompleteDraw();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
 	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
@@ -89,6 +111,9 @@ private:
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
+	uint32_t                     m_recorded_release_mem_writes     = 0;
+	uint32_t                     m_recorded_release_mem_interrupts = 0;
+	uint32_t                     m_recorded_draws                  = 0;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;

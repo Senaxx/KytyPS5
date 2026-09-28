@@ -120,6 +120,9 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+	                          uint64_t total_size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -141,6 +144,9 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
+	// stretch without presents still ages its entries.
+	[[nodiscard]] uint64_t LruClock() const noexcept;
 };
 
 } // namespace Libs::Graphics

@@ -12,6 +12,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -30,6 +31,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -655,6 +657,74 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Tracked-page faults are the emulator's CPU/GPU coherence mechanism, and every one costs a
+// protection change or a GPU drain. This tallies who takes them (host code address, thread)
+// so the hot readers and writers of GPU-owned memory can be named.
+namespace {
+struct FaultStats {
+	struct Site {
+		uint64_t address = 0;
+		uint64_t count   = 0;
+		uint64_t reads   = 0;
+		uint64_t gpu     = 0;
+	};
+	std::mutex             mutex;
+	std::vector<Site>      sites;
+	uint64_t               total    = 0;
+	uint64_t               reported = 0;
+};
+FaultStats g_fault_stats;
+
+void RecordTrackedFault(uint64_t host_pc, uint64_t guest_vaddr, bool is_read, bool gpu_thread) {
+	if (gpu_thread) {
+		// The GPU thread faulting on GPU-owned memory drains the whole pipeline; the first few
+		// get a full host stack so the command-processor path responsible can be named.
+		static std::atomic<uint32_t> traced = 0;
+		if (traced.fetch_add(1) < 48) {
+			LOGF("TrackedFault on GPU thread: %s vaddr=0x%016" PRIx64 " pc=0x%016" PRIx64 "\n%s",
+			     is_read ? "read" : "write", guest_vaddr, host_pc,
+			     Common::HostBacktrace().c_str());
+		}
+	}
+	std::scoped_lock lock(g_fault_stats.mutex);
+	auto&            stats = g_fault_stats;
+	stats.total++;
+	auto it = std::find_if(stats.sites.begin(), stats.sites.end(),
+	                       [host_pc](const FaultStats::Site& site) { return site.address == host_pc; });
+	if (it == stats.sites.end()) {
+		stats.sites.push_back({host_pc, 0, 0, 0});
+		it = std::prev(stats.sites.end());
+	}
+	it->count++;
+	it->reads += is_read ? 1 : 0;
+	it->gpu += gpu_thread ? 1 : 0;
+	if (stats.total - stats.reported < 5000) {
+		return;
+	}
+	stats.reported = stats.total;
+	std::sort(stats.sites.begin(), stats.sites.end(),
+	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.count > b.count; });
+	uint64_t gpu_total = 0;
+	for (const auto& site: stats.sites) {
+		gpu_total += site.gpu;
+	}
+	LOGF("TrackedFaults: total=%" PRIu64 " gpu_thread=%" PRIu64 " distinct_sites=%zu\n", stats.total,
+	     gpu_total, stats.sites.size());
+	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 12); i++) {
+		const auto& site = stats.sites[i];
+		LOGF("\t pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 " gpu_thread=%" PRIu64 "\n",
+		     site.address, site.count, site.reads, site.gpu);
+	}
+	std::sort(stats.sites.begin(), stats.sites.end(),
+	          [](const FaultStats::Site& a, const FaultStats::Site& b) { return a.gpu > b.gpu; });
+	for (size_t i = 0; i < std::min<size_t>(stats.sites.size(), 8) && stats.sites[i].gpu != 0; i++) {
+		const auto& site = stats.sites[i];
+		LOGF("\t gpu-thread pc=0x%016" PRIx64 " count=%" PRIu64 " reads=%" PRIu64 "\n", site.address,
+		     site.gpu, site.reads);
+	}
+}
+} // namespace
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -674,6 +744,8 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Unknown: return false;
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+			RecordTrackedFault(info->exception_address, info->access_violation_vaddr,
+			                   access == GpuAccess::Read, Libs::Graphics::GuestGpu::IsGpuThread());
 			return true;
 		}
 	}

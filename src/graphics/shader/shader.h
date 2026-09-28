@@ -295,12 +295,18 @@ struct Shader {
 };
 
 struct ShaderMappedData {
+	static constexpr uint32_t MaxInputSemantics = 32;
+
 	Prospero::ShaderBinaryType type {};
 	ShaderUserData* user_data           = nullptr;
 	ShaderSemantic* input_semantics     = nullptr;
 	uint32_t        num_input_semantics = 0;
 	uint32_t        code_size_bytes     = 0;
 	uint32_t        scratch_size_dwords = 0;
+	// The semantics table copied out of the guest header at registration. The header shares
+	// a page with memory the GPU writes each frame, and reading it per draw faults and
+	// drains the pipeline.
+	std::array<ShaderSemantic, MaxInputSemantics> input_semantics_snapshot {};
 };
 
 void ShaderInit();

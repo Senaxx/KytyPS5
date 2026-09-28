@@ -20,8 +20,10 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -243,7 +245,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
-	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -251,6 +253,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
+	}
+	if (image.bindless_pinned) {
+		image.bindless_pinned = false;
+		if (on_bindless_unregister) {
+			on_bindless_unregister(id);
+		}
 	}
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
@@ -319,7 +327,7 @@ void TextureCache::FreeImage(ImageId id) {
 
 void TextureCache::TouchImage(Image& image) {
 	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+		m_lru_cache.Touch(image.lru_id, LruClock());
 	}
 }
 
@@ -1126,7 +1134,14 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
-	const auto range = desc.info.metadata.range;
+	const auto range        = desc.info.metadata.range;
+	const auto current_tick = m_scheduler.CurrentTick();
+	const auto layers       = desc.info.TransferLayers();
+	const auto& view           = desc.view_info;
+	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
+	const auto  first          = volume_texture ? 0u : metadata_base_layer;
+	const auto  image_first    = volume_texture ? 0u : view.base_layer;
+	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	{
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
@@ -1136,19 +1151,34 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
 			return;
 		}
+		// A fast-clear stamps the whole DCC metadata range with one uniform code; an ordinary
+		// draw also touches these bytes (per-block compression state) but leaves a mixed
+		// pattern, so it never passes the all-same-code check below -- yet it re-marks the range
+		// GPU-dirty just the same, so gating purely on that flag re-triggers the synchronous
+		// readback on every draw to an already-bound render target. Gate on the scheduler tick
+		// instead: within one still-unsubmitted recording no GPU write can land in guest memory
+		// after the first check, so a later FindImage for the same slices of the same image
+		// this tick is redundant. Other slices of the image (another layer or face) keep their
+		// own check, a CPU store to the metadata (a guest-side clear) is caught through the
+		// tracker below, and a real re-clear in a later recording still gets caught, since the
+		// tick will have advanced.
+		const bool already_resolved_this_tick =
+		    image.dcc_clear_checked_tick == current_tick &&
+		    image.dcc_clear_checked_first == first && image.dcc_clear_checked_count == count;
+		image.dcc_clear_checked_tick  = current_tick;
+		image.dcc_clear_checked_first = first;
+		image.dcc_clear_checked_count = count;
+		if (already_resolved_this_tick &&
+		    !m_buffer_cache.IsRegionCpuModified(range.address, range.size)) {
+			return;
+		}
 	}
-	const auto layers = desc.info.TransferLayers();
 	// These one-mip surfaces use complete 4 KiB color metadata blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
 		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
-	const auto& view           = desc.view_info;
-	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
-	const auto  first          = volume_texture ? 0u : metadata_base_layer;
-	const auto  image_first    = volume_texture ? 0u : view.base_layer;
-	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
@@ -1809,35 +1839,52 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!transfer.valid || !image.SafeToDownload()) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
-	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+	const auto range = image.info.data;
+	auto&      ring  = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// An image larger than the download ring gets a staging buffer of its own for this one
+	// transfer: the ring cannot map it, and its regions cannot be cut into ring-sized pieces
+	// the way a buffer download can.
+	std::shared_ptr<Buffer> dedicated;
+	Buffer*                 download = &ring;
+	uint8_t*                mapped   = nullptr;
+	uint64_t                offset   = 0;
+	if (range.size > ring.Size()) {
+		dedicated = std::make_shared<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		download  = dedicated.get();
+		mapped    = dedicated->Mapped().data();
+		if (mapped == nullptr) {
+			return false;
+		}
+	} else {
+		std::tie(mapped, offset) =
+		    ring.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+		if (mapped == nullptr) {
+			EXIT("TextureCache: failed to map reusable download buffer\n");
+		}
+		ring.Commit();
 	}
-	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	download->Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, std::move(transfer));
+	DownloadImage(image, *download, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
+	barrier.buffer              = download->Handle();
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
+	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset] {
+		download->Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
 	return true;
@@ -1964,50 +2011,165 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+uint64_t TextureCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
+namespace {
+// Why the collector does not free: over each TexStats window, candidates it visited and what
+// happened to them.
+struct GcSkipStats {
+	uint64_t visited      = 0;
+	uint64_t freed        = 0;
+	uint64_t freed_mb     = 0;
+	uint64_t gone         = 0; // no longer registered
+	uint64_t depth        = 0; // part of a depth/stencil association
+	uint64_t gpu_tiled    = 0; // GPU-written tiled: needs a write-back it cannot do
+	uint64_t gpu_unpress  = 0; // GPU-written, not under pressure
+	uint64_t gpu_download = 0; // GPU-written, write-back failed
+	uint64_t young        = 0; // runs where the LRU had nothing old enough
+	uint64_t written_back = 0; // GPU-written tiled images written back, then freed
+};
+GcSkipStats g_gc_skip;
+} // namespace
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	m_gc_tick++;
+	const uint64_t clock = LruClock();
 	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		// Pressure is judged by this cache's own image bytes, which RegisterImage and
+		// UnregisterImage already track. Device-wide usage counts the images this cache has
+		// spilled to host memory (and every buffer), so it reads "critical" no matter how
+		// small the cache is -- and never falls, so the collector cannot tell that it is the
+		// one holding too much. Spider-Man's world then grew to 7.6 GB of images on a 6 GB
+		// card, all of it spilled, and every shader access crossed PCIe (3 fps).
+		// KYTY_GC_DEVICE_BYTES=1 restores the old policy, as in the buffer cache.
+		static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
+		if (device_bytes) {
+			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		}
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	// The collector runs once per guest submission -- this title submits hundreds of times a
+	// frame -- so a budget counted per run is really that many evictions per frame, and every
+	// eviction is an image recreated, synchronized and submitted. Budget the work per frame
+	// instead: 7 600 submissions a frame came from a per-run budget of 256.
+	if (m_gc_budget_frame != clock) {
+		m_gc_budget_frame       = clock;
+		m_gc_freed_bytes_frame  = 0;
+		m_gc_freed_images_frame = 0;
+		m_gc_written_back_bytes_frame = 0;
+	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		bool pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		// Ages in frames. This collector runs once per guest submission, and a title can
+		// submit a hundred times a frame: an age counted in its ticks evicted textures inside
+		// the frame that used them, to recreate them the next (11 000 images a second at the
+		// title menu). An image used in the frame being recorded is never a candidate, at any
+		// pressure; over budget the collector reaches back only as far as the previous frame.
+		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		// Under pressure the work is budgeted per frame, in bytes actually freed, and in
+		// proportion to the excess, so the cache converges on its threshold instead of either
+		// churning (a per-run budget: 7 600 submissions a frame) or growing without bound (a
+		// small fixed count, spent on GPU-written render targets that are skipped: 13.5 GB).
+		// Only frees count against it. A cap on images per frame bounds the synchronization
+		// that recreating them costs.
+		constexpr uint64_t MiB             = 1024 * 1024;
+		constexpr size_t   MaxFreesInFrame = 1024;
+		uint64_t           byte_budget     = 0;
+		size_t             deletions       = 10;
+		if (pressured || aggressive) {
+			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
+			const auto excess    = m_total_used_memory - threshold;
+			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
+			                         : std::max<uint64_t>(16 * MiB, excess / 8);
+			if (m_gc_freed_bytes_frame >= byte_budget ||
+			    m_gc_freed_images_frame >= MaxFreesInFrame) {
+				return;
+			}
+			deletions = MaxFreesInFrame - m_gc_freed_images_frame;
+		}
+		// Skipped candidates (GPU-written tiled images, depth associations) do not use up the
+		// budget, so look further down the LRU than the number of frees wanted.
+		const size_t         visit_limit = pressured || aggressive ? deletions * 4 : deletions;
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
+		candidates.reserve(std::min<size_t>(visit_limit, 4096));
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+		m_lru_cache.ForEachItemBelow(clock - age, [&](ImageId id) {
 			candidates.push_back(id);
-			return candidates.size() == deletions;
+			return candidates.size() >= visit_limit || candidates.size() >= 4096;
 		});
+		if (candidates.empty() && (pressured || aggressive)) {
+			g_gc_skip.young++;
+		}
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
+			if (!(pressured || aggressive)) {
+				--deletions;
+			}
+			g_gc_skip.visited++;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered) {
+				g_gc_skip.gone++;
+				continue;
+			}
+			if (owner->depth_id) {
+				g_gc_skip.depth++;
+				continue;
+			}
+			if (owner->bindless_pinned) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
+				// A GPU-written tiled image was never evicted: render targets and textures the
+				// GPU decompresses are almost all of a 4K title's images, so under pressure the
+				// collector found nothing else it could free (Spider-Man: 3 500 of every 4 000
+				// candidates) and the cache grew to 13.5 GB until the driver crashed in
+				// present. Under pressure such an image is now written back, detiled, like any
+				// other, within a per-frame write-back budget; candidates are never ones used in
+				// the frame being recorded. KYTY_GC_KEEP_TILED=1 restores the old rule.
+				static const bool keep_tiled = std::getenv("KYTY_GC_KEEP_TILED") != nullptr;
+				constexpr uint64_t WriteBackPerFrame = 256 * MiB;
+				if (safe && owner->info.IsTiled() &&
+				    (keep_tiled || !(pressured || aggressive) ||
+				     (m_gc_written_back_bytes_frame != 0 &&
+				      m_gc_written_back_bytes_frame + owner->info.data.size > WriteBackPerFrame))) {
+					g_gc_skip.gpu_tiled++;
 					continue;
 				}
 				if (safe && !pressured) {
+					g_gc_skip.gpu_unpress++;
 					continue;
 				}
 				if (safe && !DownloadImageMemory(id)) {
+					g_gc_skip.gpu_download++;
 					continue;
 				}
+				if (safe && owner->info.IsTiled()) {
+					m_gc_written_back_bytes_frame += owner->info.data.size;
+					g_gc_skip.written_back++;
+				}
 			}
+			const auto freed = owner->AccountedSize();
+			g_gc_skip.freed++;
+			g_gc_skip.freed_mb += freed >> 20u;
 			FreeImage(id);
+			if (pressured || aggressive) {
+				--deletions;
+				m_gc_freed_images_frame++;
+				m_gc_freed_bytes_frame += freed;
+				if (m_gc_freed_bytes_frame >= byte_budget) {
+					break;
+				}
+			}
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
@@ -2021,6 +2183,28 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+	if (m_gc_tick % 500 == 0) {
+		uint64_t images = 0;
+		uint64_t bytes  = 0;
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (image.registered) {
+				images++;
+				bytes += image.AccountedSize();
+			}
+		});
+		LOGF("TexStats: runs=%" PRIu64 " frame=%" PRIu64 " images=%" PRIu64 " image_bytes=%" PRIu64
+		     "MB device_used=%" PRIu64 "MB pressure=%" PRIu64 "MB critical=%" PRIu64 "MB\n",
+		     m_gc_tick, m_graphics.presented_frames.load(std::memory_order_relaxed), images,
+		     bytes >> 20u, m_total_used_memory >> 20u, m_pressure_gc_memory >> 20u,
+		     m_critical_gc_memory >> 20u);
+		LOGF("TexGc: visited=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) written_back=%" PRIu64
+		     " gone=%" PRIu64 " depth=%" PRIu64 " gpu_tiled=%" PRIu64 " gpu_unpressured=%" PRIu64
+		     " gpu_download_failed=%" PRIu64 " nothing_old_enough=%" PRIu64 "\n",
+		     g_gc_skip.visited, g_gc_skip.freed, g_gc_skip.freed_mb, g_gc_skip.written_back,
+		     g_gc_skip.gone, g_gc_skip.depth, g_gc_skip.gpu_tiled, g_gc_skip.gpu_unpress,
+		     g_gc_skip.gpu_download, g_gc_skip.young);
+		g_gc_skip = {};
 	}
 }
 

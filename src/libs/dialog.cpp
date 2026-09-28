@@ -311,6 +311,7 @@ constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
 constexpr int SAVE_RESULT_OK          = 0;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
+constexpr int SAVE_MODE_PROGRESS_BAR  = 5;
 
 struct SaveDataDialogParam {
 	uint8_t  base_param[48];
@@ -355,6 +356,7 @@ struct SaveDataDialogResult {
 
 static std::atomic<int> g_save_status         = SAVE_STATUS_NONE;
 static bool             g_save_running_polled = false;
+static bool             g_save_progress_bar   = false;
 static int              g_save_mode           = 0;
 static void*            g_save_user_data      = nullptr;
 static char             g_save_dir_name[sizeof(SaveDataDirName::data)] {};
@@ -380,8 +382,8 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
 
-	// Some games require a RUNNING update before FINISHED.
-	if (g_save_status == SAVE_STATUS_RUNNING) {
+	// Some games require a RUNNING update before FINISHED. A progress bar runs until Close.
+	if (g_save_status == SAVE_STATUS_RUNNING && !g_save_progress_bar) {
 		if (g_save_running_polled) {
 			g_save_status = SAVE_STATUS_FINISHED;
 		}
@@ -443,8 +445,13 @@ int KYTY_SYSV_ABI SaveDataDialogOpen(const void* param) {
 		}
 	}
 
+	// A progress bar has no button: the app owns it and closes it when its work is done.
+	// Reported finished, the app takes it for dismissed and reopens it every frame, so it
+	// stays RUNNING until Close. Every other mode is answered with OK, as if the user had
+	// pressed it, once UpdateStatus has reported it RUNNING.
 	g_save_status         = SAVE_STATUS_RUNNING;
 	g_save_running_polled = false;
+	g_save_progress_bar   = p != nullptr && p->mode == SAVE_MODE_PROGRESS_BAR;
 
 	return OK;
 }
@@ -506,9 +513,11 @@ LIB_NAME("MsgDialog.native", "MsgDialog");
 
 constexpr int STATUS_NONE        = 0;
 constexpr int STATUS_INITIALIZED = 1;
+constexpr int STATUS_RUNNING     = 2;
 constexpr int STATUS_FINISHED    = 3;
 constexpr int RESULT_OK          = 0;
 constexpr int BUTTON_ID_OK       = 1;
+constexpr int MODE_PROGRESS_BAR  = 2;
 
 struct MsgDialogParam {
 	uint8_t  base_param[48];
@@ -559,7 +568,8 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
 	}
 
-	g_status = STATUS_FINISHED;
+	// As for the save-data dialog: a progress bar runs until the app closes it.
+	g_status = (p != nullptr && p->mode == MODE_PROGRESS_BAR) ? STATUS_RUNNING : STATUS_FINISHED;
 
 	return OK;
 }

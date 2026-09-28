@@ -245,6 +245,18 @@ void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
 }
 
+void CommandProcessor::CompleteReleaseMemWrite() {
+	GetScheduler().CompleteReleaseMemWrite();
+}
+
+void CommandProcessor::CompleteReleaseMemInterrupt() {
+	GetScheduler().CompleteReleaseMemInterrupt();
+}
+
+void CommandProcessor::CompleteDraw() {
+	GetScheduler().CompleteDraw();
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -697,6 +709,23 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
+		if ((packet_header >> 30u) == 0u) {
+			// A type-0 packet writes COUNT+1 registers from a base index; the command processor
+			// ignores them, and games leave reserved dwords as zeros, which decode to this
+			// (a zero header is one register write of 0 to index 0).
+			const auto packet_dw = ((packet_header >> 16u) & 0x3fffu) + 2u;
+			static std::atomic<uint32_t> type0_log_count {0};
+			if (type0_log_count.fetch_add(1) < 16) {
+				LOGF("CP: skipping type-0 packet header=0x%08" PRIx32 " len=%" PRIu32
+				     " at offset=0x%05" PRIx32 "\n",
+				     packet_header, packet_dw, total_dw - remaining_dw);
+			}
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",
@@ -858,6 +887,7 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		     args.base_vertex, args.first_instance);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
+	CompleteDraw();
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
@@ -1051,6 +1081,7 @@ void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 		args.instance_count = m_num_instances;
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
+	CompleteDraw();
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {

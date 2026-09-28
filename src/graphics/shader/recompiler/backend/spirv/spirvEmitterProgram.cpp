@@ -370,9 +370,23 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// Safety net: a guest loop whose trip count comes from bad data (a blur radius read
+	// from a buffer an unemulated pass left unwritten) hung the GPU until the driver reset it.
+	// Leave the dispatcher after a bounded number of block transitions instead: the invocation's
+	// results are wrong, the device survives.
+	constexpr uint32_t MaxDispatcherTransitions = 4096;
+	const auto         iteration                = state.builder.AllocateId();
+	const auto         next_iteration           = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+	                          initial_parent, next_iteration, dispatcher.continue_label);
+	const auto finished = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+	                          ConstantU32(state, MaxDispatcherTransitions));
+	const auto done = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, exhausted);
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -405,6 +419,8 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+	                          ConstantU32(state, 1u));
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);

@@ -2,10 +2,14 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
+#include "common/timer.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -26,6 +30,21 @@ void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint3
 	            what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,
 	            debug_submit, arg0, arg1, arg2, arg3, arg4);
 	std::fflush(stdout);
+}
+
+// KYTY_DRAW_FLUSH_INTERVAL=N overrides CompleteDraw()'s periodic non-blocking flush interval.
+// Defaults to 16 -- validated against real gameplay, where it cut the fraction of the main thread
+// spent in MasterSemaphore::Wait from dominating the frame to under 10%. Explicitly setting it to
+// 0 disables the flush entirely, same as before this had a default.
+uint32_t DrawFlushInterval() {
+	static const uint32_t interval = [] {
+		const char* v = std::getenv("KYTY_DRAW_FLUSH_INTERVAL");
+		if (v == nullptr) {
+			return 16u;
+		}
+		return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+	}();
+	return interval;
 }
 
 } // namespace
@@ -170,18 +189,53 @@ void CommandScheduler::Flush() {
 	Flush(submit);
 }
 
+void CommandScheduler::CompleteReleaseMemWrite() {
+	constexpr uint32_t WritesPerSubmission = 32;
+	if (++m_recorded_release_mem_writes < WritesPerSubmission) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
+void CommandScheduler::CompleteReleaseMemInterrupt() {
+	// Deliberately smaller than CompleteReleaseMemWrite's 32: this event has already been queued
+	// for guest delivery once its tick completes (see Sync::TriggerEopEventAtEndOfPipe ->
+	// DeferPriorityOperation), and a guest thread may be blocked waiting on it via an event queue.
+	// Batching still defers only the vkQueueSubmit -- the event fires once that (now slightly
+	// larger) submission's tick completes, same as before, just a handful of RELEASE_MEM events
+	// later instead of immediately.
+	constexpr uint32_t InterruptsPerSubmission = 8;
+	if (++m_recorded_release_mem_interrupts < InterruptsPerSubmission) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
+void CommandScheduler::CompleteDraw() {
+	const auto interval = DrawFlushInterval();
+	if (interval == 0u || ++m_recorded_draws < interval) {
+		return;
+	}
+	CheckActive();
+	Flush();
+}
+
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
+	KYTY_PROFILER_FUNCTION();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_FUNCTION();
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -191,19 +245,62 @@ void CommandScheduler::Finish() {
 	PopPendingOperations();
 }
 
+// How long the GPU thread spends drained on the host GPU, and how often. A drain that
+// submits the current tick first (a CPU read of GPU-owned memory mid-frame) is counted apart
+// from one that waits on already submitted work.
+namespace {
+struct WaitStats {
+	uint64_t count       = 0;
+	uint64_t drain_count = 0;
+	double   total_s     = 0.0;
+	double   drain_s     = 0.0;
+	double   max_s       = 0.0;
+};
+WaitStats g_wait_stats;
+
+void RecordWait(double seconds, bool drained) {
+	if (!GuestGpu::IsGpuThread()) {
+		return;
+	}
+	auto& stats = g_wait_stats;
+	stats.count++;
+	stats.total_s += seconds;
+	stats.max_s = std::max(stats.max_s, seconds);
+	if (drained) {
+		stats.drain_count++;
+		stats.drain_s += seconds;
+	}
+	if (stats.count % 256 == 0) {
+		LOGF("GpuWaits: count=%" PRIu64 " total=%.1fms max=%.1fms drains=%" PRIu64
+		     " drain_total=%.1fms\n",
+		     stats.count, stats.total_s * 1000.0, stats.max_s * 1000.0, stats.drain_count,
+		     stats.drain_s * 1000.0);
+		stats = {};
+	}
+}
+} // namespace
+
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(tick > CurrentTick());
+	Common::Timer timer;
+	timer.Start();
 	if (tick == CurrentTick()) {
 		CheckActive();
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
-		const auto submitted_tick = Submit();
-		EXIT_IF(submitted_tick != tick);
-		m_master.Wait(tick);
-		BeginNext();
+		{
+			KYTY_PROFILER_BLOCK("CommandScheduler::Wait (forced submit-then-wait)");
+			const auto submitted_tick = Submit();
+			EXIT_IF(submitted_tick != tick);
+			m_master.Wait(tick);
+			BeginNext();
+		}
+		RecordWait(timer.GetTimeS(), true);
 	} else {
 		m_master.Wait(tick);
+		RecordWait(timer.GetTimeS(), false);
 	}
 }
 
@@ -344,6 +441,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
@@ -379,6 +477,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpDeviceLossDiagnostics(graphics);
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,
@@ -387,7 +488,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
-	m_command.m_buffer = nullptr;
+	m_command.m_buffer                = nullptr;
+	m_recorded_release_mem_writes     = 0;
+	m_recorded_release_mem_interrupts = 0;
+	m_recorded_draws                  = 0;
 	return tick;
 }
 

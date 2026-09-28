@@ -948,6 +948,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 		}
 		previous = layer;
 	}
+	m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 	m_impl->Present();
 }
 
