@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/indirectDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -12,6 +13,7 @@
 
 #include <unordered_set>
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -229,6 +231,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Created at the first thread-dimension indirect dispatch.
+	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
