@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -110,7 +112,8 @@ void EnsureLdsStorage(EmitterState& state) {
 	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	const auto dwords = std::max(LdsDwordCount(state), LdsPadDwords(state.program.shader_hash));
+	const auto dwords =
+	    std::max({1u, LdsDwordCount(state), LdsPadDwords(state.program.shader_hash)});
 	const auto define = [&](uint32_t type, uint32_t bytes) {
 		const auto array = state.builder.DecoratedType(
 		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,

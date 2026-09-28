@@ -138,6 +138,8 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::SharedBase:
 		case Decoder::OperandKind::PrivateBase:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
+		case Decoder::OperandKind::SharedLimit:
+		case Decoder::OperandKind::PrivateLimit: return IR::U32(IR::Value(UINT32_MAX));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::Vgpr:
@@ -481,6 +483,12 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 		return {IR::U32(IR::Value(0u)), IR::U32(IR::Value(
 		    operand.kind == Decoder::OperandKind::PrivateBase ? Decoder::PrivateApertureHigh
 		                                                      : Decoder::SharedApertureHigh))};
+	}
+	if (operand.kind == Decoder::OperandKind::SharedLimit) {
+		return {ReadRawU32(operand), IR::U32(IR::Value(Decoder::SharedApertureHigh))};
+	}
+	if (operand.kind == Decoder::OperandKind::PrivateLimit) {
+		return {ReadRawU32(operand), IR::U32(IR::Value(Decoder::PrivateApertureHigh))};
 	}
 	if (operand.kind == Decoder::OperandKind::ExecLo) {
 		return {ir.GetExecLo(), ir.GetExecHi()};
@@ -1102,6 +1110,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
+			}
+		}
+		if (options.stage == ShaderType::Compute &&
+		    options.input_info.compute->dispatch_thread_dimensions) {
+			// Vulkan dispatches whole workgroups. The guest thread-dimension mode starts
+			// padding lanes with EXEC cleared, while allowing later guest mask changes.
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				initial_exec = entry_ir.LogicalAnd(
+				    initial_exec,
+				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis),
+				                      builtin(IR::StageInputKind::DispatchThreadCount, axis)));
 			}
 		}
 		entry_ir.SetExec(initial_exec);

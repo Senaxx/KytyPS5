@@ -89,6 +89,8 @@ private:
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
+	void IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
+	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
 	void IMAGE_GET_LOD(const Decoder::Instruction& inst);
@@ -124,11 +126,10 @@ private:
 	                        bool scalar, bool cmpx);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
-	std::array<IR::U32, 2> ReadF64Halves(const Decoder::Operand& operand);
-	void                   EmitFloat64EqualCompare(const Decoder::Instruction& inst);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
 	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
+	void EmitFloat64Equal(const Decoder::Instruction& inst);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);

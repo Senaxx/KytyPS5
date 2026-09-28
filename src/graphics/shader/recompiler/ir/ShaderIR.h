@@ -23,6 +23,12 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Emulated 64-bit FLAT apertures. Each contains 4 GiB of byte offsets and is
+// outside guest global VA space. Keep queries and FLAT routing consistent: the values are
+// upstream's Decoder::SharedApertureHigh / PrivateApertureHigh (ShaderDecoder.h).
+inline constexpr uint32_t SharedApertureHigh = 0x80000000u;
+inline constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
@@ -193,6 +199,7 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	DispatchThreadCount,
 };
 
 enum class StageOutputKind {
@@ -422,14 +429,18 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	bool                           has_dispatch_dimensions = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t BufferLengthDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t DispatchDimensionsDword() const {
 		return BufferLengthDword() + memory_offset_count;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return DispatchDimensionsDword() + (has_dispatch_dimensions ? 3u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

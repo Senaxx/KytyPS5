@@ -1003,7 +1003,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
-                                         bool indexed) {
+                                         bool indexed, uint32_t draw_index_register) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -1040,11 +1040,19 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 
 	for (uint32_t i = 0; i < draw_count; i++) {
+		// DRAW_INDIRECT_MULTI writes DrawIndex before each draw, including draws
+		// with zero vertices/instances. It starts at zero for each packet.
+		if (draw_index_register != Pm4::SH_NOP) {
+			EXIT_NOT_IMPLEMENTED(draw_index_register >= Pm4::SH_NUM ||
+			                     g_hw_sh_indirect_func[draw_index_register] == nullptr);
+			SetUserDataMarker(HW::UserSgprType::Unknown);
+			g_hw_sh_indirect_func[draw_index_register](*this, draw_index_register, i);
+		}
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 
 		if (!indexed) {
-			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			auto* args      = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1191,6 +1199,8 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
+		// Publish the completion label only after preceding GPU work has finished.
+		SynchronizeGpu();
 		std::memcpy(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
@@ -1241,10 +1251,14 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 			} else {
 				if (event_write_source == 0x04) {
+					// The timestamp marks the end of the work before it.
+					SynchronizeGpu();
 					value = Sync::ReadReferenceClock();
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
+					// Publish the completion label only after preceding GPU work has finished.
+					SynchronizeGpu();
 					std::memcpy(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
@@ -1481,6 +1495,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		     reinterpret_cast<uint64_t>(dst_gpu_addr), value);
 	}
 
+	SynchronizeGpu();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
@@ -1506,6 +1521,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 	if (eop_event_type != 0x00000004 || cache_action != 0x00000038) {
 		EXIT("unknown event type\n");
 	}
+	SynchronizeGpu();
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);

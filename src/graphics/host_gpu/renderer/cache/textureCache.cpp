@@ -492,20 +492,14 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 }
 
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
-	// One null image per format and base type: 1D and 3D views need 1D and 3D images.
-	const auto type = desc.info.type == Prospero::ImageType::kColor1D ||
-	                          desc.info.type == Prospero::ImageType::kColor3D
-	                      ? desc.info.type
-	                      : Prospero::ImageType::kColor2D;
-	const auto key  = (static_cast<uint64_t>(desc.info.pixel_format) << 8u) |
-	                 static_cast<uint64_t>(type);
+	const auto key = std::pair {desc.info.pixel_format, desc.info.type};
 	if (const auto found = m_null_images.find(key); found != m_null_images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = type;
+	info.type            = desc.info.type;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;

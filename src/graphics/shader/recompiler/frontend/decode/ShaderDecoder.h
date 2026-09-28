@@ -348,6 +348,7 @@ enum class Opcode {
 	V_CMP_F_F32,
 	V_CMP_LT_F32,
 	V_CMP_EQ_F32,
+	V_CMP_EQ_F64,
 	V_CMP_LE_F32,
 	V_CMP_GT_F32,
 	V_CMP_LG_F32,
@@ -454,7 +455,6 @@ enum class Opcode {
 	V_CMPX_NE_I64,
 	V_CMPX_LE_U64,
 	V_CMPX_NE_U64,
-	V_CMP_EQ_F64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
 	V_CMPX_LE_U32,
@@ -595,6 +595,7 @@ enum class Opcode {
 	DS_READ_ADDTID_B32,
 	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
 	IMAGE_LOAD_MIP,
@@ -667,10 +668,12 @@ enum class OperandKind {
 	M0,
 	PopsExitingWaveId,
 	SharedBase,
+	SharedLimit,
 	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
-	// A special register the recompiler does not model (the memory aperture bases and limits);
+	// A special register the recompiler does not model;
 	// DecodeInstruction turns the instruction into UNSUPPORTED, so the shader gives up.
 	Unsupported,
 };

@@ -352,6 +352,18 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.image_address_components =
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
+	if (opcode == 0xe6u) {
+		// BVH addresses are raw DWORDs: only direction and inverse direction use A16.
+		inst.image_address_components = a16 ? 8u : 11u;
+		const uint32_t expected_nsa = (inst.image_address_components + 2u) / 4u;
+		if (inst.dmask != 0xfu || d16 || !r128 || (word0 & (1u << 12u)) == 0u ||
+		    ((word0 >> 3u) & 7u) != 0u || (word0 & (3u << 16u)) != 0u || ssamp != 0u ||
+		    (nsa_dwords != 0u && nsa_dwords != expected_nsa) ||
+		    (nsa_dwords == 0u && vaddr + inst.image_address_components > 256u) || vdata > 252u) {
+			SetUnsupported(inst, Family::MIMG, opcode, "invalid BVH instruction fields");
+			return;
+		}
+	}
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");

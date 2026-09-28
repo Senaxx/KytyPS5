@@ -647,6 +647,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
+		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
+		     GetDumpLabel(options), options.shader_hash, folded);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
@@ -654,6 +662,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
+		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
+		     GetDumpLabel(options), options.shader_hash, removed);
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	if (!LowerTessellationMemory(ir, options)) {
@@ -678,8 +691,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		DumpGaveUpCode(options, code);
 		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
 		     options.shader_hash);
+		if (Config::GraphicsDebugDumpEnabled()) {
+			const auto path = Config::GetShaderLogFolder() / "rejected" /
+			                  fmt::format("{}_{:016x}.ir", StageName(options.stage), options.shader_hash);
+			Common::File::CreateDirectories(path.parent_path());
+			Common::File file(path);
+			if (!file.IsInvalid()) {
+				const auto dump = MakeIrDump(CFG::GraphToString(cfg), ir);
+				file.Write(dump.data(), dump.size());
+			}
+		}
 		TranslateResult unsupported_result;
 		unsupported_result.unsupported = true;
+		unsupported_result.decoded_dump = std::move(decoded_dump);
 		return unsupported_result;
 	}
 	TranslateResult result;

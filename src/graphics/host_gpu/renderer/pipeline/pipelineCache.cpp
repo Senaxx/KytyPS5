@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -330,6 +331,9 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		std::vector<uint32_t> static_state;
+		// Exact expanded code includes callees and their original return-PC constants.
+		// A different target/body must not reuse a program compiled for an earlier call.
+		std::vector<uint32_t> function_code;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
@@ -362,6 +366,7 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
+			PipelineKeyHash::Mix(hash, key.function_code.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
 			return hash;
@@ -419,6 +424,22 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		lookup_key.function_code.clear();
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			std::string reason;
+			if (!ShaderRecompiler::Decoder::InlineShaderFunctions(
+			        params.code, params.Base(), user_data,
+			        [&](uint64_t address, std::span<uint32_t> words) {
+				        return ReadShaderGuestMemoryRaw(nullptr, address, words);
+			        },
+			        lookup_key.function_code, reason, input_info.wave_size)) {
+				static std::atomic<uint32_t> reports {0};
+				if (reports.fetch_add(1) < 16) {
+					::printf("Shader function expansion hash=%016" PRIx64 ": %s\n",
+					         params.hash, reason.c_str());
+				}
+			}
+		}
 		if (unsupported.contains(lookup_key)) {
 			return ShaderProgram {};
 		}
@@ -517,7 +538,10 @@ struct PipelineCache::ProgramCache {
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		options.non_fatal = ShaderFailureNonFatal();
 		options.bindless_images = bindless_images;
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		const auto compile_code = lookup_key.function_code.empty()
+		                              ? params.code
+		                              : std::span<const uint32_t>(lookup_key.function_code);
+		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
@@ -808,7 +832,21 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
+		// In particular, 32-bit exports can carry raw integer material data.
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			const auto& rt = context.GetRenderTarget(slot);
+			if (rt.base.addr == 0 ||
+			    render_target_mask_slot(context.GetRenderTargetMask(), slot) == 0) {
+				continue;
+			}
+			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
+				pixel_info.target_uint_mask |= 1u << slot;
+			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
+				pixel_info.target_sint_mask |= 1u << slot;
+			}
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -822,6 +860,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
+		           ((pixel_info.target_uint_mask | pixel_info.target_sint_mask) & 1u) == 0 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
 		                       [](uint8_t mode) { return mode == 0; }) &&
@@ -832,6 +871,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.dual_source_blending     = true;
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = {};
+		}
+		if (pixel_info.dual_source_blending) {
+			// The second source takes the numeric type of target 0.
+			pixel_info.target_uint_mask =
+			    (pixel_info.target_uint_mask & ~2u) | ((pixel_info.target_uint_mask & 1u) << 1u);
+			pixel_info.target_sint_mask =
+			    (pixel_info.target_sint_mask & ~2u) | ((pixel_info.target_sint_mask & 1u) << 1u);
 		}
 	}
 	if (context.GetClipControl().clip_disable) {

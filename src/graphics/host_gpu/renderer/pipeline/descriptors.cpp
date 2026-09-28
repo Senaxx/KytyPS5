@@ -1118,6 +1118,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
+	if (layout.has_dispatch_dimensions) {
+		std::copy(prepared.dispatch_dimensions.begin(), prepared.dispatch_dimensions.end(),
+		          prepared.shader_data.begin() + layout.DispatchDimensionsDword());
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -1130,8 +1134,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                               program.info.buffers[resource],
 		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
+		// buffer still has no accessible elements. In particular, never let a null store
+		// modify the shared fallback and affect subsequent null reads.
 		prepared.shader_data[layout.BufferLengthDword() + i] =
-		    static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
+		    prepared.buffer_sources[i].size == 0
+		        ? 0u
+		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {

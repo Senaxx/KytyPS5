@@ -1,7 +1,7 @@
-#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
 #include <fmt/format.h>
@@ -37,7 +37,7 @@ void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::st
 }
 
 void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
-                                   const std::string& message) {
+                      const std::string& message) {
 	SetFailure(graph, kind, block_id, message);
 	if (Frontend::TranslationNonFatal()) {
 		return;
