@@ -3,6 +3,7 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <array>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -73,6 +74,22 @@ void Translator::TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32
 	}
 }
 
+void Translator::ForceDestination(const Decoder::Instruction& inst,
+                                  const std::vector<uint32_t>& values) {
+	for (uint32_t component = 0; component < values.size(); component++) {
+		WriteRawU32(OffsetOperand(inst.dst, component), IR::U32(IR::Value(values[component])));
+	}
+}
+
+void Translator::ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values) {
+	Decoder::Operand reg;
+	reg.kind = Decoder::OperandKind::Vgpr;
+	reg.reg  = first;
+	for (uint32_t component = 0; component < values.size(); component++) {
+		WriteRawU32(OffsetOperand(reg, component), IR::U32(IR::Value(values[component])));
+	}
+}
+
 void Translator::V_INTERP_P1_F32() {}
 
 void Translator::V_INTERP_P2_F32(const Decoder::Instruction& inst) {
@@ -100,6 +117,30 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	                                     IR::Value(0u)};
 	for (uint32_t source = 0; source < std::min(inst.src_count, 4u); source++) {
 		components[source] = ReadRawU32(PlainOperand(SourceAt(inst, source)));
+	}
+	// Diagnostics: KYTY_FORCE_EXPORT=<shader hash>:<target>:<component>:<value> (all hex)
+	// exports a constant dword in place of one component, to bisect a wrong draw.
+	struct ForcedExport {
+		uint64_t hash      = 0;
+		uint32_t target    = 0;
+		uint32_t component = 0;
+		uint32_t value     = 0;
+	};
+	static const ForcedExport forced = [] {
+		ForcedExport result;
+		const char*  value = std::getenv("KYTY_FORCE_EXPORT");
+		if (value != nullptr) {
+			char* end        = nullptr;
+			result.hash      = std::strtoull(value, &end, 16);
+			result.target    = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			result.component = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			result.value     = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+		}
+		return result;
+	}();
+	if (forced.hash != 0 && forced.hash == program.shader_hash &&
+	    forced.target == inst.exp.target && forced.component < 4u) {
+		components[forced.component] = IR::Value(forced.value);
 	}
 	const auto data = ir.Emit(IR::ValueOpcode::CompositeConstructU32x4,
 	                          {components[0], components[1], components[2], components[3]});

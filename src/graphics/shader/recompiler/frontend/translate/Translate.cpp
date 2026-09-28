@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <unordered_map>
 #include <utility>
 
@@ -1349,6 +1350,40 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 	}
 	const bool flush_f32_inputs = options.stage == ShaderType::Compute &&
 	                             (options.input_info.compute->float_mode & 0x10u) == 0;
+	// Diagnostics: KYTY_FORCE_PC=<shader hash>@<pc>=<dword>[,<dword>...][;<pc>=...] (all hex)
+	// overwrites the destinations of instructions with constants, to bisect which path feeds a
+	// wrong result. <pc>:v<n>=... writes VGPRs from v<n> on instead, after that instruction.
+	struct ForcedResult {
+		uint32_t              pc  = 0;
+		uint32_t              vgpr = UINT32_MAX;
+		std::vector<uint32_t> values;
+	};
+	struct ForcedResults {
+		uint64_t                  hash = 0;
+		std::vector<ForcedResult> results;
+	};
+	static const ForcedResults forced = [] {
+		ForcedResults result;
+		const char*   value = std::getenv("KYTY_FORCE_PC");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end   = nullptr;
+		result.hash = std::strtoull(value, &end, 16);
+		while (end != nullptr && (*end == '@' || *end == ';')) {
+			ForcedResult forced_result;
+			forced_result.pc = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+			if (end != nullptr && end[0] == ':' && end[1] == 'v') {
+				forced_result.vgpr = static_cast<uint32_t>(std::strtoul(end + 2, &end, 10));
+			}
+			while (end != nullptr && (*end == '=' || *end == ',')) {
+				forced_result.values.push_back(
+				    static_cast<uint32_t>(std::strtoul(end + 1, &end, 16)));
+			}
+			result.results.push_back(std::move(forced_result));
+		}
+		return result;
+	}();
 	for (const auto& cfg_block: cfg.blocks) {
 		const auto typed_index = block_indices.at(cfg_block.id);
 		Translator translator(result, result.blocks[typed_index], vector_limit, flush_f32_inputs);
@@ -1373,6 +1408,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				continue;
 			}
 			translator.TranslateInstruction(instruction);
+			if (forced.hash != 0 && forced.hash == result.shader_hash) {
+				for (const auto& forced_result: forced.results) {
+					if (forced_result.pc != instruction.pc) {
+						continue;
+					}
+					if (forced_result.vgpr != UINT32_MAX) {
+						translator.ForceVectorRegisters(forced_result.vgpr, forced_result.values);
+					} else {
+						translator.ForceDestination(instruction, forced_result.values);
+					}
+				}
+			}
 		}
 		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}

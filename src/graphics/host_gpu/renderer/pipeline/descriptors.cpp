@@ -54,7 +54,82 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
+struct WatchedReread {
+	uint64_t frame   = 0;
+	uint64_t address = 0;
+	uint64_t size    = 0;
+};
+
+std::mutex                 g_watched_reread_mutex;
+std::vector<WatchedReread> g_watched_rereads;
+
+void LogWords(const uint32_t* words, size_t count) {
+	for (size_t row = 0; row < count; row += 8) {
+		std::string line;
+		for (size_t k = row; k < std::min(count, row + 8); k++) {
+			line += fmt::format(" {:08x}", words[k]);
+		}
+		LOGF("    +0x%03zx:%s\n", row * 4, line.c_str());
+	}
+}
+
 } // namespace
+
+static uint64_t WatchedShaderHash() {
+	static const uint64_t hash = [] {
+		const char* value = std::getenv("KYTY_WATCH_SHADER");
+		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	}();
+	return hash;
+}
+
+static std::atomic<uint64_t> g_watched_first_frame {UINT64_MAX};
+
+uint64_t WatchedShaderFirstFrame() {
+	return g_watched_first_frame.load();
+}
+
+bool InWatchedShaderFrame(uint64_t hash, uint64_t presented_frame, std::atomic<uint32_t>& logged) {
+	static const uint64_t delta = [] {
+		const char* value = std::getenv("KYTY_WATCH_SHADER_FRAME");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : UINT64_MAX;
+	}();
+	if (hash == 0 || hash != WatchedShaderHash()) {
+		return false;
+	}
+	uint64_t unset = UINT64_MAX;
+	g_watched_first_frame.compare_exchange_strong(unset, presented_frame);
+	return delta != UINT64_MAX && presented_frame == g_watched_first_frame.load() + delta &&
+	       logged.fetch_add(1) < 64u;
+}
+
+void LogWatchedRereads(BufferCache& cache, uint64_t presented_frames) {
+	std::vector<WatchedReread> due;
+	{
+		std::lock_guard lock(g_watched_reread_mutex);
+		for (auto it = g_watched_rereads.begin(); it != g_watched_rereads.end();) {
+			if (it->frame <= presented_frames) {
+				due.push_back(*it);
+				it = g_watched_rereads.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	for (const auto& reread: due) {
+		std::vector<uint32_t> words(reread.size / 4u);
+		const bool gpu_written = cache.HasGpuDirtyBytes(reread.address, reread.size);
+		const bool read =
+		    Libs::LibKernel::Memory::TryReadBacking(reread.address, words.data(), reread.size);
+		LOGF("WatchShader reread at frame %" PRIu64 ": 0x%012" PRIx64 "+0x%" PRIx64
+		     " gpu_written=%d%s\n",
+		     presented_frames, reread.address, reread.size, gpu_written ? 1 : 0,
+		     read ? "" : " (unreadable)");
+		if (read) {
+			LogWords(words.data(), words.size());
+		}
+	}
+}
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 	const auto image_class = ShaderRecompiler::IR::ImageBindingResourceClass(kind);
@@ -1033,23 +1108,57 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	const auto& snapshot = *runtime.resources;
 	const DiagShaderScope diag_shader_scope(program.shader_hash);
 	// Diagnostics: KYTY_WATCH_SHADER=<hash> logs the buffer and texture descriptors a shader is
-	// bound with (first few uses).
-	static const uint64_t watch_shader = [] {
-		const char* value = std::getenv("KYTY_WATCH_SHADER");
-		return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ull;
+	// bound with (first few uses; KYTY_WATCH_SHADER_EVERY=<n> adds every n-th use, up to 8 more).
+	const uint64_t        watch_shader = WatchedShaderHash();
+	static const uint32_t watch_every = [] {
+		const char* value = std::getenv("KYTY_WATCH_SHADER_EVERY");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
 	}();
 	static std::atomic<uint32_t> watched_uses {0};
-	if (watch_shader != 0 && program.shader_hash == watch_shader && watched_uses.fetch_add(1) < 4) {
-		LOGF("WatchShader 0x%016" PRIx64 " stage=%u buffers=%zu images=%zu\n", program.shader_hash,
+	const auto                   watched_use = watch_shader != 0 && program.shader_hash == watch_shader
+	                                               ? watched_uses.fetch_add(1)
+	                                               : UINT32_MAX;
+	static std::atomic<uint32_t> frame_uses {0};
+	const bool in_watched_frame =
+	    watched_use != UINT32_MAX &&
+	    InWatchedShaderFrame(program.shader_hash,
+	                         m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+	                         frame_uses);
+	if (watched_use < 4u ||
+	    (watched_use != UINT32_MAX && watch_every != 0 && watched_use % watch_every == 0 &&
+	     watched_use / watch_every <= 8u) ||
+	    in_watched_frame) {
+		LOGF("WatchShader 0x%016" PRIx64 " use=%u frame=%" PRIu64 " stage=%u buffers=%zu images=%zu\n",
+		     program.shader_hash, watched_use,
+		     m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
 		     static_cast<uint32_t>(program.stage), program.info.buffers.size(),
 		     program.info.images.size());
 		for (size_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); i++) {
 			const auto r = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
-			LOGF("  buffer[%zu]: formatted=%d written=%d base=0x%012" PRIx64
-			     " stride=%u records=%u format=%u dst_sel=%u%u%u%u\n",
-			     i, program.info.buffers[i].formatted ? 1 : 0,
+			// Whether the GPU has written bytes of the buffer that the CPU copy lacks.
+			const uint64_t bytes =
+			    std::max<uint64_t>(r.Stride(), 1u) * static_cast<uint64_t>(r.NumRecords());
+			const bool gpu_written = r.Base48() != 0 && bytes != 0 &&
+			                         m_context.GetBufferCache().HasGpuDirtyBytes(r.Base48(), bytes);
+			LOGF("  buffer[%zu]: pc=0x%x formatted=%d written=%d base=0x%012" PRIx64
+			     " stride=%u records=%u format=%u dst_sel=%u%u%u%u gpu_written=%d\n",
+			     i, program.info.buffers[i].first_use_pc, program.info.buffers[i].formatted ? 1 : 0,
 			     program.info.buffers[i].written ? 1 : 0, r.Base48(), r.Stride(), r.NumRecords(),
-			     r.RawFormat(), r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW());
+			     r.RawFormat(), r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW(),
+			     gpu_written ? 1 : 0);
+			// Small buffers (constants, tables) are listed in full, as guest memory holds them.
+			if (r.Base48() != 0 && bytes != 0 && bytes <= 4096 && !gpu_written) {
+				std::vector<uint32_t> words((bytes + 3) / 4);
+				if (Libs::LibKernel::Memory::TryReadBacking(r.Base48(), words.data(), bytes)) {
+					for (size_t row = 0; row < words.size(); row += 8) {
+						std::string line;
+						for (size_t k = row; k < std::min(words.size(), row + 8); k++) {
+							line += fmt::format(" {:08x}", words[k]);
+						}
+						LOGF("    +0x%03zx:%s\n", row * 4, line.c_str());
+					}
+				}
+			}
 		}
 		for (size_t i = 0; i < program.info.images.size() && i < snapshot.images.size(); i++) {
 			const auto r = DecodeNativeDescriptor<ShaderTextureResource>(snapshot.images[i]);
@@ -1058,6 +1167,41 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			     r.DstSelX(), r.DstSelY(), r.DstSelZ(), r.DstSelW(),
 			     static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Width5()) + 1u,
 			     static_cast<uint32_t>(r.Height5()) + 1u);
+		}
+		// User data, and the first bytes of every buffer a user-data V# points at: the shader
+		// reads constants and heap indices from these with scalar loads.
+		const auto& user = snapshot.user_data;
+		for (size_t row = 0; row < user.size(); row += 8) {
+			std::string line;
+			for (size_t k = row; k < std::min(user.size(), row + 8); k++) {
+				line += fmt::format(" {:08x}", user[k]);
+			}
+			LOGF("  user_data[s%zu]:%s\n", program.user_data_base + row, line.c_str());
+		}
+		for (size_t reg = 0; reg + 4 <= user.size(); reg += 4) {
+			ShaderBufferResource r;
+			r.fields[0]         = user[reg];
+			r.fields[1]         = user[reg + 1];
+			r.fields[2]         = user[reg + 2];
+			r.fields[3]         = user[reg + 3];
+			const uint64_t size = r.Stride() != 0 ? static_cast<uint64_t>(r.Stride()) * r.NumRecords()
+			                                      : r.NumRecords();
+			if (r.Base48() == 0 || size == 0) {
+				continue;
+			}
+			std::vector<uint32_t> words(std::min<uint64_t>(size, 0x100u) / 4u);
+			if (words.empty() || m_context.GetBufferCache().HasGpuDirtyBytes(r.Base48(), words.size() * 4u) ||
+			    !Libs::LibKernel::Memory::TryReadBacking(r.Base48(), words.data(), words.size() * 4u)) {
+				continue;
+			}
+			LOGF("  user V# s[%zu:%zu]: base=0x%012" PRIx64 " stride=%u records=%u\n",
+			     program.user_data_base + reg, program.user_data_base + reg + 3, r.Base48(), r.Stride(),
+			     r.NumRecords());
+			LogWords(words.data(), words.size());
+			std::lock_guard lock(g_watched_reread_mutex);
+			g_watched_rereads.push_back(
+			    {m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed) + 2u,
+			     r.Base48(), words.size() * 4u});
 		}
 	}
 	prepared.runtime = &runtime;

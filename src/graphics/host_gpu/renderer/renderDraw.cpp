@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -941,6 +942,27 @@ static void LogDrawCensus(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                  state.ps_active ? 1 : 0);
 }
 
+// Diagnostics: the draw parameters of the watched shader's draws in the watched frame (see
+// InWatchedShaderFrame); each line precedes that draw's WatchShader bindings.
+void RenderExecutor::LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,
+                                    uint32_t index_offset, int32_t base_vertex,
+                                    uint32_t first_vertex, int32_t host_vertex_offset,
+                                    uint32_t host_first_instance, bool indirect) {
+	static std::atomic<uint32_t> logged {0};
+	const auto*                  program = state.vertex_info[0].stage.program;
+	if (program == nullptr ||
+	    !InWatchedShaderFrame(program->shader_hash,
+	                          m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed),
+	                          logged)) {
+		return;
+	}
+	LOGF("WatchShader draw: %s count=%u instances=%u first_instance=%u index_offset=%u "
+	     "base_vertex=%d first_vertex=%u host_vertex_offset=%d host_first_instance=%u "
+	     "indirect=%d\n",
+	     draw.Name(), draw.index_count, draw.instance_count, draw.first_instance, index_offset,
+	     base_vertex, first_vertex, host_vertex_offset, host_first_instance, indirect ? 1 : 0);
+}
+
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
@@ -1344,6 +1366,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	LogWatchedDraw(draw, state, ucfg.GetIndexOffset(), args.base_vertex, 0, emit.vertex_offset,
+	               emit.first_instance, indirect);
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -1435,6 +1459,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	LogWatchedDraw(draw, state, ucfg.GetIndexOffset(), 0, args.first_vertex,
+	               static_cast<int32_t>(emit.first_vertex), emit.first_instance, indirect);
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

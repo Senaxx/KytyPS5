@@ -269,7 +269,15 @@ bool SkipShaderRequested(uint64_t shader_hash) {
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	// KYTY_DUMP_SPIRV_HASHES="hash,hash,...": dump these shaders' SPIR-V without the full
+	// graphics debug dump.
+	static const std::string requested = [] {
+		const char* value = std::getenv("KYTY_DUMP_SPIRV_HASHES");
+		return value != nullptr ? std::string(value) : std::string();
+	}();
+	if (!Config::GraphicsDebugDumpEnabled() &&
+	    (requested.empty() ||
+	     requested.find(fmt::format("{:016x}", shader_hash)) == std::string::npos)) {
 		return;
 	}
 	static std::atomic_int id = 0;

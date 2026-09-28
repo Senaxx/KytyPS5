@@ -742,34 +742,43 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			std::unique_lock lock(m_dirty_ranges_mutex);
 			m_gpu_modified_ranges.Add(vaddr, size);
 		}
-		// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>] (hex) names the bindings that mark
-		// bytes of that range GPU-written, once per distinct (range, shader).
-		static const std::pair<uint64_t, uint64_t> watch = [] {
-			const char* value = std::getenv("KYTY_WATCH_GPU_WRITE");
-			if (value == nullptr) {
-				return std::pair<uint64_t, uint64_t> {0, 0};
+		// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names
+		// the bindings that mark bytes of those ranges GPU-written: the first write of each
+		// (range, shader), with a host stack when no shader is being bound (copies, fills).
+		static const std::vector<std::pair<uint64_t, uint64_t>> watches = [] {
+			std::vector<std::pair<uint64_t, uint64_t>> result;
+			const char*                                value = std::getenv("KYTY_WATCH_GPU_WRITE");
+			while (value != nullptr && *value != '\0') {
+				char*      end   = nullptr;
+				const auto begin = std::strtoull(value, &end, 16);
+				uint64_t   bytes = 1;
+				if (end != nullptr && *end == '+') {
+					bytes = std::strtoull(end + 1, &end, 16);
+				}
+				result.emplace_back(begin, bytes);
+				value = end != nullptr && *end == ',' ? end + 1 : nullptr;
 			}
-			char*      end   = nullptr;
-			const auto begin = std::strtoull(value, &end, 16);
-			const auto bytes = end != nullptr && *end == '+' ? std::strtoull(end + 1, nullptr, 16)
-			                                                 : 1ull;
-			return std::pair<uint64_t, uint64_t> {begin, bytes};
+			return result;
 		}();
 		static std::atomic<uint32_t> watched {0};
-		if (watch.second != 0 && vaddr < watch.first + watch.second &&
-		    watch.first < vaddr + size) {
-			static std::mutex                                        seen_mutex;
-			static std::set<std::tuple<uint64_t, uint64_t, uint64_t>> seen;
-			bool                                                     first = false;
+		for (size_t index = 0; index < watches.size(); index++) {
+			const auto& [watch_begin, watch_size] = watches[index];
+			if (watch_size == 0 || vaddr >= watch_begin + watch_size ||
+			    watch_begin >= vaddr + size) {
+				continue;
+			}
+			static std::mutex                             seen_mutex;
+			static std::set<std::pair<size_t, uint64_t>> seen;
+			bool                                          first = false;
 			{
 				std::lock_guard lock(seen_mutex);
-				first = seen.emplace(vaddr, size, s_diag_shader_hash).second;
+				first = seen.emplace(index, s_diag_shader_hash).second;
 			}
-			if (first && watched.fetch_add(1) < 48) {
-				LOGF("GPU write covers watched 0x%016" PRIx64 "+0x%" PRIx64 ": range=0x%016" PRIx64
-				     " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
-				     watch.first, watch.second, vaddr, size, s_diag_shader_hash,
-				     Common::HostBacktrace().c_str());
+			if (first && watched.fetch_add(1) < 128) {
+				LOGF("GPU write covers watched #%zu 0x%016" PRIx64 "+0x%" PRIx64
+				     ": range=0x%016" PRIx64 " size=0x%" PRIx64 " shader=0x%016" PRIx64 "\n%s",
+				     index, watch_begin, watch_size, vaddr, size, s_diag_shader_hash,
+				     s_diag_shader_hash == 0 ? Common::HostBacktrace().c_str() : "");
 			}
 		}
 	}
@@ -884,6 +893,31 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
+	std::vector<std::pair<uint64_t, uint64_t>> downloaded;
+	auto                                       it = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < vaddr + size; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto begin  = std::max(vaddr, buffer.CpuAddress());
+		const auto end    = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
+		if (begin < end && DownloadBufferMemory(buffer, begin, end - begin)) {
+			downloaded.emplace_back(begin, end - begin);
+		}
+	}
+	if (downloaded.empty()) {
+		return;
+	}
+	const auto tick = m_scheduler.CurrentTick();
+	m_scheduler.Wait(tick);
+	m_scheduler.WaitPriorityOperations(tick);
+	for (const auto& [begin, bytes]: downloaded) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(begin, bytes);
+	}
 }
 
 bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {

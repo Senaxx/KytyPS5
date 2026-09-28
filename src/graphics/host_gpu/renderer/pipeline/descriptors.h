@@ -10,6 +10,7 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -74,6 +75,16 @@ template <typename T>
                                                    bool r128 = false);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
+
+// Diagnostics (KYTY_WATCH_SHADER): logs again, a few frames later, the user-data buffers a
+// watched draw read, to tell data written after the draw from data never written.
+void LogWatchedRereads(BufferCache& cache, uint64_t presented_frames);
+
+// Diagnostics: KYTY_WATCH_SHADER=<hash> with KYTY_WATCH_SHADER_FRAME=<n>: whether a use of the
+// shader falls in the n-th presented frame after its first use (each caller counts up to 64).
+bool InWatchedShaderFrame(uint64_t hash, uint64_t presented_frame, std::atomic<uint32_t>& logged);
+// The presented frame of the watched shader's first use, or UINT64_MAX.
+uint64_t WatchedShaderFirstFrame();
 
 } // namespace Libs::Graphics
 

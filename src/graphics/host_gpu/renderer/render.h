@@ -224,6 +224,10 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	// Bindless heaps already surveyed (base ^ table offset << 48).
 	std::unordered_set<uint64_t>          m_bindless_surveyed;
+
+	void LogWatchedDraw(const DrawCallInfo& draw, const DrawRenderState& state,
+	                    uint32_t index_offset, int32_t base_vertex, uint32_t first_vertex,
+	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
 	std::vector<uint32_t>                 m_bindless_srt;

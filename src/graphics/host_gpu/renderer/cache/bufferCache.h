@@ -103,6 +103,9 @@ public:
 	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
 	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
+	// Diagnostics, GPU thread: makes guest memory current for [vaddr, vaddr + size) by
+	// downloading what the GPU wrote there (drains the GPU).
+	void                            DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size);
 
 	// Diagnostics: the guest shader whose bindings are being prepared on this thread, if any.
 	inline static thread_local uint64_t s_diag_shader_hash = 0;

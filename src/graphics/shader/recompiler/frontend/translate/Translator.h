@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
 #include <array>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -18,6 +19,10 @@ public:
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
+	// Diagnostics (KYTY_FORCE_PC): overwrites the first destination dwords of an instruction
+	// with constants after it is translated.
+	void ForceDestination(const Decoder::Instruction& inst, const std::vector<uint32_t>& values);
+	void ForceVectorRegisters(uint32_t first, const std::vector<uint32_t>& values);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

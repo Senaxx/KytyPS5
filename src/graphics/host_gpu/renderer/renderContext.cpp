@@ -3,10 +3,18 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -152,7 +160,70 @@ void RenderContext::PrepareBda() {
 	m_fault_process_pending = true;
 }
 
+// Diagnostics: KYTY_DUMP_GUEST=<frame>:<address>+<size>[,<address>+<size>...] (frame decimal,
+// the rest hex) writes guest memory, with the GPU's writes downloaded first, to
+// dump_<frame>_<address>.bin once that many frames have been presented. A frame written +<n>
+// counts from the first use of the KYTY_WATCH_SHADER shader.
+static void DumpGuestMemory(GraphicContext& graphics, BufferCache& cache) {
+	struct Request {
+		uint64_t                                   frame    = 0;
+		bool                                       relative = false;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+	};
+	static const Request request = [] {
+		Request     result;
+		const char* value = std::getenv("KYTY_DUMP_GUEST");
+		if (value == nullptr) {
+			return result;
+		}
+		char* end       = nullptr;
+		result.relative = *value == '+';
+		result.frame    = std::strtoull(result.relative ? value + 1 : value, &end, 10);
+		value        = end != nullptr && *end == ':' ? end + 1 : nullptr;
+		while (value != nullptr && *value != '\0') {
+			const auto address = std::strtoull(value, &end, 16);
+			uint64_t   size    = 4;
+			if (end != nullptr && *end == '+') {
+				size = std::strtoull(end + 1, &end, 16);
+			}
+			result.ranges.emplace_back(address, size);
+			value = end != nullptr && *end == ',' ? end + 1 : nullptr;
+		}
+		return result;
+	}();
+	static bool done = false;
+	if (done || request.ranges.empty()) {
+		return;
+	}
+	const auto first = WatchedShaderFirstFrame();
+	if (request.relative && first == UINT64_MAX) {
+		return;
+	}
+	const auto frame = request.relative ? first + request.frame : request.frame;
+	if (graphics.presented_frames.load(std::memory_order_relaxed) < frame) {
+		return;
+	}
+	done = true;
+	for (const auto& [address, size]: request.ranges) {
+		cache.DownloadRangeForDiagnostics(address, size);
+		std::vector<uint8_t> bytes(size);
+		const bool read = LibKernel::Memory::TryReadBacking(address, bytes.data(), size);
+		const auto name = "dump_" + std::to_string(frame) + "_" +
+		                  std::to_string(address) + ".bin";
+		if (read) {
+			if (auto* file = std::fopen(name.c_str(), "wb"); file != nullptr) {
+				std::fwrite(bytes.data(), 1, bytes.size(), file);
+				std::fclose(file);
+			}
+		}
+		LOGF("DumpGuest: 0x%016" PRIx64 "+0x%" PRIx64 " -> %s (%s)\n", address, size, name.c_str(),
+		     read ? "written" : "not readable");
+	}
+}
+
 void RenderContext::RunGarbageCollector() {
+	DumpGuestMemory(GetGraphics(), m_buffer_cache);
+	LogWatchedRereads(m_buffer_cache, GetGraphics().presented_frames.load(std::memory_order_relaxed));
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
