@@ -518,11 +518,11 @@ bool InlineShaderFunctions(std::span<const uint32_t> code, uint64_t base,
 							if (!emit_target(*target)) return false;
 							relocations.emplace_back(low_miss, result.size());
 						}
-						result.push_back(0xbf92007fu);
+						result.push_back(0xbf920000u | ShaderCallMissTrapCode);
 						result.push_back(0xbf810000u);
 						relocations.emplace_back(high_miss, result.size());
 					}
-					result.push_back(0xbf92007fu);
+					result.push_back(0xbf920000u | ShaderCallMissTrapCode);
 					result.push_back(0xbf810000u);
 				}
 			} else {

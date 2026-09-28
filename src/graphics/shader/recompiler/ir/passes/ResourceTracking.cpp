@@ -486,9 +486,11 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
-	// A value shader memory writes cannot change: user data, flat SRT snapshots, and SRT reads
-	// at fixed offsets, which PlanScalarReads turns into snapshots.
-	bool UsesOnlyDescriptorSnapshots(Value value) const {
+	// A value shader memory writes cannot change: user data, flat SRT slots, and the scalar reads
+	// PlanScalarReads snapshots whether or not this value joins a descriptor: loads through
+	// CPU-evaluable pointers, and for a descriptor word (`descriptor`) any CPU-evaluable read at
+	// a fixed offset. A branch condition's s_buffer_load stays a GPU read.
+	bool UsesOnlyDescriptorSnapshots(Value value, bool descriptor) const {
 		std::vector<Value>       pending {value};
 		std::vector<const Inst*> visited;
 		while (!pending.empty()) {
@@ -498,12 +500,14 @@ private:
 			if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) continue;
 			visited.push_back(inst);
 			if (inst->GetOpcode() == ValueOpcode::ReadConst) continue;
-			uint32_t   index    = 0;
-			const bool snapshot = ScalarReadMemory(*inst, index) != nullptr &&
-			                      inst->Arg(1).Resolve().IsImmediate();
-			if (!snapshot && (BufferAccessOf(inst->GetOpcode()) != BufferAccess::None ||
-			                  AddressOpcodeInfoOf(inst->GetOpcode()).access != AddressAccess::None ||
-			                  ImageOpcodeInfoOf(inst->GetOpcode()).access != ImageAccess::None))
+			uint32_t index = 0;
+			if (ScalarReadMemory(*inst, index) != nullptr && inst->Arg(1).Resolve().IsImmediate() &&
+			    (descriptor || inst->GetOpcode() == ValueOpcode::LoadAddressU32) &&
+			    ValidateRuntimeValue(m_program, Value(const_cast<Inst*>(inst))))
+				continue;
+			if (BufferAccessOf(inst->GetOpcode()) != BufferAccess::None ||
+			    AddressOpcodeInfoOf(inst->GetOpcode()).access != AddressAccess::None ||
+			    ImageOpcodeInfoOf(inst->GetOpcode()).access != ImageAccess::None)
 				return false;
 			for (size_t i = 0; i < inst->NumArgs(); ++i)
 				pending.push_back(inst->Arg(i));
@@ -566,9 +570,9 @@ private:
 		// Writes do not invalidate user data or the descriptor values already captured
 		// in SRT slots. Never introduce a host selection over a live GPU memory read.
 		if (m_shader_writes &&
-		    (!UsesOnlyDescriptorSnapshots(info.condition) ||
-		     !UsesOnlyDescriptorSnapshots(phi->Arg(0)) ||
-		     !UsesOnlyDescriptorSnapshots(phi->Arg(1)) ||
+		    (!UsesOnlyDescriptorSnapshots(info.condition, false) ||
+		     !UsesOnlyDescriptorSnapshots(phi->Arg(0), true) ||
+		     !UsesOnlyDescriptorSnapshots(phi->Arg(1), true) ||
 		     !ValidateRuntimeValue(m_program, phi->Arg(0), RuntimeValueType::Integer) ||
 		     !ValidateRuntimeValue(m_program, phi->Arg(1), RuntimeValueType::Integer)))
 			return value;
