@@ -19,6 +19,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <limits>
@@ -589,6 +590,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
+	const uint64_t ps_hash = ps_active && ps_input_info->stage
+	                             ? ps_input_info->stage.program->shader_hash
+	                             : 0;
+	bool disable_optimization = ps_hash != 0 && DisableOptimizationFor(ps_hash);
+	for (const auto& info: vertex_info) {
+		disable_optimization = disable_optimization ||
+		                       (info.stage && DisableOptimizationFor(info.stage.program->shader_hash));
+	}
+	if (disable_optimization) {
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		LOGF("PipelineTrace: graphics pipeline VS=0x%016" PRIx64 " PS=0x%016" PRIx64
+		     " built without optimization\n",
+		     vs_input_info.stage.program->shader_hash, ps_hash);
+	}
+
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines begin VS=%" PRIu64 " PS=%" PRIu64
 		     " topology=%" PRIu32 " color_mask=0x%08" PRIx32
@@ -598,8 +614,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
+	const auto create_begin = std::chrono::steady_clock::now();
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	// The driver compiles on the GPU thread, so a slow pipeline stops every queue.
+	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                               std::chrono::steady_clock::now() - create_begin)
+	                               .count();
+	    create_ms >= 500) {
+		LOGF("PipelineTrace: slow graphics pipeline VS=0x%016" PRIx64 " PS=0x%016" PRIx64
+		     " ms=%lld\n",
+		     vs_input_info.stage.program->shader_hash, ps_hash, static_cast<long long>(create_ms));
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -678,8 +704,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	const auto create_begin = std::chrono::steady_clock::now();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
+	if (const auto create_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                               std::chrono::steady_clock::now() - create_begin)
+	                               .count();
+	    create_ms >= 500) {
+		LOGF("PipelineTrace: slow compute pipeline CS=0x%016" PRIx64 " ms=%lld\n",
+		     input_info.stage.program->shader_hash, static_cast<long long>(create_ms));
+	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
