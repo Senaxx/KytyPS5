@@ -135,9 +135,11 @@ void RenderContext::PrepareBda() {
 	// world); it only has to repeat once something became CPU-dirty or a buffer appeared.
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	if (epoch != m_bda_synced_epoch) {
+		// The guest writes somewhere nearly all the time, so the epoch moves between most
+		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
 		std::shared_lock lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
 		});
 		m_bda_synced_epoch = epoch;
 	}

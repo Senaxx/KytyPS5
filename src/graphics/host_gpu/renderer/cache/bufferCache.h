@@ -81,11 +81,19 @@ public:
 	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void                            ProcessFaultBuffer();
+	// GPU thread: writes bytes the GPU has not written, on a page protected because the GPU wrote
+	// other bytes of it, without downloading the page: the host copy through the backing store,
+	// the GPU copy in the command stream. False when there is nothing to save (the page is not
+	// protected as GPU-written) or it would be wrong (the bytes are GPU-written, or no cached
+	// buffer covers them); the caller then writes normally.
+	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
 	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
 		return m_fault_manager.UnattributedFaults();
 	}
 	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
+	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void                            RunGarbageCollector();
 
 private:

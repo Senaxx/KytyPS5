@@ -15,6 +15,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <fmt/format.h>
 #include <atomic>
 #include <cinttypes>
 #include <cstdlib>
@@ -288,6 +289,21 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) || HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
+	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -300,6 +316,62 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+		// Diagnostics: whether the bytes the faulting access touches were written by the GPU
+		// (true sharing) or only share the page with bytes that were (false sharing).
+		{
+			static uint64_t exact = 0;
+			static uint64_t shared = 0;
+			const bool      dirty  = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
+			(dirty ? exact : shared)++;
+			static uint32_t logged = 0;
+			if (!dirty && logged < 32) {
+				logged++;
+				// Which bytes of the 4 KiB page the GPU did write, in 16-byte steps.
+				std::string dirty_ranges;
+				const auto  page  = vaddr & ~uint64_t {0xfff};
+				uint64_t    begin = 0;
+				bool        open  = false;
+				for (uint64_t at = page; at <= page + 0x1000; at += 16) {
+					const bool here = at < page + 0x1000 && HasGpuDirtyBytes(at, 16);
+					if (here && !open) {
+						begin = at;
+						open  = true;
+					} else if (!here && open) {
+						dirty_ranges += fmt::format(" {:x}-{:x}", begin - page, at - page);
+						open = false;
+					}
+				}
+				LOGF("ReadMemory false sharing: vaddr=0x%016" PRIx64 " write=%d page dirty:%s\n",
+				     vaddr, is_write ? 1 : 0, dirty_ranges.c_str());
+			}
+			if ((exact + shared) % 1024 == 0) {
+				LOGF("ReadMemory faults: gpu_written=%" PRIu64 " false_sharing=%" PRIu64 "\n", exact,
+				     shared);
+			}
+		}
+
+		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
+		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
+		// page. The page is current, so lift its protection. Downloading the window instead drained
+		// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
+		// labels.
+		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			static uint64_t lifted = 0;
+			if (++lifted % 1024 == 1) {
+				LOGF("ReadMemory: lifted %" PRIu64 " protections of pages without GPU-written "
+				     "bytes\n",
+				     lifted);
+			}
+			return;
+		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
 		constexpr uint64_t WindowSize   = 512 * 1024;
@@ -848,6 +920,13 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
+	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
+		    SynchronizeBuffersInRange(address, bytes);
+	    });
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
