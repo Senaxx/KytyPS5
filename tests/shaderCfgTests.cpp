@@ -1036,6 +1036,31 @@ void EnsureConfigInitialized() {
   }
 }
 
+void TestDeclaredShaderHashMarker() {
+  // A shader may start with a real s_mov_b32 vcc_hi, <constant>: the same word as the binary
+  // info marker. Engine PS 0xce92bce6ef67760d does, and its "block" lay about 8 GB past the code.
+  // The hash must then be the content hash, without reading there.
+  alignas(256) static uint32_t plain[60] = {0xBEEB03FFu, 0x3D00EAF7u};
+  ShaderMappedData data;
+  data.code_size_bytes = sizeof(plain);
+  const auto plain_addr = reinterpret_cast<uint64_t>(plain);
+  ShaderMapUserData(plain_addr, data);
+  Check(ShaderDeclaredHash(plain_addr) == XXH3_64bits(plain, sizeof(plain)),
+        "a leading s_mov_b32 vcc_hi whose offset leaves the code must give the "
+        "content hash");
+
+  // Upstream identifies shaders by content only (0ecd3229): a marker-like first word with a
+  // block offset inside the code changes nothing either.
+  alignas(256) static uint32_t unsigned_block[16] = {0xBEEB03FFu, 3u};
+  unsigned_block[12] = 0x11223344u;
+  data.code_size_bytes = sizeof(unsigned_block);
+  const auto unsigned_addr = reinterpret_cast<uint64_t>(unsigned_block);
+  ShaderMapUserData(unsigned_addr, data);
+  Check(ShaderDeclaredHash(unsigned_addr) ==
+            XXH3_64bits(unsigned_block, sizeof(unsigned_block)),
+        "a binary info block without a signature must give the content hash");
+}
+
 void TestResourceDescriptorClassification() {
   uint32_t raw_texture[8] = {};
   raw_texture[3] = 9u << 28u;
@@ -14419,6 +14444,7 @@ int main() {
 
   EnsureConfigInitialized();
   TestRayTracingInstructions();
+  TestDeclaredShaderHashMarker();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
