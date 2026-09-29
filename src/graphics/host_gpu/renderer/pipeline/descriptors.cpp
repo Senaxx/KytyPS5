@@ -202,6 +202,13 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+// A/B switch for bounded buffer writes (KYTY_BOUNDED_BUFFER_WRITES=0 marks every written buffer's
+// whole range GPU-written, as before).
+static const bool g_bounded_buffer_writes = [] {
+	const char* value = std::getenv("KYTY_BOUNDED_BUFFER_WRITES");
+	return value == nullptr || value[0] != '0';
+}();
+
 // Diagnostics: names the shader whose bindings are prepared, for KYTY_WATCH_GPU_WRITE.
 struct DiagShaderScope {
 	explicit DiagShaderScope(uint64_t hash) { BufferCache::s_diag_shader_hash = hash; }
@@ -211,7 +218,8 @@ struct DiagShaderScope {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource&    resource,
+                    const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -223,8 +231,20 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	// The stores' addresses bound the bytes this draw or dispatch writes: only those become
+	// GPU-written, so the guest's accesses elsewhere in the range do not drain the GPU.
+	const bool bounded_write = resource.written && extent != nullptr && extent->valid &&
+	                           g_bounded_buffer_writes;
+	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
+	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	auto [buffer, offset] =
+	    bounded_write
+	        ? context.GetBufferCache().ObtainBufferWritten(address, size, address + written_begin,
+	                                                       written_end - std::min(written_begin,
+	                                                                              written_end),
+	                                                       id)
+	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -233,8 +253,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	if (resource.written && written_end > written_begin) {
+		context.GetTextureCache().InvalidateMemoryFromGPU(address + written_begin,
+		                                                  written_end - written_begin);
 	}
 	return result;
 }
@@ -1378,9 +1399,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[resource],
-		                                               buffer_offset));
+		prepared.buffers.push_back(NativeStorageBuffer(
+		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
+		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
+		                                                    : nullptr,
+		    buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
 		// buffer still has no accessible elements. In particular, never let a null store

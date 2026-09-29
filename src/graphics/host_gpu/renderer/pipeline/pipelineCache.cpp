@@ -485,7 +485,7 @@ struct PipelineCache::ProgramCache {
 		// verdict can be safely reused across every read within one synchronous evaluation but
 		// must never survive past it.
 		GpuCleanReadCache                            clean_read_cache;
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryRaw,
@@ -493,6 +493,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				runtime.workgroup_count[axis] = input_info.dispatch_groups[axis];
+				runtime.workgroup_size[axis]  = input_info.threads_num[axis];
+			}
+		}
 		if (entry != programs.end()) {
 			{
 				KYTY_PROFILER_BLOCK("ProgramCache::MaterializeResources");
