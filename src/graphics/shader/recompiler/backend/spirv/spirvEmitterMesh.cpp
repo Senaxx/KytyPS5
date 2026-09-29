@@ -49,8 +49,30 @@ uint32_t MeshLoad(EmitterState& state, uint32_t variable, spv::StorageClass stor
 	return value;
 }
 
+bool IsDistance(IR::StageOutputKind kind) {
+	return kind == IR::StageOutputKind::ClipDistance || kind == IR::StageOutputKind::CullDistance;
+}
+
+// The per-lane value a guest export stores: a whole vector, or one clip or cull distance.
 uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
-	return kind == IR::StageOutputKind::Layer ? TypeU32(state) : TypeF32Vector(state, 4);
+	if (kind == IR::StageOutputKind::Layer) {
+		return TypeU32(state);
+	}
+	return IsDistance(kind) ? TypeF32(state) : TypeF32Vector(state, 4);
+}
+
+// Where the copy-out stores an output of the vertex at index: distances are elements of the
+// vertex's float[N] ClipDistance or CullDistance array.
+uint32_t MeshVertexOutputPointer(EmitterState& state, const OutputBinding& output, uint32_t index) {
+	if (!IsDistance(output.kind)) {
+		return MeshElement(state, output.variable_id, spv::StorageClassOutput,
+		                   MeshOutputType(state, output.kind), index);
+	}
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassOutput, TypeF32(state)), pointer,
+	                          output.variable_id, index, ConstantU32(state, output.index));
+	return pointer;
 }
 
 // The guest's allocation clamped to the declared output size: larger counts are undefined.
@@ -118,13 +140,50 @@ uint32_t UnusableVertex(EmitterState& state, uint32_t vertex, uint32_t vertices)
 
 void DefineMeshOutputs(EmitterState& state) {
 	const auto& mesh = state.input_info.vertex->mesh;
+	// Clip and cull distances (the position exports' CCDIST vectors): one per-vertex float[N]
+	// built-in each, like gl_MeshVerticesEXT[].gl_ClipDistance; every distance has its own
+	// per-lane value until the copy-out.
+	uint32_t clip_distances = 0;
+	uint32_t cull_distances = 0;
+	for (const auto& output: state.outputs) {
+		if (output.kind == IR::StageOutputKind::ClipDistance) {
+			clip_distances = std::max(clip_distances, output.index + 1);
+		} else if (output.kind == IR::StageOutputKind::CullDistance) {
+			cull_distances = std::max(cull_distances, output.index + 1);
+		}
+	}
+	const auto DefineDistances = [&](uint32_t& variable, uint32_t count, const char* name,
+	                                 spv::BuiltIn builtin) {
+		if (count == 0) {
+			return;
+		}
+		variable = MeshArray(
+		    state, spv::StorageClassOutput,
+		    state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count)),
+		    mesh.max_vertices);
+		state.interface_variables.push_back(variable);
+		state.builder.AddName(variable, name);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
+	};
+	DefineDistances(state.clip_distance_variable, clip_distances, "gl_ClipDistance",
+	                spv::BuiltInClipDistance);
+	DefineDistances(state.cull_distance_variable, cull_distances, "gl_CullDistance",
+	                spv::BuiltInCullDistance);
 	for (auto& output: state.outputs) {
 		if (output.kind != IR::StageOutputKind::Position &&
 		    output.kind != IR::StageOutputKind::Parameter &&
-		    output.kind != IR::StageOutputKind::Layer) {
+		    output.kind != IR::StageOutputKind::Layer && !IsDistance(output.kind)) {
 			EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(output.kind));
 		}
-		const auto type    = MeshOutputType(state, output.kind);
+		const auto type = MeshOutputType(state, output.kind);
+		if (IsDistance(output.kind)) {
+			output.variable_id = output.kind == IR::StageOutputKind::ClipDistance
+			                         ? state.clip_distance_variable
+			                         : state.cull_distance_variable;
+			output.mesh_data_variable =
+			    MeshArray(state, spv::StorageClassPrivate, type, state.lane_count);
+			continue;
+		}
 		output.variable_id = MeshArray(
 		    state, spv::StorageClassOutput, type,
 		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
@@ -264,9 +323,8 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));
-				const auto pointer =
-				    MeshElement(state, output.variable_id, spv::StorageClassOutput, type, index);
-				state.builder.AddFunction(spv::OpStore, pointer, value);
+				state.builder.AddFunction(spv::OpStore, MeshVertexOutputPointer(state, output, index),
+				                          value);
 				if (output.kind == IR::StageOutputKind::Position &&
 				    state.mesh_zero_position_mask != 0) {
 					MarkZeroPosition(state, value, index);

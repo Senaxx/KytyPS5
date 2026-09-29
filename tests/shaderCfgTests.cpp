@@ -10162,6 +10162,50 @@ void TestMeshExportStorage() {
   }
 }
 
+// Three engine geometry shaders export a user clip distance through the position exports'
+// CCDIST0 vector; as mesh shaders they need a per-vertex ClipDistance array.
+void TestMeshClipDistanceExport() {
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t code[] = {
+      EncodeSMovB32(12, 255), 0x1003u,              // 3 vertices, 1 primitive
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeVop1(0x01, 0, 128),                    // v0 = 0
+      EncodeVop1(0x01, 1, 242),                    // v1 = 1.0
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(1, 1, 1, 1),
+      EncodeExp0(0x0d, 0x1, false), EncodeExp1(0, 0, 0, 0), // POS1.x: clip distance 0
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),        // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.pa_cl_vs_out_cntl = (1u << 22u) | 1u; // VS_OUT_CCDIST0_VEC_ENA, CLIP_DIST_ENA_0
+  auto &mesh = input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 3840;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  std::array<uint32_t, 14> user_data{};
+  ShaderRecompiler::CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.input_info.vertex = &input;
+  options.user_data = user_data;
+  for (const auto subgroup_size : {32u, 64u}) {
+    mesh.host_subgroup_size = subgroup_size;
+    const auto result = RecompileForTest(code, options, nullptr, nullptr,
+                                         PushData::MeshDrawDwordCount);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpCapability ClipDistance") != std::string::npos &&
+              source.find("BuiltIn ClipDistance") != std::string::npos,
+          "mesh clip distance export lost its ClipDistance built-in");
+    // Stored into element 0 of the vertex's float[1] array, from the lane's own value.
+    Check(source.find("%_arr__arr_float_uint_1_uint_192") != std::string::npos,
+          "mesh ClipDistance is not a per-vertex float[1] array");
+  }
+}
+
 void TestMergedShaderUserDataSnapshot() {
   using namespace ShaderRecompiler;
   const uint32_t front[] = {
@@ -14554,6 +14598,7 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
+  TestMeshClipDistanceExport();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
   TestEmbeddedFetchPreservesSharedScalarLoad();
