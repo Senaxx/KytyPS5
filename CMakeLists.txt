@@ -425,6 +425,11 @@ endfunction()
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 # Offline batch translation of shaders extracted from game files; a tool, not a test.
 add_kyty_full_emulator_test(shader_batch_tool "${KYTY_TESTS_DIR}/ShaderBatchTool.cpp")
+if(KYTY_CLANG_CL)
+	# Symbols for the stack it prints when a shader crashes it.
+	target_link_options(shader_batch_tool PRIVATE "/DEBUG:FULL"
+		"/PDB:${CMAKE_CURRENT_BINARY_DIR}/shader_batch_tool.pdb")
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

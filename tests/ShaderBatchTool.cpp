@@ -10,10 +10,13 @@
 // header's own input semantics. The host subgroup size is 32, as on
 // NVIDIA. Shader function calls are not expanded: their callees live in game memory.
 //
-// usage: shader_batch_tool <shader folder> <log file> [first manifest row]
+// usage: shader_batch_tool <shader folder> <log file> [first manifest row] [end row]
 // Prints "START <row> <hash>" before and one tab-separated RESULT line after each shader. A
-// fatal error exits with code 321 after START, so a driver can resume at the next row.
+// fatal error exits with code 321 after START, so a driver can resume at the next row. The
+// RESULT line lists every instruction the decoder does not support, not only the first one the
+// CFG stops at. KYTY_BATCH_DUMP_DIR makes rejected shaders dump their IR (see main).
 
+#include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
@@ -22,6 +25,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
@@ -44,8 +48,36 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 namespace Libs::Graphics {
 namespace {
+
+#ifdef _WIN32
+// A crash (not a fatal error, which exits with 321) would lose the buffered log. Print the
+// fault and the host stack on one CRASH line before the process dies, so the driver can say
+// where the shader crashed. C++ exceptions, which the recompiler uses internally, pass through.
+LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
+	const auto code = info->ExceptionRecord->ExceptionCode;
+	if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_STACK_OVERFLOW &&
+	    code != EXCEPTION_ILLEGAL_INSTRUCTION && code != EXCEPTION_INT_DIVIDE_BY_ZERO &&
+	    code != EXCEPTION_PRIV_INSTRUCTION && code != EXCEPTION_ARRAY_BOUNDS_EXCEEDED) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	auto stack = Common::HostBacktrace();
+	std::replace(stack.begin(), stack.end(), '\n', '|');
+	std::printf("CRASH\t0x%08lx\t0x%016llx\t%s\n", static_cast<unsigned long>(code),
+	            static_cast<unsigned long long>(
+	                reinterpret_cast<uintptr_t>(info->ExceptionRecord->ExceptionAddress)),
+	            stack.c_str());
+	std::fflush(stdout);
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
 
 // Shader checksum registers (COMPUTE_SHADER_CHKSUM, SPI_SHADER_PGM_CHKSUM_PS/GS): no state.
 constexpr uint32_t ComputeChecksum = 0x22a;
@@ -403,6 +435,34 @@ void AppendNote(std::string& note, const std::string& text) {
 	}
 }
 
+// Every distinct instruction the decoder marks unsupported, e.g. "unsupported family=SOP1
+// opcode=0x21", joined with "; ".
+std::string UnsupportedInstructions(std::span<const uint32_t> code) {
+	ShaderRecompiler::Decoder::Program decoded;
+	ShaderRecompiler::Decoder::DecodeProgram(code, decoded);
+	std::vector<std::string> found;
+	for (const auto& inst: decoded.instructions) {
+		if (inst.opcode != ShaderRecompiler::Decoder::Opcode::UNSUPPORTED) {
+			continue;
+		}
+		auto text = ShaderRecompiler::Decoder::InstructionToString(inst);
+		if (const auto colon = text.find(": "); colon != std::string::npos) {
+			text.erase(0, colon + 2);
+		}
+		while (!text.empty() && text.back() == ' ') {
+			text.pop_back();
+		}
+		if (std::find(found.begin(), found.end(), text) == found.end()) {
+			found.push_back(std::move(text));
+		}
+	}
+	std::string joined;
+	for (const auto& text: found) {
+		AppendNote(joined, text);
+	}
+	return joined;
+}
+
 void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	const auto name   = fmt::format("{:016x}", row.hash);
 	auto*      header = CopyAligned(ReadFile(folder / (name + ".header")), 16);
@@ -410,8 +470,8 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 
 	Shader* shader = nullptr;
 	if (Gen5::AgcCreateShader(&shader, header, code) != 0 || shader == nullptr) {
-		std::printf("RESULT\t%s\t%s\t-\tfailed\t0\t0\t0\t0\tAgcCreateShader failed\n", name.c_str(),
-		            row.type.c_str());
+		std::printf("RESULT\t%s\t%s\t-\tfailed\t0\t0\t0\t0\tAgcCreateShader failed\t\n",
+		            name.c_str(), row.type.c_str());
 		return;
 	}
 
@@ -464,7 +524,7 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			if (!merged) {
 				std::string table_note;
 				if (!PrepareVertexTables(*shader, state.vertex, vertex_tables, table_note)) {
-					std::printf("RESULT\t%s\t%s\tVS\tfailed\t0\t0\t0\t0\t%s\n", name.c_str(),
+					std::printf("RESULT\t%s\t%s\tVS\tfailed\t0\t0\t0\t0\t%s\t\n", name.c_str(),
 					            row.type.c_str(), table_note.c_str());
 					return;
 				}
@@ -483,8 +543,9 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			break;
 		}
 		default:
-			std::printf("RESULT\t%s\t%s\t-\tnot standalone\t0\t0\t0\t0\tfetch shader or fused half\n",
-			            name.c_str(), row.type.c_str());
+			std::printf(
+			    "RESULT\t%s\t%s\t-\tnot standalone\t0\t0\t0\t0\tfetch shader or fused half\t\n",
+			    name.c_str(), row.type.c_str());
 			return;
 	}
 	const auto prepare_ms = MillisecondsSince(prepare_begin);
@@ -510,6 +571,7 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	options.non_fatal       = true;
 	options.bindless_images = true;
 
+	const auto unsupported     = UnsupportedInstructions(params.code);
 	const auto translate_begin = std::chrono::steady_clock::now();
 	auto       translated      = ShaderRecompiler::TranslateProgram(params.code, options);
 	const auto translate_ms    = MillisecondsSince(translate_begin);
@@ -523,10 +585,11 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 		plan_ms = MillisecondsSince(plan_begin);
 	}
 	const bool ok = !translated.skip_dispatch && !translated.unsupported;
-	std::printf("RESULT\t%s\t%s\t%s\t%s\t%.2f\t%.2f\t%d\t%zu\t%s\n", name.c_str(), row.type.c_str(),
-	            stage_name, outcome, prepare_ms, translate_ms + plan_ms,
+	std::printf("RESULT\t%s\t%s\t%s\t%s\t%.2f\t%.2f\t%d\t%zu\t%s\t%s\n", name.c_str(),
+	            row.type.c_str(), stage_name, outcome, prepare_ms, translate_ms + plan_ms,
 	            ok && translated.program.dispatcher_fallback ? 1 : 0,
-	            ok ? translated.program.blocks.size() : size_t {0}, note.c_str());
+	            ok ? translated.program.blocks.size() : size_t {0}, note.c_str(),
+	            unsupported.c_str());
 }
 
 } // namespace
@@ -540,6 +603,7 @@ int main(int argc, char* argv[]) {
 	}
 	const std::filesystem::path folder = argv[1];
 	const size_t                first  = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 0;
+	const size_t                end    = argc > 4 ? std::strtoull(argv[4], nullptr, 10) : SIZE_MAX;
 
 	static Common::Subsystems subsystems;
 	Common::InitializeThreads();
@@ -547,12 +611,21 @@ int main(int argc, char* argv[]) {
 	Config::ConfigOptions config;
 	config.printf_direction   = Config::LogDirection::File;
 	config.printf_output_file = argv[2];
+	// KYTY_BATCH_DUMP_DIR=<folder>: the IR of every shader that gives up in resource tracking goes
+	// to <folder>/rejected/<stage>_<hash>.ir, as with --graphics-debug-dump in the emulator.
+	if (const char* dump = std::getenv("KYTY_BATCH_DUMP_DIR"); dump != nullptr) {
+		config.graphics_debug_dump_enabled = true;
+		config.shader_log_folder           = dump;
+	}
 	Config::Load(config);
 	subsystems.Initialize<Log::Lifecycle>();
 	ShaderInit();
+#ifdef _WIN32
+	AddVectoredExceptionHandler(1, ReportCrash);
+#endif
 
 	const auto rows = ReadManifest(folder);
-	for (size_t i = first; i < rows.size(); i++) {
+	for (size_t i = first; i < std::min(end, rows.size()); i++) {
 		std::printf("START\t%zu\t%016" PRIx64 "\n", i, rows[i].hash);
 		std::fflush(stdout);
 		RunShader(folder, rows[i]);
