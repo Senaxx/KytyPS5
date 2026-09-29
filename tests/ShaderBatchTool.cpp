@@ -631,7 +631,8 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	options.shader_hash     = params.hash;
 	options.user_data       = std::span<const uint32_t>(params.user_data).first(params.user_data_count);
 	options.back_code       = params.back_code;
-	options.dump_ir         = false;
+	// KYTY_BATCH_DUMP_IR: keep each shader's final IR, for the .ir of an invalid-SPIR-V dump.
+	options.dump_ir         = std::getenv("KYTY_BATCH_DUMP_IR") != nullptr;
 	options.early_dump      = false;
 	options.dump_label      = "ShaderBatch";
 	options.input_info      = stage_input;
