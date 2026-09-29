@@ -17,10 +17,21 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 
+// A private copy for the frame dump (libPngEnc.cpp has its own, without file output).
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_WRITE_STATIC
+#include "stb_image_write.h"
+
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -254,6 +265,184 @@ void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColor
 	command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, &color, 1, &range);
 }
 
+// KYTY_FRAME_DUMP=<folder> writes the presented frame to <folder>/frame_<seconds>.bmp every
+// KYTY_FRAME_DUMP_EVERY seconds (default 15), counted from the presenter's creation. The frame is
+// read back from the GPU, so this works for runs nobody watches: with the monitor off, the window
+// covered or the session locked, where window captures come back black.
+class FrameDump final {
+public:
+	static std::unique_ptr<FrameDump> FromEnvironment(GraphicContext& graphics) {
+		const char* folder = std::getenv("KYTY_FRAME_DUMP");
+		if (folder == nullptr || *folder == '\0') {
+			return nullptr;
+		}
+		const char* every    = std::getenv("KYTY_FRAME_DUMP_EVERY");
+		const int   parsed   = every != nullptr ? std::atoi(every) : 0;
+		const int   interval = parsed > 0 ? parsed : 15;
+		std::error_code error;
+		std::filesystem::create_directories(folder, error);
+		LOGF("Frame dump: every %d s into %s\n", interval, folder);
+		return std::make_unique<FrameDump>(graphics, folder, interval);
+	}
+
+	FrameDump(GraphicContext& graphics, std::string folder, int interval)
+	    : m_graphics(graphics), m_folder(std::move(folder)), m_interval(interval),
+	      m_start(std::chrono::steady_clock::now()) {}
+	~FrameDump() {
+		// Every dump waits for its submission, so nothing here is still in use by the GPU.
+		if (m_image.image != nullptr) {
+			m_graphics.DeleteImage(m_image);
+		}
+		if (m_buffer != VK_NULL_HANDLE) {
+			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_buffer_allocation);
+		}
+	}
+	KYTY_CLASS_NO_COPY(FrameDump);
+
+	// True when this presentation should be dumped; then Record and, after the submission
+	// finished, Write follow.
+	bool Due() {
+		const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+		                         std::chrono::steady_clock::now() - m_start)
+		                         .count();
+		if (elapsed < static_cast<int64_t>(m_next) * m_interval) {
+			return false;
+		}
+		m_seconds = static_cast<uint32_t>(elapsed);
+		m_next    = static_cast<uint32_t>(elapsed / m_interval) + 1u;
+		return true;
+	}
+
+	// The source is in TRANSFER_SRC_OPTIMAL (RecordPresentCommands leaves it there). A blit
+	// converts any presentable format to RGBA8.
+	void Record(vk::CommandBuffer command, Presenter::Frame& source) {
+		const vk::Extent2D extent {source.image.extent.width, source.image.extent.height};
+		Configure(extent);
+		vk::ImageMemoryBarrier to_transfer {};
+		to_transfer.sType               = vk::StructureType::eImageMemoryBarrier;
+		to_transfer.srcAccessMask       = vk::AccessFlagBits::eTransferRead;
+		to_transfer.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_transfer.oldLayout           = vk::ImageLayout::eUndefined;
+		to_transfer.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_transfer.image               = m_image.image;
+		to_transfer.subresourceRange    = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+		                        nullptr, 0, nullptr, 1, &to_transfer);
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int>(extent.width),
+                                             static_cast<int>(extent.height), 1};
+		region.dstSubresource = region.srcSubresource;
+		region.dstOffsets[1]  = region.srcOffsets[1];
+		command.blitImage(source.image.image, vk::ImageLayout::eTransferSrcOptimal, m_image.image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eNearest);
+		auto to_source          = to_transfer;
+		to_source.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		to_source.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		to_source.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		to_source.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
+		                        nullptr, 0, nullptr, 1, &to_source);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = region.srcSubresource;
+		copy.imageExtent      = vk::Extent3D {extent.width, extent.height, 1};
+		command.copyImageToBuffer(m_image.image, vk::ImageLayout::eTransferSrcOptimal,
+		                          vk::Buffer(m_buffer), 1, &copy);
+		vk::BufferMemoryBarrier to_host {};
+		to_host.sType               = vk::StructureType::eBufferMemoryBarrier;
+		to_host.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		to_host.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_host.buffer              = vk::Buffer(m_buffer);
+		to_host.size                = VK_WHOLE_SIZE;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, vk::DependencyFlags {}, 0, nullptr,
+		                        1, &to_host, 0, nullptr);
+	}
+
+	void Write(uint64_t presented) {
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaInvalidateAllocation(
+		                         m_graphics.allocator, m_buffer_allocation, 0, VK_WHOLE_SIZE)),
+		                     "invalidate frame dump buffer");
+		char name[32];
+		std::snprintf(name, sizeof(name), "frame_%04u.bmp", m_seconds);
+		const auto path = (std::filesystem::path(m_folder) / name).string();
+		// RGB only: the frame's alpha is whatever the game left there.
+		const auto*          rgba = static_cast<const uint8_t*>(m_mapped);
+		std::vector<uint8_t> rgb(static_cast<size_t>(m_extent.width) * m_extent.height * 3u);
+		for (size_t pixel = 0; pixel < rgb.size() / 3u; pixel++) {
+			rgb[pixel * 3u + 0u] = rgba[pixel * 4u + 0u];
+			rgb[pixel * 3u + 1u] = rgba[pixel * 4u + 1u];
+			rgb[pixel * 3u + 2u] = rgba[pixel * 4u + 2u];
+		}
+		const bool ok = stbi_write_bmp(path.c_str(), static_cast<int>(m_extent.width),
+		                               static_cast<int>(m_extent.height), 3, rgb.data()) != 0;
+		LOGF("Frame dump: %s %s (%ux%u, presented frame %" PRIu64 ")\n",
+		     ok ? "wrote" : "failed to write", path.c_str(), m_extent.width, m_extent.height,
+		     presented);
+	}
+
+private:
+	void Configure(vk::Extent2D extent) {
+		if (m_image.image != nullptr && m_extent == extent) {
+			return;
+		}
+		if (m_image.image != nullptr) {
+			m_graphics.DeleteImage(m_image);
+			vmaDestroyBuffer(m_graphics.allocator, m_buffer, m_buffer_allocation);
+			m_buffer = VK_NULL_HANDLE;
+		}
+		m_extent = extent;
+		vk::ImageCreateInfo create {};
+		create.sType         = vk::StructureType::eImageCreateInfo;
+		create.imageType     = vk::ImageType::e2D;
+		create.extent        = vk::Extent3D {extent.width, extent.height, 1};
+		create.mipLevels     = 1;
+		create.arrayLayers   = 1;
+		create.format        = vk::Format::eR8G8B8A8Unorm;
+		create.tiling        = vk::ImageTiling::eOptimal;
+		create.initialLayout = vk::ImageLayout::eUndefined;
+		create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+		create.sharingMode = vk::SharingMode::eExclusive;
+		create.samples     = vk::SampleCountFlagBits::e1;
+		if (!m_graphics.CreateImage(create, m_image)) {
+			EXIT("failed to allocate the frame dump image, extent=%ux%u\n", extent.width,
+			     extent.height);
+		}
+		vk::BufferCreateInfo buffer {};
+		buffer.size  = static_cast<vk::DeviceSize>(extent.width) * extent.height * 4u;
+		buffer.usage = vk::BufferUsageFlagBits::eTransferDst;
+		VmaAllocationCreateInfo allocate {};
+		allocate.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocate.flags =
+		    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+		VmaAllocationInfo info {};
+		const auto        raw = static_cast<VkBufferCreateInfo>(buffer);
+		RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(m_graphics.allocator, &raw,
+		                                                             &allocate, &m_buffer,
+		                                                             &m_buffer_allocation, &info)),
+		                     "allocate frame dump buffer");
+		m_mapped = info.pMappedData;
+	}
+
+	GraphicContext&                       m_graphics;
+	std::string                           m_folder;
+	int                                   m_interval = 15;
+	std::chrono::steady_clock::time_point m_start;
+	uint32_t                              m_next    = 1;
+	uint32_t                              m_seconds = 0;
+	vk::Extent2D                          m_extent {};
+	VulkanImage                           m_image;
+	VkBuffer                              m_buffer            = VK_NULL_HANDLE;
+	VmaAllocation                         m_buffer_allocation = nullptr;
+	void*                                 m_mapped            = nullptr;
+};
+
 class Swapchain final {
 public:
 	enum class Status : uint8_t { Success, Recreate, SurfaceLost };
@@ -307,6 +496,7 @@ struct Presenter::Impl {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+		frame_dump = FrameDump::FromEnvironment(owner.graphic_ctx);
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -346,6 +536,8 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	// Declared last: destroyed first, while the device is still alive.
+	std::unique_ptr<FrameDump> frame_dump;
 };
 
 void Swapchain::Create() {
@@ -983,6 +1175,8 @@ void Presenter::Impl::Present() {
 			RecoverSwapchain(status);
 			continue;
 		}
+		bool     dumped    = false;
+		uint64_t dump_tick = 0;
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
@@ -990,12 +1184,21 @@ void Presenter::Impl::Present() {
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
+			if (frame_dump != nullptr && layers[0].frame != nullptr && frame_dump->Due()) {
+				frame_dump->Record(command.Handle(), *layers[0].frame);
+				dumped = true;
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;
 				}
 			}
+			dump_tick = tick;
+		}
+		if (dumped) {
+			present_scheduler.Wait(dump_tick);
+			frame_dump->Write(window.graphic_ctx.presented_frames.load(std::memory_order_relaxed));
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
