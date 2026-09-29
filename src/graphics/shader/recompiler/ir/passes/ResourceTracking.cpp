@@ -955,6 +955,32 @@ private:
 		return true;
 	}
 
+	// True when value reaches nothing but sampler handles, through phis and selects: once the
+	// handles take a fixed sampler, the value is stranded. A phi web that ends nowhere counts too.
+	static bool FeedsOnlySamplers(const Inst& value) {
+		std::vector<const Inst*> pending {&value};
+		std::vector<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto* current = pending.back();
+			pending.pop_back();
+			if (std::ranges::find(visited, current) != visited.end()) {
+				continue;
+			}
+			visited.push_back(current);
+			for (const auto& use: current->Uses()) {
+				const auto op = use.user->GetOpcode();
+				if (op == ValueOpcode::GetSamplerResource) {
+					continue;
+				}
+				if (op != ValueOpcode::Phi && op != ValueOpcode::SelectU32) {
+					return false;
+				}
+				pending.push_back(use.user);
+			}
+		}
+		return true;
+	}
+
 	static bool UsesOnly(const Inst& value, std::span<const Inst* const> users) {
 		return !value.Uses().empty() && std::ranges::all_of(value.Uses(), [&](const Use& use) {
 			return std::ranges::find(users, use.user) != users.end() ||
@@ -2197,13 +2223,12 @@ private:
 				std::vector<const Inst*> reads;
 				std::vector<const Inst*> pending;
 				std::vector<const Inst*> visited;
-				bool                     exclusive = true;
 				for (uint32_t dword = 0; dword < 4u; dword++) {
 					if (const auto* arg = sampler->Arg(dword).Resolve().TryInstruction()) {
 						pending.push_back(arg);
 					}
 				}
-				while (!pending.empty() && exclusive) {
+				while (!pending.empty()) {
 					const auto* current = pending.back();
 					pending.pop_back();
 					if (std::ranges::find(visited, current) != visited.end()) {
@@ -2212,12 +2237,6 @@ private:
 					visited.push_back(current);
 					uint32_t index = 0;
 					if (ScalarReadMemory(*current, index) != nullptr) {
-						exclusive = std::ranges::all_of(current->Uses(), [&](const Use& use) {
-							return use.user->GetOpcode() == ValueOpcode::GetSamplerResource ||
-							       use.user->GetOpcode() == ValueOpcode::Phi ||
-							       use.user->GetOpcode() == ValueOpcode::SelectU32 ||
-							       FeedsOnlyDeadPhis(*use.user);
-						});
 						reads.push_back(current);
 						continue;
 					}
@@ -2230,13 +2249,18 @@ private:
 						}
 					}
 				}
-				if (!exclusive) {
-					continue;
-				}
+				// A read whose value the shader also uses as data (a register reused after a
+				// branch) stays an ordinary load; only the reads the fixed sampler strands are
+				// planning-only. Marking a data read too left its phis without a value.
+				size_t stranded = 0;
 				for (const auto* read: reads) {
+					if (!FeedsOnlySamplers(*read)) {
+						continue;
+					}
 					uint32_t index = 0;
 					(void)ScalarReadMemory(*read, index);
 					m_program.memory_info[index].planning_only = true;
+					stranded++;
 				}
 				for (uint32_t dword = 0; dword < 4u; dword++) {
 					sampler->SetArg(dword, Value(DefaultSampler[dword]));
@@ -2246,7 +2270,7 @@ private:
 				              [&](const ResolvedHandle& entry) { return entry.handle == sampler; });
 				LOGF("shader resource tracking: hash=0x%016" PRIx64 " pc=0x%08x bindless sampler: "
 				     "using a default sampler (%zu heap reads planning-only)\n",
-				     m_program.shader_hash, flags.pc, reads.size());
+				     m_program.shader_hash, flags.pc, stranded);
 			}
 		}
 	}

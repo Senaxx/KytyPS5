@@ -1557,9 +1557,26 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
+// A planning-only read emits no load. If a phi web with no other consumer still references it,
+// the read gets an undefined value, so that the phis have one to name. (Other references, such
+// as planning references, emit nothing and need none.)
+static void DefinePlanningOnlyRead(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (std::ranges::none_of(inst.Uses(), [](const IR::Use& use) {
+		    return use.user->GetOpcode() == IR::ValueOpcode::Phi;
+	    })) {
+		return;
+	}
+	const auto undefined = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpUndef, TypeId(ctx.state, inst.GetType()), undefined);
+	ctx.Define(inst, undefined);
+}
+
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
-	if (mem.planning_only) return;
+	if (mem.planning_only) {
+		DefinePlanningOnlyRead(ctx, inst);
+		return;
+	}
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 		ctx.Define(inst, LoadIndirectScalarBuffer(ctx, inst));
 		return;
@@ -1589,7 +1606,10 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
-	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
+	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) {
+		DefinePlanningOnlyRead(ctx, inst);
+		return;
+	}
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);

@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -2615,6 +2616,58 @@ void TestFiniteImageBitScanSentinel() {
               image.Instruction()->Arg(0).Instruction()->NumPhiBlocks() == 2,
           "nonzero bit scan retained its impossible sentinel or removed a Phi edge");
   }
+// A sampler read from a heap at a GPU-selected key gets a fixed sampler, and the heap reads it
+// strands become planning-only (no load). Six effect shaders also use one of those reads as data
+// (the register is reused after a branch); planning-only, it left that data without a value.
+void TestDefaultSamplerKeepsDataReads() {
+  Libs::Graphics::ShaderRecompiler::Frontend::TranslationNonFatalScope non_fatal(true);
+  Fixture fixture;
+  std::array<Value, 4> heap_words;
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  for (uint32_t dword = 0; dword < 8; dword++) {
+    image_words[dword] = fixture.UserData(dword + 8u);
+  }
+  const auto heap = fixture.Buffer(heap_words, 0x100);
+  const auto invocation = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> reads;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarBuffer;
+    word.offset = dword * sizeof(uint32_t);
+    reads[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+                                fixture.AddMemory(word, 0x100));
+  }
+  const auto sampler = fixture.Sampler(reads, 0x110);
+  const auto image = fixture.Image(image_words, 0x110);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x110));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  const auto data = fixture.Emit(ValueOpcode::SelectU32, {invocation, reads[1], Value(0u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {data});
+  fixture.PlanAndTrack();
+
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    const auto &memory =
+        fixture.program.memory_info[reads[dword].TryInstruction()->Flags<MemoryFlags>().index];
+    Check(memory.planning_only == (dword != 1u),
+          dword == 1u ? "a heap read also used as data became planning-only"
+                      : "a heap read only the sampler used stayed a load");
+  }
+  const auto *handle = sampler.TryInstruction();
+  Check(handle->Arg(0).IsImmediate() && handle->Arg(3).IsImmediate(),
+        "the sampler did not take the fixed sampler");
 }
 
 void TestLoopCycleEnteredThroughRuntimeValue() {
@@ -3423,6 +3476,7 @@ int main() {
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
+    Run("default sampler keeps data reads", TestDefaultSamplerKeepsDataReads);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
