@@ -463,6 +463,28 @@ std::string ValidateSpirv(const std::vector<uint32_t>& spirv) {
 	return "invalid: " + first.substr(0, 300);
 }
 
+// With KYTY_BATCH_DUMP_DIR set, a shader whose SPIR-V fails validation leaves
+// <folder>/invalid/<hash>.spv, its disassembly (.spvasm) and its IR (.ir) behind.
+void DumpInvalidSpirv(const std::string& name, const std::vector<uint32_t>& spirv,
+                      const std::string& ir_dump) {
+	const char* folder = std::getenv("KYTY_BATCH_DUMP_DIR");
+	if (folder == nullptr) {
+		return;
+	}
+	const auto base = std::filesystem::path(folder) / "invalid";
+	std::filesystem::create_directories(base);
+	std::ofstream(base / (name + ".spv"), std::ios::binary)
+	    .write(reinterpret_cast<const char*>(spirv.data()),
+	           static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+	std::string source;
+	spvtools::SpirvTools(SPV_ENV_VULKAN_1_3)
+	    .Disassemble(spirv, &source, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);
+	std::ofstream(base / (name + ".spvasm")) << source;
+	if (!ir_dump.empty()) {
+		std::ofstream(base / (name + ".ir")) << ir_dump;
+	}
+}
+
 void Phase(const char* name) {
 	std::printf("PHASE\t%s\n", name);
 	std::fflush(stdout);
@@ -663,6 +685,9 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			spirv       = ValidateSpirv(compiled.spirv);
 			spirv_words = compiled.spirv.size();
 			emit_ms     = MillisecondsSince(emit_begin);
+			if (spirv != "valid") {
+				DumpInvalidSpirv(name, compiled.spirv, compiled.ir_dump);
+			}
 		}
 	}
 	std::printf("RESULT\t%s\t%s\t%s\t%s\t%.2f\t%.2f\t%d\t%zu\t%s\t%s\t%s\t%zu\t%.2f\n",
