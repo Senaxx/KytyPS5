@@ -464,14 +464,16 @@ std::string ValidateSpirv(const std::vector<uint32_t>& spirv) {
 }
 
 // With KYTY_BATCH_DUMP_DIR set, a shader whose SPIR-V fails validation leaves
-// <folder>/invalid/<hash>.spv, its disassembly (.spvasm) and its IR (.ir) behind.
-void DumpInvalidSpirv(const std::string& name, const std::vector<uint32_t>& spirv,
-                      const std::string& ir_dump) {
+// <folder>/invalid/<hash>.spv, its disassembly (.spvasm) and its IR (.ir) behind. With
+// KYTY_BATCH_DUMP_ALL set as well, every compiled shader leaves them in <folder>/all, with its
+// decoded code (.asm).
+void DumpSpirv(const char* subfolder, const std::string& name, const std::vector<uint32_t>& spirv,
+               const std::string& ir_dump, const std::string& decoded_dump = {}) {
 	const char* folder = std::getenv("KYTY_BATCH_DUMP_DIR");
 	if (folder == nullptr) {
 		return;
 	}
-	const auto base = std::filesystem::path(folder) / "invalid";
+	const auto base = std::filesystem::path(folder) / subfolder;
 	std::filesystem::create_directories(base);
 	std::ofstream(base / (name + ".spv"), std::ios::binary)
 	    .write(reinterpret_cast<const char*>(spirv.data()),
@@ -482,6 +484,9 @@ void DumpInvalidSpirv(const std::string& name, const std::vector<uint32_t>& spir
 	std::ofstream(base / (name + ".spvasm")) << source;
 	if (!ir_dump.empty()) {
 		std::ofstream(base / (name + ".ir")) << ir_dump;
+	}
+	if (!decoded_dump.empty()) {
+		std::ofstream(base / (name + ".asm")) << decoded_dump;
 	}
 }
 
@@ -602,8 +607,25 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			params = PrepareProgram(state.vertex, state.context, state.user_config, vertex_info);
 			stage  = vertex_info.logical_stage;
 			if (stage == ShaderType::Mesh) {
-				vertex_info.mesh.host_subgroup_size = 32;
-				wave_size                           = vertex_info.mesh.wave_size;
+				auto& mesh              = vertex_info.mesh;
+				mesh.host_subgroup_size = 32;
+				wave_size               = mesh.wave_size;
+				// The host limits of the RTX 5090 (VK_EXT_mesh_shader), as GetGraphicsPrograms
+				// applies them: a larger subgroup runs in passes, and a draw that still does not fit
+				// is skipped.
+				mesh.passes = mesh.PassesFor(128u);
+				if (mesh.passes > 1u) {
+					AppendNote(note, fmt::format("mesh passes={} (wave{} threads={})", mesh.passes,
+					                             mesh.wave_size, mesh.HostThreads()));
+				}
+				if (mesh.passes == 0u || mesh.max_vertices > 256u || mesh.max_primitives > 256u ||
+				    mesh.lds_size_dwords * 4u > 28672u) {
+					AppendNote(note, fmt::format("mesh exceeds host limits: wave{} threads={} "
+					                             "vertices={} primitives={} LDS={}",
+					                             mesh.wave_size, mesh.HostThreads(),
+					                             mesh.max_vertices, mesh.max_primitives,
+					                             mesh.lds_size_dwords));
+				}
 			} else {
 				user_data_base = 8;
 				wave_size      = vertex_info.wave_size;
@@ -632,7 +654,8 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	options.user_data       = std::span<const uint32_t>(params.user_data).first(params.user_data_count);
 	options.back_code       = params.back_code;
 	// KYTY_BATCH_DUMP_IR: keep each shader's final IR, for the .ir of an invalid-SPIR-V dump.
-	options.dump_ir         = std::getenv("KYTY_BATCH_DUMP_IR") != nullptr;
+	options.dump_ir         = std::getenv("KYTY_BATCH_DUMP_IR") != nullptr ||
+	                  std::getenv("KYTY_BATCH_DUMP_ALL") != nullptr;
 	options.early_dump      = false;
 	options.dump_label      = "ShaderBatch";
 	options.input_info      = stage_input;
@@ -687,7 +710,10 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 			spirv_words = compiled.spirv.size();
 			emit_ms     = MillisecondsSince(emit_begin);
 			if (spirv != "valid") {
-				DumpInvalidSpirv(name, compiled.spirv, compiled.ir_dump);
+				DumpSpirv("invalid", name, compiled.spirv, compiled.ir_dump);
+			}
+			if (std::getenv("KYTY_BATCH_DUMP_ALL") != nullptr) {
+				DumpSpirv("all", name, compiled.spirv, compiled.ir_dump, compiled.decoded_dump);
 			}
 		}
 	}
