@@ -653,9 +653,15 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
 	}
+	// Shader debug info, resource tracking and shader error reporting cost driver compile and
+	// CPU time. Aftermath needs them; KYTY_NV_DIAGNOSTICS=1 enables them without it.
+	const char* nv_diagnostics_value = std::getenv("KYTY_NV_DIAGNOSTICS");
+	const bool  nv_diagnostics       = std::getenv("KYTY_AFTERMATH_DLL") != nullptr ||
+	                            (nv_diagnostics_value != nullptr && nv_diagnostics_value[0] == '1');
 	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
 	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
-	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+	if (nv_diagnostics &&
+	    HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
 		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
 		vk::PhysicalDeviceFeatures2                   diagnostics_query {};
 		diagnostics_query.pNext = &supported_diagnostics;
@@ -671,6 +677,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			create_info.pNext                      = &diagnostics_config;
 		}
 	}
+	LOGF("Vulkan NV diagnostics config: %s\n",
+	     diagnostics_features.diagnosticsConfig == VK_TRUE ? "enabled" : "disabled");
 	// S_MEMREALTIME lowers to OpReadClockKHR at device scope; without it the guest's
 	// timed spin-waits never terminate.
 	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
