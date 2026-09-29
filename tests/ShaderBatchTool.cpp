@@ -30,6 +30,7 @@
 #include "graphics/shader/shaderCompiler.h"
 #include "graphics/shader/shaderVertexMetadata.h"
 #include "libs/agc.h"
+#include "spirv-tools/libspirv.hpp"
 
 #include <algorithm>
 #include <array>
@@ -424,6 +425,49 @@ bool PrepareVertexTables(const Shader& shader, HW::VertexShaderInfo& vertex, Ver
 	return true;
 }
 
+// Stand-in guest memory and user data: one 16-byte pattern laid over every address and over the
+// user SGPRs. Read as a buffer descriptor (V#, 16-byte aligned) it is a raw 2 GB buffer; as an
+// image descriptor (T#, 32-byte aligned) a null image, as dword 0 is zero; as a pointer, an
+// address below 2^48 that reads the same pattern. Materialization then succeeds with unbound
+// images, as when a game draws with nothing bound to a slot.
+constexpr std::array<uint32_t, 4> MemoryPattern = {0u, 0u, 0x7ffffff0u, DstSel(4, 5, 6, 7)};
+
+bool ReadPatternMemory(void* /*userdata*/, uint64_t address, std::span<uint32_t> values) {
+	for (size_t i = 0; i < values.size(); i++) {
+		values[i] = MemoryPattern[((address >> 2u) + i) & 3u];
+	}
+	return true;
+}
+
+void FillUserData(HW::UserSgprInfo& user_data) {
+	for (uint32_t i = 0; i < HW::UserSgprInfo::SGPRS_MAX; i++) {
+		user_data.value[i] = MemoryPattern[i & 3u];
+	}
+}
+
+// "valid", or the first validator message (SPIRV-Tools, Vulkan 1.3, as the emulator validates).
+std::string ValidateSpirv(const std::vector<uint32_t>& spirv) {
+	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
+	std::string          first;
+	tools.SetMessageConsumer(
+	    [&first](spv_message_level_t, const char*, const spv_position_t&, const char* message) {
+		    if (first.empty()) {
+			    first = message;
+		    }
+	    });
+	if (tools.Validate(spirv)) {
+		return "valid";
+	}
+	std::replace(first.begin(), first.end(), '\t', ' ');
+	std::replace(first.begin(), first.end(), '\n', ' ');
+	return "invalid: " + first.substr(0, 300);
+}
+
+void Phase(const char* name) {
+	std::printf("PHASE\t%s\n", name);
+	std::fflush(stdout);
+}
+
 double MillisecondsSince(std::chrono::steady_clock::time_point begin) {
 	return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin)
 	    .count();
@@ -477,6 +521,9 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 
 	GuestState state;
 	ApplyHeaderRegisters(state, *shader);
+	FillUserData(state.compute.cs_user_sgpr);
+	FillUserData(state.pixel.ps_user_sgpr);
+	FillUserData(state.vertex.gs_user_sgpr);
 	std::string note;
 	AppendNote(note, state.unhandled.empty() ? "" : "unhandled registers " + state.unhandled);
 
@@ -578,18 +625,50 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	const char* outcome        = translated.skip_dispatch ? "ray tracing"
 	                             : translated.unsupported ? "gave up"
 	                                                      : "ok";
-	double plan_ms = 0;
-	if (!translated.skip_dispatch && !translated.unsupported) {
+	const bool   ok         = !translated.skip_dispatch && !translated.unsupported;
+	const bool   dispatcher = ok && translated.program.dispatcher_fallback;
+	const size_t blocks     = ok ? translated.program.blocks.size() : 0;
+	double       plan_ms    = 0;
+	double       emit_ms    = 0;
+	std::string  spirv      = "-";
+	size_t       spirv_words = 0;
+	if (ok) {
+		// The rest of the in-game path, with every descriptor unbound: materialize the resource
+		// plan, emit SPIR-V and validate it.
 		const auto plan_begin = std::chrono::steady_clock::now();
-		(void)ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-		plan_ms = MillisecondsSince(plan_begin);
+		const auto plan       = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+		plan_ms               = MillisecondsSince(plan_begin);
+		Phase("materialize");
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		          .user_data                  = options.user_data,
+		          .shader_base                = reinterpret_cast<uint64_t>(params.code.data()),
+		          .read_memory                = ReadPatternMemory,
+		          .userdata                   = nullptr,
+		          .read_specialization_memory = ReadPatternMemory,
+        };
+		if (!ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources, specialization)) {
+			spirv = fmt::format("materialization failed (line {})",
+			                    ShaderRecompiler::IR::LastIndirectImageFailureLine());
+		} else {
+			Phase("emit");
+			const auto emit_begin = std::chrono::steady_clock::now();
+			const auto push_data  = stage == ShaderType::Mesh
+			                            ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount
+			                            : 0u;
+			auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+			                                                 specialization, push_data);
+			Phase("validate");
+			spirv       = ValidateSpirv(compiled.spirv);
+			spirv_words = compiled.spirv.size();
+			emit_ms     = MillisecondsSince(emit_begin);
+		}
 	}
-	const bool ok = !translated.skip_dispatch && !translated.unsupported;
-	std::printf("RESULT\t%s\t%s\t%s\t%s\t%.2f\t%.2f\t%d\t%zu\t%s\t%s\n", name.c_str(),
-	            row.type.c_str(), stage_name, outcome, prepare_ms, translate_ms + plan_ms,
-	            ok && translated.program.dispatcher_fallback ? 1 : 0,
-	            ok ? translated.program.blocks.size() : size_t {0}, note.c_str(),
-	            unsupported.c_str());
+	std::printf("RESULT\t%s\t%s\t%s\t%s\t%.2f\t%.2f\t%d\t%zu\t%s\t%s\t%s\t%zu\t%.2f\n",
+	            name.c_str(), row.type.c_str(), stage_name, outcome, prepare_ms,
+	            translate_ms + plan_ms, dispatcher ? 1 : 0, blocks, note.c_str(),
+	            unsupported.c_str(), spirv.c_str(), spirv_words, emit_ms);
 }
 
 } // namespace
