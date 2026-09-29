@@ -210,6 +210,15 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			return;
 
 		case O::V_CMP_EQ_F64: EmitFloat64Equal(inst); return;
+		case O::V_CMP_LE_F64:
+			EmitFloat64Compare(inst, IR::ValueOpcode::FPOrdLessThanEqual64, false);
+			return;
+		case O::V_CMPX_LE_F64:
+			EmitFloat64Compare(inst, IR::ValueOpcode::FPOrdLessThanEqual64, true);
+			return;
+		case O::V_CMPX_GE_F64:
+			EmitFloat64Compare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual64, true);
+			return;
 		case O::V_CMP_F_F32: EmitCompareConstant(inst, false, false, false); return;
 		case O::V_CMP_TRU_F32: EmitCompareConstant(inst, true, false, false); return;
 		case O::V_CMP_EQ_F32:

@@ -9978,6 +9978,38 @@ void TestDsAddU64() {
         "DS_ADD_U64 did not become two 32-bit LDS atomic adds");
 }
 
+// V_ADD_F64 and the f64 compares of two engine shaders (V_CMP_LE_F64, V_CMPX_LE_F64,
+// V_CMPX_GE_F64), with the source modifiers they use.
+void TestFloat64AddAndCompares() {
+  const uint32_t shader[] = {
+      EncodeVop3Word0(0x164, 0),
+      EncodeVop3Word1(256 + 2, 256 + 4, 0) | (1u << 30u), // v_add_f64 v[0:1], v[2:3], -v[4:5]
+      EncodeVopc(0x23, 256 + 0, 2),                       // v_cmp_le_f64 vcc, v[0:1], v[2:3]
+      EncodeVop1(0x01, 8, 242),                           // v_mov_b32 v8, 1.0
+      EncodeVop2(0x01, 6, 128, 8),                        // v_cndmask_b32 v6, 0, v8, vcc
+      EncodeVop3Word0(0x36, 0, 0, 1),
+      EncodeVop3Word1(256 + 0, 256 + 2, 0),               // v_cmpx_ge_f64 |v[0:1]|, v[2:3]
+      EncodeVopc(0x33, 256 + 2, 0),                       // v_cmpx_le_f64 v[2:3], v[0:1]
+      EncodeExp0(0x00, 0xf), EncodeExp1(6, 0, 1, 6),      // exp mrt0
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  for (const char *name : {"V_ADD_F64", "V_CMP_LE_F64", "V_CMPX_GE_F64", "V_CMPX_LE_F64"}) {
+    Check(result.decoded_dump.find(name) != std::string::npos,
+          "an f64 add or compare was not decoded");
+  }
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpFAdd %double") != std::string::npos &&
+            source.find("OpFNegate") == std::string::npos,
+        "V_ADD_F64 did not become a 64-bit OpFAdd with a sign-bit negate");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 188u) == 2u &&
+            SpirvInstructionOpcodeCount(result.spirv, 190u) == 1u,
+        "f64 compares did not become ordered 64-bit comparisons");
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -14629,6 +14661,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDsAddU64();
+  TestFloat64AddAndCompares();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();

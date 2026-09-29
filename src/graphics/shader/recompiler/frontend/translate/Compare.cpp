@@ -71,6 +71,13 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false, cmpx);
 }
 
+void Translator::EmitFloat64Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                    bool cmpx) {
+	const auto lhs = ReadOperand(inst.src0, IR::Type::F64);
+	const auto rhs = ReadOperand(inst.src1, IR::Type::F64);
+	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs})), false, cmpx);
+}
+
 void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx) {
 	const auto lhs       = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
 	const auto rhs       = IR::F32(ReadOperand(inst.src1, IR::Type::F32));

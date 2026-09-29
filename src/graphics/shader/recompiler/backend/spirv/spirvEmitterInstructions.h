@@ -157,6 +157,8 @@ EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdLessThanEqual64, OpFOrdLessThanEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdGreaterThanEqual64, OpFOrdGreaterThanEqual, U1, uint32_t, uint32_t)
 inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
