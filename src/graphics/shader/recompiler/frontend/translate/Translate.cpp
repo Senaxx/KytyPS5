@@ -934,7 +934,8 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
-			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
+			case Decoder::Opcode::DS_WRITE_B128:
+			case Decoder::Opcode::DS_ADD_U64: include_vector(inst.src1, inst.data_dwords); break;
 			case Decoder::Opcode::DS_WRITE2_B32:
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:

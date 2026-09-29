@@ -586,6 +586,28 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 	}
 }
 
+// DS_ADD_U64 (no return) as two 32-bit atomics: the low dword's add, then the high dword's add
+// with the low one's carry. The sum is exact; only a read between the two could see one half
+// updated.
+void Translator::DS_ADD_U64(const Decoder::Instruction& inst) {
+	auto memory            = MemoryInfoFromDecoded(inst);
+	memory.data_dwords     = 1u;
+	memory.component_count = 1u;
+	const auto address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto data        = MemorySourceAt(inst, 0);
+	const auto low         = IR::U32(ReadU32(OffsetOperand(data, 0)));
+	const auto high        = IR::U32(ReadU32(OffsetOperand(data, 1)));
+	const auto old_low     = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
+	                                         {address, low, ir.GetExec()},
+	                                         AddMemoryInfo(memory, inst.pc)));
+	const auto carry = ir.Select(ir.ULessThan(ir.IAdd(old_low, low), old_low),
+	                             IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
+	auto high_memory = memory;
+	high_memory.offset += 4u;
+	ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32, {address, ir.IAdd(high, carry), ir.GetExec()},
+	        AddMemoryInfo(high_memory, inst.pc));
+}
+
 void Translator::FLAT_APERTURE(const Decoder::Instruction& inst, bool store) {
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	const auto      bits   = memory.data_bits;
@@ -1115,6 +1137,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
+		case Decoder::Opcode::DS_ADD_U64: return DS_ADD_U64(inst);
 
 		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCompareSwap32);

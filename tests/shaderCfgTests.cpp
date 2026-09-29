@@ -9900,6 +9900,8 @@ void TestCapturedBufferAtomicsX2() {
   const Case cases[] = {
       {{0xe1680018u, 0x80000000u}, 0u, 241u, "BUFFER_ATOMIC_OR_X2",
        "BufferAtomicOr64", "OpAtomicOr", ValueOpcode::BufferAtomicOr64},
+      {{0xe1640018u, 0x80000000u}, 0u, 240u, "BUFFER_ATOMIC_AND_X2",
+       "BufferAtomicAnd64", "OpAtomicAnd", ValueOpcode::BufferAtomicAnd64},
       {{0xe1402000u, 0x80000913u}, 9u, 229u, "BUFFER_ATOMIC_SWAP_X2",
        "BufferAtomicSwap64", "OpAtomicExchange", ValueOpcode::BufferAtomicSwap64},
   };
@@ -9957,6 +9959,23 @@ void TestCapturedBufferAtomicsX2() {
           "GLC=1 64-bit MUBUF atomic did not return both dwords");
     CheckSpirvBinaryValidates(glc_result.spirv);
   }
+}
+
+// DS_ADD_U64 (one engine compute shader) runs as two 32-bit LDS adds: the low dword's, then the
+// high dword's with the low one's carry.
+void TestDsAddU64() {
+  const uint32_t shader[] = {
+      EncodeDs0(0x40, 8), EncodeDs1(0, 2, 1), // ds_add_u64 v1, v[2:3] offset:8
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  const auto result = RecompileForTest(shader, options);
+  Check(result.decoded_dump.find("DS_ADD_U64") != std::string::npos,
+        "new decoder did not decode DS_ADD_U64");
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(SpirvInstructionOpcodeCount(result.spirv, 234u) == 2u,
+        "DS_ADD_U64 did not become two 32-bit LDS atomic adds");
 }
 
 void TestNewShaderRecompilerBranchConditionForms() {
@@ -14609,6 +14628,7 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
+  TestDsAddU64();
   TestDisabledDebugBranches();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
