@@ -129,6 +129,10 @@ private:
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
 	                        bool scalar, bool cmpx);
+	// A 64-bit compare the IR has no opcode for, as another one with swapped operands and/or a
+	// negated result (a >= b is !(a < b); a <= b is !(b < a) or !(a > b)).
+	void EmitInteger64CompareVia(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+	                             bool swap, bool negate, bool cmpx);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,

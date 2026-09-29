@@ -44,6 +44,14 @@ void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueO
 	                  cmpx);
 }
 
+void Translator::EmitInteger64CompareVia(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+                                         bool swap, bool negate, bool cmpx) {
+	const auto lhs    = ReadOperand(inst.src0, IR::Type::U64);
+	const auto rhs    = ReadOperand(inst.src1, IR::Type::U64);
+	const auto result = swap ? IR::U1(ir.Emit(opcode, {rhs, lhs})) : IR::U1(ir.Emit(opcode, {lhs, rhs}));
+	EmitCompareResult(inst, negate ? ir.LogicalNot(result) : result, false, cmpx);
+}
+
 void Translator::EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                       bool signed_value, bool cmpx) {
 	const auto lhs = ReadU16AsU32(inst.src0, signed_value);
