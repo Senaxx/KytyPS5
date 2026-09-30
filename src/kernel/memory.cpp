@@ -891,6 +891,20 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		return nullptr;
+	}
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return nullptr;
+		}
+	}
+	return g_guest_address_space->FindBacking(vaddr, size);
+}
+
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
 	return g_gpu_resources != nullptr &&
 	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&

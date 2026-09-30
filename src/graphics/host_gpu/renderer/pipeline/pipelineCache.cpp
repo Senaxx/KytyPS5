@@ -106,38 +106,46 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-// Caches TryReadGpuCleanBacking's per-page dirty verdict for the lifetime of a single
-// MaterializeResources call (see ReadShaderGuestMemory below, which the caller wires up as this
-// scratch space's owner via SrtRuntime::userdata). A shader's SRT resource-specialization reads
-// commonly pull several adjacent 4-byte descriptor words out of the same buffer, all landing in
-// the same TRACKER_PAGE_SIZE page -- every one of them currently pays the same mutex-guarded
-// buffer/texture-cache dirty query for an answer that cannot have changed since the previous read
-// a few nanoseconds earlier in the same synchronous, single-threaded evaluation (this only runs on
-// the GPU thread, and nothing this evaluation does submits GPU work that could mark a page dirty
-// mid-pass). Small fixed capacity: a shader's resource plan touches only a handful of distinct
-// pages in practice; anything past capacity just falls back to the uncached path.
-struct GpuCleanReadCache {
-	static constexpr size_t Capacity = 8;
-	std::array<uint64_t, Capacity> pages {};
-	std::array<bool, Capacity>     dirty {};
-	size_t                         count = 0;
+// The backing bytes of the guest pages one resource evaluation (MaterializeResources, a function
+// expansion) reads, found once per page: every SRT dword read otherwise took the backing store's
+// lock, two map lookups and the GPU-dirty range queries (a third of the GPU thread in the
+// jungle). Only pages with no GPU-written byte are cached; within one synchronous evaluation on
+// the GPU thread nothing marks them GPU-written. A page that is not clean stays on the exact path.
+struct GuestPageReadCache {
+	static constexpr size_t Capacity = 16;
+	struct Entry {
+		uint64_t       page    = 0;
+		const uint8_t* backing = nullptr;
+	};
+	std::array<Entry, Capacity> entries {};
+	size_t                      count = 0;
+	size_t                      next  = 0;
 
-	[[nodiscard]] bool Find(uint64_t page, bool& out_dirty) const {
+	// True when the page is GPU-clean and the bytes were copied from its backing.
+	bool Read(uint64_t address, std::span<uint32_t> values) {
+		const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		if (Common::AlignDown(address + values.size_bytes() - 1, TRACKER_PAGE_SIZE) != page) {
+			return false;
+		}
+		const Entry* entry = nullptr;
 		for (size_t i = 0; i < count; i++) {
-			if (pages[i] == page) {
-				out_dirty = dirty[i];
-				return true;
+			if (entries[i].page == page) {
+				entry = &entries[i];
+				break;
 			}
 		}
-		return false;
-	}
-
-	void Insert(uint64_t page, bool is_dirty) {
-		if (count < Capacity) {
-			pages[count] = page;
-			dirty[count] = is_dirty;
-			count++;
+		if (entry == nullptr) {
+			auto& slot = count < Capacity ? entries[count++] : entries[next++ % Capacity];
+			slot       = {.page    = page,
+			              .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(page,
+			                                                                     TRACKER_PAGE_SIZE)};
+			entry      = &slot;
 		}
+		if (entry->backing == nullptr) {
+			return false;
+		}
+		std::memcpy(values.data(), entry->backing + (address - page), values.size_bytes());
+		return true;
 	}
 };
 
@@ -179,9 +187,13 @@ void CountGpuOwnedSrtRead(uint64_t address, uint32_t bytes) {
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
-bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
+	}
+	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
+	    cache != nullptr && cache->Read(address, values)) {
+		return true;
 	}
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
@@ -204,27 +216,12 @@ bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t>
 	if (values.empty()) {
 		return false;
 	}
-	auto*      cache     = static_cast<GpuCleanReadCache*>(userdata);
-	const auto page      = Common::AlignDown(address, TRACKER_PAGE_SIZE);
-	const auto last_page = Common::AlignDown(address + values.size_bytes() - 1, TRACKER_PAGE_SIZE);
-	// A read spanning two pages skips the cache rather than reason about two pages' verdicts
-	// at once.
-	bool dirty = false;
-	if (cache == nullptr || page != last_page) {
-		if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes())) {
-			return true;
-		}
-	} else if (cache->Find(page, dirty)) {
-		if (!dirty) {
-			return Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
-		}
-	} else {
-		const bool ok =
-		    Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
-		cache->Insert(page, !ok);
-		if (ok) {
-			return true;
-		}
+	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
+	    cache != nullptr && cache->Read(address, values)) {
+		return true;
+	}
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes())) {
+		return true;
 	}
 	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
 	// tracked-page fault, which drains the GPU and refreshes the page, so the value read is
@@ -481,10 +478,8 @@ struct PipelineCache::ProgramCache {
 		}
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		auto                                         entry = programs.find(lookup_key);
-		// Scoped to this call only -- see GpuCleanReadCache's comment for why a page's dirty
-		// verdict can be safely reused across every read within one synchronous evaluation but
-		// must never survive past it.
-		GpuCleanReadCache                            clean_read_cache;
+		// Scoped to this call only: see GuestPageReadCache.
+		GuestPageReadCache                           clean_read_cache;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
