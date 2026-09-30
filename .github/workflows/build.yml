@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, wolverine ]
   pull_request:
 
 concurrency:
@@ -435,7 +435,8 @@ jobs:
     if: >-
       always() &&
       github.event_name == 'push' &&
-      github.repository == 'KytyPS5/KytyPS5' &&
+      (github.repository == 'KytyPS5/KytyPS5' ||
+       (github.repository == 'Senaxx/KytyPS5' && github.ref == 'refs/heads/wolverine')) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')
