@@ -5,6 +5,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <atomic>
 #include <bit>
 #include <cmath>
@@ -329,7 +330,131 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      Value active_mask)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+      m_context(AcquireContext(program)) {
+	BindNative();
+}
+
+namespace {
+
+// KYTY_SRT_NATIVE=0 keeps every walker on the interpreter.
+bool NativeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_NATIVE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+// KYTY_SRT_NATIVE_VERIFY=1 evaluates every native result again with the interpreter and stops the
+// emulator on a difference.
+bool NativeVerify() {
+	static const bool verify = std::getenv("KYTY_SRT_NATIVE_VERIFY") != nullptr;
+	return verify;
+}
+
+// A plan is compiled once this many walkers were created for it (two per resource refresh), so
+// plans used once or twice are not compiled.
+constexpr uint32_t NativeAfterWalkers = 8;
+
+// Set while VerifyNative's reference walkers run.
+thread_local bool g_native_suppressed = false;
+
+SrtNativeStats g_native_stats;
+bool           g_native_report = false;
+
+} // namespace
+
+bool TakeSrtNativeReport(SrtNativeStats& stats) {
+	if (!g_native_report) {
+		return false;
+	}
+	g_native_report = false;
+	stats           = g_native_stats;
+	return true;
+}
+
+void SrtWalker::BindNative() {
+	if (!NativeEnabled() || g_native_suppressed || !m_active_mask.IsEmpty() ||
+	    !SrtNativeCode::Supported()) {
+		return;
+	}
+	const auto& program = m_program;
+	if (program.native_code == nullptr) {
+		if (program.native_attempted || ++program.native_uses < NativeAfterWalkers) {
+			return;
+		}
+		program.native_attempted = true;
+		program.native_code      = SrtNativeCode::Compile(program);
+		auto& stats              = g_native_stats;
+		if (program.native_code == nullptr) {
+			stats.failed++;
+		} else {
+			stats.plans++;
+			stats.bytes += program.native_code->CodeSize();
+			stats.instructions += program.native_code->Instructions();
+			stats.interpreted += program.native_code->Interpreted();
+		}
+		const auto total = stats.plans + stats.failed;
+		if ((total & (total - 1u)) == 0u) {
+			g_native_report = true;
+		}
+		if (program.native_code == nullptr) {
+			return;
+		}
+	}
+	auto mode = SrtNativeMode::Self;
+	if (m_clean_evaluator != nullptr) {
+		// Split code evaluates the plan's clean slots and every select predicate in the clean
+		// walker, which must itself run Self code for this plan.
+		if (m_clean_evaluator->m_native != program.native_code.get() ||
+		    m_clean_evaluator->m_native_mode != SrtNativeMode::Self ||
+		    &m_clean_evaluator->m_program != &program ||
+		    m_clean_flat_slots.size() != program.clean_flat_slots.size() ||
+		    !std::equal(m_clean_flat_slots.begin(), m_clean_flat_slots.end(),
+		                program.clean_flat_slots.begin())) {
+			return;
+		}
+		mode = SrtNativeMode::Split;
+	}
+	if (m_context.values.size() < program.evaluation_value_count) {
+		m_context.values.resize(program.evaluation_value_count);
+	}
+	m_native_frame.memo           = m_context.values.data();
+	m_native_frame.generation     = m_context.generation;
+	m_native_frame.user_data      = m_runtime.user_data.data();
+	m_native_frame.user_data_size = m_runtime.user_data.size();
+	m_native_frame.shader_base    = m_runtime.shader_base;
+	m_native_frame.walker         = this;
+	m_native_frame.clean =
+	    mode == SrtNativeMode::Split ? &m_clean_evaluator->m_native_frame : nullptr;
+	m_native_frame.failed = &m_failed_value;
+	m_native              = program.native_code.get();
+	m_native_mode         = mode;
+}
+
+bool SrtWalker::VerifyNative(Value value, bool native_ok, uint64_t native_result) {
+	const bool suppressed = g_native_suppressed;
+	g_native_suppressed   = true;
+	uint64_t reference    = 0;
+	bool     reference_ok = false;
+	if (m_native_mode == SrtNativeMode::Self) {
+		SrtWalker walker(m_program, m_runtime);
+		reference_ok = walker.EvaluateWide(value, reference);
+	} else {
+		SrtWalker clean(m_program, m_clean_evaluator->m_runtime);
+		SrtWalker walker(m_program, m_runtime, m_clean_flat_slots, &clean);
+		reference_ok = walker.EvaluateWide(value, reference);
+	}
+	g_native_suppressed = suppressed;
+	if (reference_ok != native_ok || (native_ok && reference != native_result)) {
+		EXIT("SRT native mismatch: shader %016" PRIx64 " opcode %u mode %u: native %s 0x%" PRIx64
+		     ", interpreter %s 0x%" PRIx64 "\n",
+		     m_program.shader_hash, static_cast<uint32_t>(value.Resolve().TryInstruction()->GetOpcode()),
+		     static_cast<uint32_t>(m_native_mode), native_ok ? "ok" : "failed", native_result,
+		     reference_ok ? "ok" : "failed", reference);
+	}
+	return native_ok;
+}
 
 SrtWalker::~SrtWalker() {
 	--m_program.evaluation_depth;
@@ -385,6 +510,11 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
 	if (index >= m_context.values.size()) {
 		m_context.values.resize(m_program.evaluation_value_count);
+		m_native_frame.memo = m_context.values.data();
+	}
+	if (m_native != nullptr && m_native->Has(m_native_mode, index)) {
+		const bool ok = m_native->Evaluate(m_native_frame, m_native_mode, index, result);
+		return NativeVerify() ? VerifyNative(value, ok, result) : ok;
 	}
 	if (m_context.values[index].generation == m_context.generation) {
 		result = m_context.values[index].value;
@@ -398,7 +528,8 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	uint64_t   out                     = 0;
 	const bool evaluated               = EvaluateInst(*inst, out);
 	// Recursive evaluation may grow the dense memo vector.
-	auto& memo = m_context.values[index];
+	m_native_frame.memo = m_context.values.data();
+	auto& memo          = m_context.values[index];
 	if (!evaluated) {
 		if (m_failed_value == nullptr) m_failed_value = inst;
 		memo.generation = 0;

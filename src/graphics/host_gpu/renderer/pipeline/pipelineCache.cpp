@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
+#include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -606,6 +607,13 @@ struct PipelineCache::ProgramCache {
 				    entry->second.resource_plan, runtime, entry->second.resources,
 				    entry->second.specialization);
 				t_srt_shader_hash = 0;
+				if (ShaderRecompiler::IR::SrtNativeStats stats;
+				    ShaderRecompiler::IR::TakeSrtNativeReport(stats)) {
+					LOGF("SRT native: %u plans compiled, %u failed, %" PRIu64 " KB of code, %" PRIu64
+					     " instructions, %" PRIu64 " through the interpreter\n",
+					     stats.plans, stats.failed, stats.bytes / 1024u, stats.instructions,
+					     stats.interpreted);
+				}
 				if (!materialized) {
 					// A descriptor source that cannot be read right now (memory the guest has
 					// not mapped or filled yet) skips this draw rather than the session; the
