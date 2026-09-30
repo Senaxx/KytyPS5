@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 
 #include <queue>
@@ -63,6 +64,12 @@ public:
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so
+	// vkQueueSubmit (and the queue lock that present also takes) leaves the recording thread.
+	// Submit() then returns once the tick is allocated; host waits on a timeline value may precede
+	// its signal operation. Enable before the first Submit().
+	void EnableAsyncSubmit();
+	[[nodiscard]] bool AsyncSubmit() const noexcept { return m_async_submit; }
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
@@ -102,7 +109,25 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	// A finished command buffer and everything its vkQueueSubmit needs, including the recording
+	// state that a fatal submit report prints.
+	struct SubmitJob {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo        submit;
+		uint64_t          tick         = 0;
+		uint32_t          debug_op     = 0;
+		uint64_t          debug_submit = 0;
+		uint32_t          debug_arg0   = 0;
+		uint32_t          debug_arg1   = 0;
+		uint32_t          debug_arg2   = 0;
+		uint32_t          debug_arg3   = 0;
+		uint64_t          debug_arg4   = 0;
+	};
+
 	void BeginNext();
+	void QueueSubmit(SubmitJob& job);
+	void SubmitThread(std::stop_token stop);
+	void StopSubmitThread();
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
@@ -122,6 +147,11 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	bool                         m_async_submit         = false;
+	std::deque<SubmitJob>        m_submit_jobs;
+	std::mutex                   m_submit_mutex;
+	std::condition_variable_any  m_submit_available;
+	std::jthread                 m_submit_thread;
 };
 
 } // namespace Libs::Graphics

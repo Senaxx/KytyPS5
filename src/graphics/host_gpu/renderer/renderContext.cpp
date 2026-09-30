@@ -10,6 +10,8 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +31,14 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
 	};
+	// vkQueueSubmit, and the queue lock that present also holds, runs on a queue thread instead
+	// of the GPU thread. Frames reach the presenter only after their flip tick completed, and the
+	// presenter's own scheduler stays synchronous. KYTY_ASYNC_SUBMIT=0 submits on the GPU thread.
+	const char* async_submit = std::getenv("KYTY_ASYNC_SUBMIT");
+	if (async_submit == nullptr || std::strcmp(async_submit, "0") != 0) {
+		m_command_scheduler.EnableAsyncSubmit();
+	}
+	LOGF("Async queue submit: %s\n", m_command_scheduler.AsyncSubmit() ? "on" : "off");
 }
 
 RenderContext::~RenderContext() {
