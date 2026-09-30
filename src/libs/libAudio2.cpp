@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -531,7 +532,92 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	return OK;
 }
 
+// The queue as the hardware reports it: grains pushed and not yet played. With a real device, that
+// is what SDL still holds for the context. A push returns at once while the queue has room and
+// blocks only while it is full; the level falls as the device plays.
+//
+// The game's mixer thread renders a grain into one buffer whenever the level shows room, and
+// another thread pushes it. When the push instead slept to pace SDL with the level held at 0-1,
+// the mixer rendered three grains per push into the same buffer: two of three were lost (the
+// menu music at several times the tempo, normal pitch, crackling; issue #1).
+// KYTY_AUDIOOUT2_DEVICE_QUEUE=0 restores that timer model.
+const bool g_audioout2_device_queue = [] {
+	const char* value = std::getenv("KYTY_AUDIOOUT2_DEVICE_QUEUE");
+	return value == nullptr || value[0] != '0';
+}();
+
+// SDL may hold this much beyond the queue depth before it counts: the depth alone (4 grains, 21 ms
+// with 256-sample grains) does not cover Windows scheduling, and the device ran dry (issue #5).
+constexpr uint64_t AUDIOOUT2_DEVICE_CUSHION_US = 20000;
+
+// Microseconds the context's device still has to play (its first port with PCM and a device), or
+// -1 when it has none: then the timer model applies.
+static int64_t audioout2_device_queued_us(AudioOut2ContextHandle ctx) {
+	int handle = 0;
+	{
+		Common::LockGuard lock(g_audioout2_port_mutex);
+		for (const auto& state: g_audioout2_ports) {
+			if (state.used && state.context == ctx && state.audio_handle > 0 &&
+			    !state.pcm_data.empty()) {
+				handle = state.audio_handle;
+				break;
+			}
+		}
+	}
+	return handle > 0 ? AudioInternal::AudioOutQueuedUs(handle) : -1;
+}
+
+// Caller holds g_audioout2_context_mutex. The level from the device's queue, or from the timer.
+static uint32_t audioout2_level_locked(AudioOut2ContextState* state, int64_t device_queued_us) {
+	if (device_queued_us < 0) {
+		audioout2_update_context_locked(state);
+		return state->queued;
+	}
+	const auto grain_us = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
+	const auto beyond   = static_cast<uint64_t>(device_queued_us) > AUDIOOUT2_DEVICE_CUSHION_US
+	                          ? static_cast<uint64_t>(device_queued_us) - AUDIOOUT2_DEVICE_CUSHION_US
+	                          : 0;
+	state->queued      = static_cast<uint32_t>(
+        std::min<uint64_t>((beyond + grain_us - 1) / grain_us, state->queue_depth));
+	state->last_update = LibKernel::KernelGetProcessTime();
+	return state->queued;
+}
+
+static int audioout2_push_device_queue(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	for (;;) {
+		const auto device_us = audioout2_device_queued_us(ctx);
+
+		g_audioout2_context_mutex.Lock();
+		auto* state = audioout2_find_context_locked(ctx);
+		if (state == nullptr) {
+			g_audioout2_context_mutex.Unlock();
+			return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		}
+		const auto level = audioout2_level_locked(state, device_us);
+		if (level < state->queue_depth) {
+			if (device_us < 0 && state->queued == 0) {
+				state->last_update = LibKernel::KernelGetProcessTime();
+			}
+			state->queued++;
+			g_audioout2_context_mutex.Unlock();
+			// The level paces the pushes: the device takes the grain at once.
+			audioout2_queue_context_audio(ctx, device_us < 0 && blocking != 0);
+			return OK;
+		}
+		g_audioout2_context_mutex.Unlock();
+
+		if (blocking == 0) {
+			return AUDIO_OUT2_ERROR_NOT_READY;
+		}
+		Common::Thread::SleepMicro(1000);
+	}
+}
+
 int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t blocking) {
+	if (g_audioout2_device_queue) {
+		return audioout2_push_device_queue(ctx, blocking);
+	}
+
 	uint32_t sleep_micros = audioout2_grain_micros(512);
 
 	for (;;) {
@@ -576,9 +662,11 @@ int KYTY_SYSV_ABI AudioOut2ContextGetQueueLevel(AudioOut2ContextHandle ctx, uint
 		*available_queues = 4;
 	}
 
+	const auto device_us = g_audioout2_device_queue ? audioout2_device_queued_us(ctx) : -1;
+
 	g_audioout2_context_mutex.Lock();
 	if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
-		audioout2_update_context_locked(state);
+		(void)audioout2_level_locked(state, device_us);
 		if (queue_level != nullptr) {
 			*queue_level = state->queued;
 		}
