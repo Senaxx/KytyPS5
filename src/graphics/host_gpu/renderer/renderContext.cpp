@@ -147,7 +147,19 @@ void RenderContext::PrepareBda() {
 	// Every cached buffer is synchronized so a global-memory shader sees the CPU's writes.
 	// That walk touched every buffer per dispatch (a quarter of the GPU thread in the
 	// world); it only has to repeat once something became CPU-dirty or a buffer appeared.
+	// The walk runs at most once per guest submission: what the game wrote before submitting is
+	// visible to all its commands, as on the console, and the GPU thread runs behind the game
+	// anyway. Per draw, the walk and the re-protection it triggers took ~38 % of the GPU thread
+	// on the title menu (21 -> 32 fps).
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+	if (epoch != m_bda_synced_epoch) {
+		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+		if (submission == m_bda_synced_submission) {
+			m_fault_process_pending = true;
+			return;
+		}
+		m_bda_synced_submission = submission;
+	}
 	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.

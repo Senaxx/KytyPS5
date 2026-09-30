@@ -68,6 +68,9 @@ static_assert(std::atomic_uint32_t::is_always_lock_free);
 // all buffers for global-memory shaders, can skip its walk while this has not moved.
 inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 
+// Bumped by the GPU thread when it starts a guest submission (its first slice).
+inline std::atomic<uint64_t> g_guest_submission_seq {1};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
