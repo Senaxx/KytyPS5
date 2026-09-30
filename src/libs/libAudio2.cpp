@@ -599,9 +599,25 @@ static int audioout2_push_device_queue(AudioOut2ContextHandle ctx, uint32_t bloc
 				state->last_update = LibKernel::KernelGetProcessTime();
 			}
 			state->queued++;
+			const auto depth = state->queue_depth;
+			const auto grain = state->num_grains;
 			g_audioout2_context_mutex.Unlock();
 			// The level paces the pushes: the device takes the grain at once.
 			audioout2_queue_context_audio(ctx, device_us < 0 && blocking != 0);
+			// A blocking push returns once the queue has room for the next grain. The game's pushing
+			// thread wakes the mixer right after each push, and the mixer renders only when it sees
+			// room: returning with the queue full left the mixer asleep until the next frame woke
+			// it (300-500 ms in the jungle at ~9 fps; issue #7, the gameplay sound skipped).
+			if (blocking != 0 && device_us >= 0) {
+				const auto grain_us  = static_cast<uint64_t>(audioout2_grain_micros(grain));
+				const auto cushion   = AUDIOOUT2_DEVICE_CUSHION_US;
+				const auto full_us   = cushion + (depth - 1) * grain_us;
+				for (int64_t queued_us = audioout2_device_queued_us(ctx);
+				     queued_us >= 0 && static_cast<uint64_t>(queued_us) > full_us;
+				     queued_us = audioout2_device_queued_us(ctx)) {
+					Common::Thread::SleepMicro(500);
+				}
+			}
 			return OK;
 		}
 		g_audioout2_context_mutex.Unlock();
