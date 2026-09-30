@@ -609,8 +609,13 @@ void RecordSync(uint64_t size, bool is_written, bool uploaded, double walk_s) {
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
 	KYTY_PROFILER_FUNCTION();
+	// Timing every call cost ~2 % of the GPU thread (two performance-counter reads); SyncStats
+	// times the tracker walk only with KYTY_SYNC_STATS=1.
+	static const bool timed = std::getenv("KYTY_SYNC_STATS") != nullptr;
 	Common::Timer               walk_timer;
-	walk_timer.Start();
+	if (timed) {
+		walk_timer.Start();
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -627,7 +632,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			    source = UploadCopies(buffer, copies, total_size);
 		    });
 	}
-	RecordSync(size, is_written, static_cast<bool>(source), walk_timer.GetTimeS());
+	RecordSync(size, is_written, static_cast<bool>(source), timed ? walk_timer.GetTimeS() : 0.0);
 	if (source) {
 		KYTY_PROFILER_BLOCK("Sync::Copy");
 		auto& command = m_scheduler.Current();
