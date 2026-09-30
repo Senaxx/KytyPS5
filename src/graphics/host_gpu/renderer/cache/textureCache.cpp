@@ -1374,7 +1374,9 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	}
 	std::scoped_lock lock {m_lock};
 	ImageIds         matches;
-	for (const auto id: FindImagesInRegion(address, size, false)) {
+	// Only an image that starts at the address qualifies, and it covers that byte: one page to
+	// query instead of every page of the range (a multi-megabyte texel buffer on every draw).
+	for (const auto id: FindImagesInRegion(address, 1, false)) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr || owner->info.data.address != address) {
 			continue;
