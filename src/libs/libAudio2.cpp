@@ -210,6 +210,8 @@ struct AudioOut2LatencyState {
 static Common::Mutex                              g_audioout2_context_mutex;
 static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
 static Common::Mutex                              g_audioout2_port_mutex;
+// Held while a push outputs copies of the ports' PCM, and to close a port's handle.
+static Common::Mutex                              g_audioout2_output_mutex;
 static std::array<AudioOut2PortStateEntry, 256>   g_audioout2_ports;
 static std::vector<AudioOut2UserHandle>          g_audioout2_users;
 static Common::Mutex                              g_audioout2_speaker_array_mutex;
@@ -362,17 +364,31 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 }
 
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
-	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
-	// Keep both PCM storage and port handles alive until it returns.
-	std::vector<AudioInternal::OutputParam> params;
-	params.reserve(AudioInternal::OUT_PORTS_MAX);
+	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue
+	// (a grain, or up to 200 ms while it drains). The PCM is copied out under the port lock, so
+	// the game's mixer, which hands over the next buffers through PortSetAttributes, is not held
+	// for that time: it produced audio at ~60 % of real time in the jungle. The output lock keeps
+	// the port handles open until the backend returns.
+	thread_local std::vector<std::vector<uint8_t>>         buffers;
+	thread_local std::vector<AudioInternal::OutputParam> params;
+	params.clear();
 
-	Common::LockGuard lock(g_audioout2_port_mutex);
-	for (const auto& state: g_audioout2_ports) {
-		if (state.used && state.context == ctx && state.audio_handle > 0 &&
-		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data.data()});
+	Common::LockGuard output_lock(g_audioout2_output_mutex);
+	{
+		Common::LockGuard lock(g_audioout2_port_mutex);
+		for (const auto& state: g_audioout2_ports) {
+			if (state.used && state.context == ctx && state.audio_handle > 0 &&
+			    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
+				if (buffers.size() <= params.size()) {
+					buffers.resize(params.size() + 1);
+				}
+				buffers[params.size()].assign(state.pcm_data.begin(), state.pcm_data.end());
+				params.push_back(AudioInternal::OutputParam {state.audio_handle, nullptr});
+			}
 		}
+	}
+	for (size_t i = 0; i < params.size(); i++) {
+		params[i].data = buffers[i].data();
 	}
 
 	if (!params.empty()) {
@@ -383,6 +399,8 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle > 0) {
+		// Not while a push still outputs through the handle (see audioout2_queue_context_audio).
+		Common::LockGuard output_lock(g_audioout2_output_mutex);
 		AudioInternal::AudioOutClose(audio_handle);
 	}
 }
