@@ -924,7 +924,10 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 }
 
 bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
-	EXIT_IF(g_virtual_ranges == nullptr);
+	// No guest memory map (unit tests that drive the libraries on host memory): nothing to check.
+	if (g_virtual_ranges == nullptr) {
+		return true;
+	}
 
 	return size == 0 || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
 }
