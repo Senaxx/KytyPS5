@@ -25,22 +25,6 @@ Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
 }
 
-bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
-bool Value::IsPhi() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
-}
-
 Type Value::GetType() const {
 	if (IsPhi()) {
 		return inst->Flags<Type>();
@@ -54,19 +38,6 @@ Type Value::GetType() const {
 Inst* Value::Instruction() const {
 	EXIT_IF(type != Type::Opaque);
 	return inst;
-}
-
-Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
-Inst* Value::ResolveInstruction() const {
-	EXIT_IF(type != Type::Opaque);
-	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -92,11 +63,6 @@ uint8_t Value::U8() const {
 uint16_t Value::U16() const {
 	EXIT_IF(type != Type::U16);
 	return imm_u16;
-}
-
-uint32_t Value::U32() const {
-	EXIT_IF(type != Type::U32);
-	return imm_u32;
 }
 
 uint64_t Value::U64() const {
@@ -150,10 +116,6 @@ Inst::Inst(ValueOpcode value_opcode, uint64_t value_flags)
 
 Inst::~Inst() {
 	ClearArgs();
-}
-
-ValueOpcode Inst::GetOpcode() const {
-	return opcode;
 }
 
 Type Inst::GetType() const {

@@ -177,4 +177,44 @@ private:
 
 static_assert(sizeof(Inst) <= 112, "Inst operand storage unintentionally increased");
 
+// The accessors the IR passes and the resource walker call for every operand, inline: out of
+// line they were a fifth of the GPU thread's resource walk (calls, no LTO).
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+}
+
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
