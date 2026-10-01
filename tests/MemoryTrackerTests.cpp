@@ -650,17 +650,12 @@ void TestCrossRegionUpload() {
 // IsRangeCpuCleanHint mirrors the regions' CPU summaries one bit per region; the read-only upload
 // walk is skipped only when every region of the range exists and is clean.
 void TestRegionBitmapHint() {
-  // Region aligned (4 MiB) and above 0x200010000: the macOS test binary's guest segments reach
-  // past 0x200000000, so a fixed allocation there fails.
-  constexpr uintptr_t base = 0x0000000200400000ull;
+  // Region aligned (4 MiB), clear of the other tests' memory.
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   const auto page_size = harness.page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  auto *memory = AllocateFixedGuestRange(region_size * 2, 0x400000);
   const auto address = reinterpret_cast<uint64_t>(memory);
   Check(!tracker.IsRangeCpuCleanHint(address, region_size * 2),
         "regions that do not exist yet were reported clean");
