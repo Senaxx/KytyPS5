@@ -1150,9 +1150,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
+	auto& walk    = m_program.active_walk;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
+	walk.clear();
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
