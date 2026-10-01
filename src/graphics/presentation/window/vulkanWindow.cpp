@@ -702,6 +702,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 			graphics.shader_device_clock_enabled = true;
 		}
 	}
+	if (graphics.shader_device_clock_enabled) {
+		// Vulkan does not report the device clock's rate. On NVIDIA it counts nanoseconds and on
+		// AMD it is the 100 MHz reference clock, in both cases the rate of timestamp queries, so
+		// take that rate and the shift that brings it nearest the guest's 100 MHz.
+		const double period_ns = properties2.properties.limits.timestampPeriod;
+		const double rate_hz   = period_ns > 0.0 ? 1e9 / period_ns : 1e9;
+		uint32_t     shift     = 0;
+		while (shift < 8 && rate_hz / static_cast<double>(1u << (shift + 1)) >= 100e6 / 1.5) {
+			shift++;
+		}
+		ShaderRecompiler::Spirv::SetDeviceClockShift(shift);
+		LOGF("Vulkan shader device clock: timestamp period %.3f ns, S_MEMREALTIME shift %u\n",
+		     period_ns, shift);
+	}
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
 	if (graphics.address_binding_report_enabled) {
 		address_binding.reportAddressBinding = VK_TRUE;

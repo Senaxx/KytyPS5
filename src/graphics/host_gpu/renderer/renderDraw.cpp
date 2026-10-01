@@ -537,7 +537,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			}
 		}
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
-			EXIT("depth attachment feedback loop is not supported by the host\n");
+			// Without VK_EXT_attachment_feedback_loop_* (the AMD Windows driver), the draw samples
+			// the depth target it writes in the GENERAL layout: not defined by Vulkan, but what
+			// the hardware does anyway, and better than ending the emulator.
+			static std::atomic_bool warned {false};
+			if (!warned.exchange(true, std::memory_order_relaxed)) {
+				LOGF("Warning: depth attachment feedback loop without host support; "
+				     "using the GENERAL layout\n");
+			}
 		}
 		auto layout = depth_attachment_layout(depth);
 		if (sampled_aspects & ~DepthReadableAspects(layout)) {

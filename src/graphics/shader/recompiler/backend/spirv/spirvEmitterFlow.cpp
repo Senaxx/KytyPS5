@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
@@ -865,9 +866,11 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 
 uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx) {
 	// S_MEMREALTIME is a free-running counter at 100 MHz. Read the device clock once as a
-	// uvec2 so the two halves cannot tear, then bring it down toward the guest's rate: the
-	// host clock is ~1 GHz, and a shift by 3 lands near 125 MHz without a 64-bit divide. Guest
-	// timeouts computed from it then expire slightly early rather than 10x early.
+	// uvec2 so the two halves cannot tear, then bring it down toward the guest's rate with a
+	// shift (no 64-bit divide): a 1 GHz clock (NVIDIA) shifted by 3 lands near 125 MHz, so guest
+	// timeouts expire slightly early rather than 10x early; a 100 MHz clock (AMD) is not
+	// shifted. Shifting AMD's clock by 3 made the game's GPU frame pacer wait 8x its interval,
+	// 133 or 267 ms a frame (DEBUGGING.md, 2026-10-01).
 	auto&      state = ctx.state;
 	const auto clock = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpReadClockKHR, TypeU32Vector(state, 2), clock,
@@ -876,7 +879,12 @@ uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx) {
 	const auto high = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, clock, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, clock, 1);
-	constexpr uint32_t ClockShift = 3;
+	const uint32_t ClockShift = GetDeviceClockShift();
+	if (ClockShift == 0) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low, high);
+		return result;
+	}
 	const auto low_shifted = Binary(state, spv::OpShiftRightLogical, TypeU32(state), low,
 	                                ConstantU32(state, ClockShift));
 	const auto high_carried = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high,

@@ -435,8 +435,17 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 }
 
 namespace {
-std::atomic_bool g_image_min_lod {false};
+std::atomic_bool     g_image_min_lod {false};
+std::atomic_uint32_t g_device_clock_shift {3};
 } // namespace
+
+void SetDeviceClockShift(uint32_t shift) {
+	g_device_clock_shift.store(shift, std::memory_order_relaxed);
+}
+
+uint32_t GetDeviceClockShift() {
+	return g_device_clock_shift.load(std::memory_order_relaxed);
+}
 
 void SetHostImageFeatures(const HostImageFeatures& features) {
 	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
