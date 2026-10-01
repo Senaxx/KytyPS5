@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/Value.h"
 
+#include "common/config.h"
+
 #include <algorithm>
 #include <cstring>
 #include <memory>
@@ -200,9 +202,25 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
-	const auto old_uses = uses;
+	// Every use goes, so the list is taken over at once: rewriting each user's slot and appending
+	// it to the replacement's uses, in the same order as SetArg would, without searching and
+	// erasing this instruction's list once per use (quadratic for widely used values; the SSA
+	// rewrite and identity removal spent most of a big shader's IR passes there).
+	// Leave the argument lists first, while this list is intact (a phi can use itself; Invalidate
+	// below then finds nothing to remove): when the replacement is one of this instruction's own
+	// arguments, as for every identity, removing this instruction from its list before the moved
+	// uses are appended shifts only the older entries, and the list ends up in the same order.
+	ClearArgs();
+	auto  old_uses         = std::move(uses);
+	auto* replacement_inst = replacement.TryInstruction();
+	uses.clear();
 	for (const auto& use: old_uses) {
-		use.user->SetArg(use.operand, replacement);
+		EXIT_IF(use.operand >= use.user->args.size() || use.user->args[use.operand].TryInstruction() != this);
+		use.user->args[use.operand] = replacement;
+		if (replacement_inst != nullptr) {
+			// That slot held this instruction until now, so the replacement cannot list it yet.
+			replacement_inst->uses.push_back({use.user, use.operand});
+		}
 	}
 	Invalidate();
 	if (preserve) {
@@ -218,17 +236,71 @@ void Inst::Invalidate() {
 }
 
 void Inst::AddUse(Inst* used, size_t operand) {
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	// A linear search of every use: quadratic for widely used values, so debug builds only.
 	const auto found = std::ranges::find_if(
 	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
 	EXIT_IF(found != used->uses.end());
+#endif
 	used->uses.push_back({this, operand});
 }
 
 void Inst::RemoveUse(Inst* used, size_t operand) {
-	const auto found = std::ranges::find_if(
-	    used->uses, [&](const Use& use) { return use.user == this && use.operand == operand; });
-	EXIT_IF(found == used->uses.end());
-	used->uses.erase(found);
+	// Uses are unique, and the one removed is usually among the most recent: search from the end.
+	auto&      list  = used->uses;
+	const auto found = std::find_if(list.rbegin(), list.rend(), [&](const Use& use) {
+		return use.user == this && use.operand == operand;
+	});
+	EXIT_IF(found == list.rend());
+	list.erase(std::next(found).base());
+}
+
+void Inst::ReplaceUsesForRemoval(Value replacement, const std::unordered_set<const Inst*>& removed,
+                                 std::vector<Inst*>& touched) {
+	auto  old_uses         = std::move(uses);
+	auto* replacement_inst = replacement.TryInstruction();
+	uses.clear();
+	for (const auto& use: old_uses) {
+		if (use.user == this || removed.contains(use.user)) {
+			continue;
+		}
+		EXIT_IF(use.operand >= use.user->args.size() ||
+		        use.user->args[use.operand].TryInstruction() != this);
+		use.user->args[use.operand] = replacement;
+		if (replacement_inst != nullptr) {
+			replacement_inst->uses.push_back({use.user, use.operand});
+		}
+	}
+	for (const auto& arg: args) {
+		if (auto* target = arg.TryInstruction(); target != nullptr && target != this) {
+			touched.push_back(target);
+		}
+	}
+	args.clear();
+	phi_blocks.clear();
+	opcode = ValueOpcode::Void;
+}
+
+void Inst::DropRemovedUses(std::span<Inst* const>              touched,
+                           const std::unordered_set<const Inst*>& removed) {
+	// Each target once: a value many identities folded into would be filtered once per identity.
+	std::vector<Inst*> targets(touched.begin(), touched.end());
+	std::ranges::sort(targets);
+	targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+	for (auto* target: targets) {
+		// A removed target is erased already; the others drop their removed users in one pass.
+		if (!removed.contains(target)) {
+			std::erase_if(target->uses, [&](const Use& use) { return removed.contains(use.user); });
+		}
+	}
+}
+
+void Inst::DropForDestruction() {
+	// Every instruction that could refer to this one is being destroyed with it.
+	args.clear();
+	phi_blocks.clear();
+	uses.clear();
+	opcode = ValueOpcode::Void;
 }
 
 void Inst::ClearArgs() {

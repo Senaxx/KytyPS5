@@ -114,14 +114,16 @@ ResourcePlan& ResourcePlan::operator=(ResourcePlan&& other) noexcept {
 
 Program::~Program() {
 	// Planning expressions can refer to block values but outlive block storage in the base class.
-	for (auto& inst: value_storage) {
-		inst.Invalidate();
-	}
 	// Values may cross block boundaries. Detach all arguments before any block starts destroying
-	// its instruction storage so reverse-use links always point to live definitions.
+	// its instruction storage so reverse-use links always point to live definitions. Every
+	// instruction of both goes now, so nobody's use list needs maintaining (removing each use
+	// one by one was quadratic for widely used values).
+	for (auto& inst: value_storage) {
+		inst.DropForDestruction();
+	}
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
-			inst.Invalidate();
+			inst.DropForDestruction();
 		}
 	}
 }
