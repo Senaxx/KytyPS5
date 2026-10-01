@@ -3,8 +3,11 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -111,6 +114,16 @@ bool ReplaceBinaryIdentity(Inst& inst, Type type, uint64_t identity) {
 		return true;
 	}
 	return false;
+}
+
+// Whether one boolean is the LogicalNot of the other.
+bool IsComplement(Value lhs, Value rhs) {
+	const auto negates = [](Value negation, Value value) {
+		const auto* inst = negation.TryInstruction();
+		return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalNot &&
+		       Arg(*inst, 0) == value;
+	};
+	return negates(lhs, rhs) || negates(rhs, lhs);
 }
 
 bool FoldSelect(Inst& inst) {
@@ -620,6 +633,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (!FoldLogical(inst, [](bool a, bool b) { return a && b; })) {
 				const auto lhs      = Arg(inst, 0);
 				const auto rhs      = Arg(inst, 1);
+				if (IsComplement(lhs, rhs)) {
+					Replace(inst, Value(false));
+					return;
+				}
 				const auto simplify = [&](Value assumption, Value expression) {
 					const auto* disjunction = expression.TryInstruction();
 					if (disjunction == nullptr ||
@@ -648,7 +665,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (!FoldLogical(inst, [](bool a, bool b) { return a || b; })) {
 				const auto lhs = Arg(inst, 0);
 				const auto rhs = Arg(inst, 1);
-				if (IsImmediate(lhs, Type::U1)) {
+				if (IsComplement(lhs, rhs)) {
+					Replace(inst, Value(true));
+				} else if (IsImmediate(lhs, Type::U1)) {
 					Replace(inst, lhs.U1() ? lhs : rhs);
 				} else if (IsImmediate(rhs, Type::U1)) {
 					Replace(inst, rhs.U1() ? rhs : lhs);
@@ -942,6 +961,309 @@ uint32_t SimplifyBoundedLoopRegisters(Program& program) {
 				Replace(inst, Value(range.lo != 0));
 				folded++;
 			}
+		}
+	}
+	return folded;
+}
+
+namespace {
+
+// Translator::ThreadBit reads the current lane's bit of a wave mask as
+//   INotEqual32(BitwiseAnd32(ShiftRightLogical32(word, BitwiseAnd32(LaneId, 31)), 1), 0)
+// where a wave64 word is SelectU32(ULessThan32(LaneId, 32), low, high).
+struct LaneBitRead {
+	Value low;
+	Value high;
+	Value high_half; // the ULessThan32 of a wave64 read; empty for wave32
+};
+
+bool IsOpcode(Value value, ValueOpcode opcode) {
+	const auto* inst = value.TryInstruction();
+	return inst != nullptr && inst->GetOpcode() == opcode;
+}
+
+// The operand of a commutative instruction that is not the immediate `constant`.
+std::optional<Value> OtherThan(const Inst& inst, uint32_t constant) {
+	const auto lhs = Arg(inst, 0);
+	const auto rhs = Arg(inst, 1);
+	if (IsImmediate(rhs, Type::U32) && rhs.U32() == constant) {
+		return lhs;
+	}
+	if (IsImmediate(lhs, Type::U32) && lhs.U32() == constant) {
+		return rhs;
+	}
+	return std::nullopt;
+}
+
+bool IsLaneBitIndex(Value value) {
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseAnd32) {
+		return false;
+	}
+	const auto lane = OtherThan(*inst, 31u);
+	return lane && IsOpcode(*lane, ValueOpcode::LaneId);
+}
+
+std::optional<LaneBitRead> MatchLaneBit(const Inst& inst) {
+	const auto masked = OtherThan(inst, 0u);
+	if (!masked || !IsOpcode(*masked, ValueOpcode::BitwiseAnd32)) {
+		return std::nullopt;
+	}
+	const auto shifted = OtherThan(*masked->TryInstruction(), 1u);
+	if (!shifted || !IsOpcode(*shifted, ValueOpcode::ShiftRightLogical32)) {
+		return std::nullopt;
+	}
+	const auto& shift = *shifted->TryInstruction();
+	if (!IsLaneBitIndex(Arg(shift, 1))) {
+		return std::nullopt;
+	}
+	const auto word = Arg(shift, 0);
+	if (const auto* select = word.TryInstruction();
+	    select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32) {
+		const auto condition = Arg(*select, 0);
+		const auto* compare  = condition.TryInstruction();
+		if (compare != nullptr && compare->GetOpcode() == ValueOpcode::ULessThan32 &&
+		    IsOpcode(Arg(*compare, 0), ValueOpcode::LaneId) &&
+		    IsImmediate(Arg(*compare, 1), Type::U32) && Arg(*compare, 1).U32() == 32u) {
+			return LaneBitRead {Arg(*select, 1), Arg(*select, 2), condition};
+		}
+	}
+	return LaneBitRead {word, Value {}, Value {}};
+}
+
+// Word `part` of a U64 built by CompositeConstructU64, or of a U64 constant.
+std::optional<Value> U64Word(Value value, uint32_t part) {
+	if (IsImmediate(value, Type::U64)) {
+		return Value(static_cast<uint32_t>(value.U64() >> (part * 32u)));
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst != nullptr && inst->GetOpcode() == ValueOpcode::CompositeConstructU64) {
+		return Arg(*inst, part);
+	}
+	return std::nullopt;
+}
+
+// What the fold needs to know about the program. In a pixel shader, helper invocations may be
+// left out of ballots (NVIDIA leaves them out), so there bit LaneId of Ballot(c) is c only for a
+// lane that takes part in ballots: c AND Participating(). Lanes keep that status for the whole
+// shader (a discard ends the invocation, OpKill). Elsewhere every running lane takes part.
+struct LaneFold {
+	Program& program;
+	bool     pixel = false;
+	Value    participating; // made on first use, at the top of the entry block
+	// Lane bits already emitted in the current block, by (word, part): the same word gives the
+	// same value, so x || !x stays recognisable (IsEveryLane compares instructions).
+	std::unordered_map<const Inst*, std::array<Value, 2>> emitted;
+	const Block*                                           emitted_block = nullptr;
+
+	Value Participating() {
+		if (!participating.IsEmpty()) {
+			return participating;
+		}
+		auto&      entry = *program.blocks.front();
+		const auto at    = entry.begin();
+		const auto add   = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+            return Value(&*entry.PrependNewInst(at, opcode, args));
+		};
+		const auto ballot = add(ValueOpcode::Ballot, {Value(true)});
+		const auto lane   = add(ValueOpcode::LaneId, {});
+		auto       word   = add(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+		if (program.wave_size == 64u) {
+			const auto high     = add(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+			const auto low_half = add(ValueOpcode::ULessThan32, {lane, Value(32u)});
+			word                = add(ValueOpcode::SelectU32, {low_half, word, high});
+		}
+		const auto bit     = add(ValueOpcode::BitwiseAnd32, {lane, Value(31u)});
+		const auto shifted = add(ValueOpcode::ShiftRightLogical32, {word, bit});
+		const auto masked  = add(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)});
+		// IEqual32(.., 1), not ThreadBit's INotEqual32(.., 0): FoldLaneMasks must not fold it.
+		participating = add(ValueOpcode::IEqual32, {masked, Value(1u)});
+		return participating;
+	}
+};
+
+// Whether the current lane's bit of `word` is known to be set: an all-one constant, a ballot of
+// true (outside pixel shaders; or under WQM, as a helper shares its quad with a lane that takes
+// part), or logic or WQM of those. WQM only adds lanes, so it keeps a set bit set.
+bool LaneBitSet(const LaneFold& fold, Value word, uint32_t part, int depth, bool under_wqm) {
+	if (depth > 16) {
+		return false;
+	}
+	if (IsImmediate(word, Type::U32)) {
+		return word.U32() == UINT32_MAX;
+	}
+	const auto* inst = word.TryInstruction();
+	if (inst == nullptr) {
+		return false;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::CompositeExtractU32x4: {
+			const auto  index  = Arg(*inst, 1);
+			const auto* ballot = Arg(*inst, 0).TryInstruction();
+			return (!fold.pixel || under_wqm) && IsImmediate(index, Type::U32) &&
+			       index.U32() == part && ballot != nullptr &&
+			       ballot->GetOpcode() == ValueOpcode::Ballot &&
+			       IsImmediate(Arg(*ballot, 0), Type::U1) && Arg(*ballot, 0).U1();
+		}
+		case ValueOpcode::CompositeExtractU64: {
+			const auto index = Arg(*inst, 1);
+			if (!IsImmediate(index, Type::U32) || index.U32() != part) {
+				return false;
+			}
+			auto source = Arg(*inst, 0);
+			bool wqm    = under_wqm;
+			if (const auto* producer = source.TryInstruction();
+			    producer != nullptr && producer->GetOpcode() == ValueOpcode::WqmU64) {
+				source = Arg(*producer, 0);
+				wqm    = true;
+			}
+			const auto component = U64Word(source, part);
+			return component && LaneBitSet(fold, *component, part, depth + 1, wqm);
+		}
+		case ValueOpcode::BitwiseAnd32:
+			return LaneBitSet(fold, Arg(*inst, 0), part, depth + 1, under_wqm) &&
+			       LaneBitSet(fold, Arg(*inst, 1), part, depth + 1, under_wqm);
+		case ValueOpcode::BitwiseOr32:
+			return LaneBitSet(fold, Arg(*inst, 0), part, depth + 1, under_wqm) ||
+			       LaneBitSet(fold, Arg(*inst, 1), part, depth + 1, under_wqm);
+		default: return false;
+	}
+}
+
+// Whether the current lane's bit of `word` (part 0: lanes 0-31, part 1: lanes 32-63) is known
+// without the word: a ballot of a predicate, an all-zero or all-one constant, a bit known to be
+// set (LaneBitSet), or bitwise and/or/xor/not of those.
+bool LaneBitKnown(const LaneFold& fold, Value word, uint32_t part, int depth) {
+	if (depth > 16) {
+		return false;
+	}
+	if (IsImmediate(word, Type::U32)) {
+		return word.U32() == 0u || word.U32() == UINT32_MAX;
+	}
+	if (LaneBitSet(fold, word, part, depth, false)) {
+		return true;
+	}
+	const auto* inst = word.TryInstruction();
+	if (inst == nullptr) {
+		return false;
+	}
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::CompositeExtractU64: {
+			const auto index = Arg(*inst, 1);
+			if (!IsImmediate(index, Type::U32) || index.U32() != part) {
+				return false;
+			}
+			const auto component = U64Word(Arg(*inst, 0), part);
+			return component && LaneBitKnown(fold, *component, part, depth + 1);
+		}
+		case ValueOpcode::CompositeExtractU32x4: {
+			const auto index = Arg(*inst, 1);
+			return IsImmediate(index, Type::U32) && index.U32() == part &&
+			       IsOpcode(Arg(*inst, 0), ValueOpcode::Ballot);
+		}
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+			return LaneBitKnown(fold, Arg(*inst, 0), part, depth + 1) &&
+			       LaneBitKnown(fold, Arg(*inst, 1), part, depth + 1);
+		case ValueOpcode::BitwiseNot32: return LaneBitKnown(fold, Arg(*inst, 0), part, depth + 1);
+		default: return false;
+	}
+}
+
+Value EmitLaneBitUncached(LaneFold& fold, Value word, uint32_t part, Block& block,
+                          Block::iterator at);
+
+// Emits the current lane's bit of `word` before `at`; LaneBitKnown(word, part) must hold.
+Value EmitLaneBit(LaneFold& fold, Value word, uint32_t part, Block& block, Block::iterator at) {
+	if (IsImmediate(word, Type::U32)) {
+		return Value(word.U32() != 0u);
+	}
+	if (fold.emitted_block != &block) {
+		fold.emitted.clear();
+		fold.emitted_block = &block;
+	}
+	const auto* key = word.TryInstruction();
+	if (key != nullptr) {
+		if (const auto found = fold.emitted.find(key);
+		    found != fold.emitted.end() && !found->second[part].IsEmpty()) {
+			return found->second[part];
+		}
+	}
+	const auto value = EmitLaneBitUncached(fold, word, part, block, at);
+	if (key != nullptr) {
+		fold.emitted[key][part] = value;
+	}
+	return value;
+}
+
+Value EmitLaneBitUncached(LaneFold& fold, Value word, uint32_t part, Block& block,
+                          Block::iterator at) {
+	if (LaneBitSet(fold, word, part, 0, false)) {
+		return Value(true);
+	}
+	const auto* inst   = word.TryInstruction();
+	const auto  binary = [&](ValueOpcode opcode) {
+		const auto lhs = EmitLaneBit(fold, Arg(*inst, 0), part, block, at);
+		const auto rhs = EmitLaneBit(fold, Arg(*inst, 1), part, block, at);
+		return Value(&*block.PrependNewInst(at, opcode, {lhs, rhs}));
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::CompositeExtractU64:
+			return EmitLaneBit(fold, *U64Word(Arg(*inst, 0), part), part, block, at);
+		case ValueOpcode::CompositeExtractU32x4: {
+			// Bit LaneId of a ballot is the current lane's own predicate, if the lane takes part.
+			const auto predicate = Arg(*Arg(*inst, 0).TryInstruction(), 0);
+			if (!fold.pixel) {
+				return predicate;
+			}
+			return Value(&*block.PrependNewInst(at, ValueOpcode::LogicalAnd,
+			                                    {predicate, fold.Participating()}));
+		}
+		case ValueOpcode::BitwiseAnd32: return binary(ValueOpcode::LogicalAnd);
+		case ValueOpcode::BitwiseOr32: return binary(ValueOpcode::LogicalOr);
+		case ValueOpcode::BitwiseXor32: return binary(ValueOpcode::LogicalXor);
+		default: {
+			const auto value = EmitLaneBit(fold, Arg(*inst, 0), part, block, at);
+			return Value(&*block.PrependNewInst(at, ValueOpcode::LogicalNot, {value}));
+		}
+	}
+}
+
+} // namespace
+
+// KYTY_FOLD_LANE_MASKS=0 turns this off, for comparisons.
+uint32_t FoldLaneMasks(Program& program) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FOLD_LANE_MASKS");
+		return value == nullptr || value[0] != '0';
+	}();
+	// A hull shader's LaneId is its invocation id, not its subgroup lane.
+	if (!enabled || program.stage == ShaderType::TessellationControl || program.blocks.empty()) {
+		return 0;
+	}
+	LaneFold fold {program, program.stage == ShaderType::Pixel, Value {}};
+	uint32_t folded = 0;
+	for (auto* block: program.blocks) {
+		for (auto inst = block->begin(); inst != block->end(); ++inst) {
+			if (inst->GetOpcode() != ValueOpcode::INotEqual32) {
+				continue;
+			}
+			const auto read = MatchLaneBit(*inst);
+			if (!read || !LaneBitKnown(fold, read->low, 0u, 0) ||
+			    (!read->high_half.IsEmpty() && !LaneBitKnown(fold, read->high, 1u, 0))) {
+				continue;
+			}
+			auto value = EmitLaneBit(fold, read->low, 0u, *block, inst);
+			if (!read->high_half.IsEmpty()) {
+				const auto high = EmitLaneBit(fold, read->high, 1u, *block, inst);
+				if (high != value) {
+					value = Value(&*block->PrependNewInst(inst, ValueOpcode::SelectU1,
+					                                      {read->high_half, value, high}));
+				}
+			}
+			Replace(*inst, value);
+			folded++;
 		}
 	}
 	return folded;

@@ -244,35 +244,50 @@ std::optional<LaneReduction> MatchLaneReduction(const Inst& read_lane, uint32_t 
 		return result;
 	}
 	// The row pair: select(every lane, op(scan, select(every lane, V_PERMLANEX16(scan, lane 15
-	// of the other row), old)), scan), read at lane 32h+31.
+	// of the other row), old)), scan), read at lane 32h+31. Once EXEC is known to be every lane
+	// (FoldLaneMasks), the selects fold away: op(scan, V_PERMLANEX16(...)).
 	if (lane % 32u != 31u) {
 		return std::nullopt;
 	}
+	// The value an every-lane select picks, or the value itself.
+	const auto every_lane_value = [](Value candidate) {
+		candidate        = candidate.Resolve();
+		const auto* inst = candidate.TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::SelectU32 &&
+		    IsEveryLane(inst->Arg(0))) {
+			return inst->Arg(1).Resolve();
+		}
+		return candidate;
+	};
 	const auto* merged = value.TryInstruction();
-	if (merged == nullptr || merged->GetOpcode() != ValueOpcode::SelectU32 ||
-	    !IsEveryLane(merged->Arg(0))) {
+	if (merged == nullptr) {
 		return std::nullopt;
 	}
-	const auto  scan      = merged->Arg(2).Resolve();
-	const auto* operation = merged->Arg(1).Resolve().TryInstruction();
+	Value scan;
+	if (merged->GetOpcode() == ValueOpcode::SelectU32) {
+		if (!IsEveryLane(merged->Arg(0))) {
+			return std::nullopt;
+		}
+		scan = merged->Arg(2).Resolve();
+	}
+	const auto* operation = every_lane_value(value).TryInstruction();
 	if (operation == nullptr || !IsReduction(operation->GetOpcode())) {
 		return std::nullopt;
 	}
 	for (size_t index = 0; index < 2; index++) {
-		const auto* other = operation->Arg(index).Resolve().TryInstruction();
-		if (other == nullptr || other->GetOpcode() != ValueOpcode::SelectU32 ||
-		    !IsEveryLane(other->Arg(0)) || operation->Arg(1 - index).Resolve() != scan) {
+		const auto* permlane = every_lane_value(operation->Arg(index)).TryInstruction();
+		const auto  row_scan = operation->Arg(1 - index).Resolve();
+		if (!scan.IsEmpty() && row_scan != scan) {
 			continue;
 		}
-		const auto* permlane = other->Arg(1).Resolve().TryInstruction();
 		if (permlane == nullptr || permlane->GetOpcode() != ValueOpcode::Permlane16U32 ||
-		    !permlane->Flags<PermlaneFlags>().x16 || permlane->Arg(0).Resolve() != scan ||
+		    !permlane->Flags<PermlaneFlags>().x16 || permlane->Arg(0).Resolve() != row_scan ||
 		    permlane->Arg(1).Resolve() != Value(0xffffffffu) ||
 		    permlane->Arg(2).Resolve() != Value(0xffffffffu) || !IsEveryLane(permlane->Arg(3))) {
 			continue;
 		}
 		result.operation = operation->GetOpcode();
-		if (const auto source = MatchRowScan(scan, result.operation)) {
+		if (const auto source = MatchRowScan(row_scan, result.operation)) {
 			result.source     = *source;
 			result.first_lane = lane - 31u;
 			result.lanes      = 32u;

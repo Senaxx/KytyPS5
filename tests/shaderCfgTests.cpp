@@ -10026,6 +10026,48 @@ void TestWaveRowReduction() {
         "a DPP row scan with V_PERMLANEX16 read at lanes 31 and 63 did not become two reductions");
   Check(native_reductions(0x117, false) == 0 && native_reductions(0x117, true) == 0,
         "a scan with the wrong last shift was taken for a lane reduction");
+
+  // The same scan as a pixel shader's work-list loop writes it (PS 0x00e3d8e3fcdfd5a7): EXEC saved,
+  // WQM, the lanes with work through S_AND_SAVEEXEC, every lane through S_ORN2_SAVEEXEC of that
+  // mask, the scan over the lanes with work, EXEC restored. With the mask reads folded (FoldLaneMasks), EXEC of the scan is x || !x; the scan
+  // must still become native reductions, or the emulated one hangs the GPU (DEBUGGING.md,
+  // 2026-10-01).
+  {
+    const std::vector<uint32_t> shader = {
+        EncodeVop3Word0(0x365, 3), EncodeVop3Word1(193, 128, 0),    // v_mbcnt_lo_u32_b32 v3, -1, 0
+        EncodeSMovB32(80, 126),                                     // s_mov_b32 s80, exec_lo
+        EncodeSop1(0x09, 126, 126),                                 // s_wqm_b32 exec_lo, exec_lo
+        EncodeVopc(0xd1, 130, 3),                                   // v_cmpx_lt_u32 exec_lo, 2, v3
+        EncodeVopc(0xc1, 132, 3),                                   // v_cmp_lt_u32 vcc_lo, 4, v3
+        EncodeSop1(0x3c, 69, 106),                                  // s_and_saveexec_b32 s69, vcc_lo
+        EncodeSMovB32(126, 69),                                     // s_mov_b32 exec_lo, s69
+        EncodeSop2(0x0e, 0, 69, 80),                                // s_and_b32 s0, s69, s80
+        EncodeSop1(0x40, 106, 69),                                  // s_orn2_saveexec_b32 vcc_lo, s69
+        EncodeVop3Word0(0x101, 1), EncodeVop3Word1(128, 256 + 3, 0), // v_cndmask_b32 v1, 0, v3, s0
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x111),       // v_max_u32 v1, v1 row_shr:1, v1
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x112),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x114),
+        EncodeVop2(0x14, 1, 250, 1), EncodeVop2Dpp(1, 0x118),
+        EncodeSMovB32(126, 106),                                    // s_mov_b32 exec_lo, vcc_lo
+        EncodeVop3Word0(0x360, 2), EncodeVop3Word1(256 + 1, 128 + 15, 0), // v_readlane_b32 s2
+        EncodeVop3Word0(0x360, 3), EncodeVop3Word1(256 + 1, 128 + 31, 0), // v_readlane_b32 s3
+        EncodeSop2(0x09, 4, 2, 3),                                  // s_max_u32 s4, s2, s3
+        EncodeVop1(0x01, 2, 4),                                     // v_mov_b32 v2, s4
+        EncodeExp0(0x00, 0xf), EncodeExp1(2, 2, 2, 2),              // exp mrt0
+        0xbf810000u,
+    };
+    auto options      = MakeCompileOptions(ShaderType::Pixel);
+    options.wave_size = 32;
+    const auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    size_t     found  = 0;
+    for (auto at = source.find("OpGroupNonUniformUMax"); at != std::string::npos;
+         at = source.find("OpGroupNonUniformUMax", at + 1)) {
+      found++;
+    }
+    Check(found == 2, "a work-list scan after S_ORN2_SAVEEXEC did not become two row reductions");
+  }
 }
 
 // V_ADD_F64 and the f64 compares of two engine shaders (V_CMP_LE_F64, V_CMPX_LE_F64,
