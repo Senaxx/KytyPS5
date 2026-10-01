@@ -36,7 +36,17 @@ namespace {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
 		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
 		if (info.IsBlock() && graphics.supports_block_texel_view) {
-			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+			if (info.IsVolume()) {
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: {} is created as a block-compressed volume; block texel views "
+					    "are 2D on this driver, so views of it keep the image's block size.\n",
+					    vk::to_string(info.pixel_format)));
+				}
+			} else {
+				flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
+			}
 		}
 	}
 	if (info.IsVolume()) {
