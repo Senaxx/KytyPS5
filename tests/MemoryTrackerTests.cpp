@@ -650,7 +650,9 @@ void TestCrossRegionUpload() {
 // IsRangeCpuCleanHint mirrors the regions' CPU summaries one bit per region; the read-only upload
 // walk is skipped only when every region of the range exists and is clean.
 void TestRegionBitmapHint() {
-  constexpr uintptr_t base = 0x0000000200000000ull;
+  // Region aligned (4 MiB) and above 0x200010000: the macOS test binary's guest segments reach
+  // past 0x200000000, so a fixed allocation there fails.
+  constexpr uintptr_t base = 0x0000000200400000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
