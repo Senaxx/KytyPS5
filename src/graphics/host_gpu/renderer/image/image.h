@@ -9,6 +9,7 @@
 
 #include <compare>
 #include <limits>
+#include <atomic>
 #include <optional>
 #include <span>
 #include <utility>
@@ -180,6 +181,16 @@ private:
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
 };
+
+// Changes of a bindless-pinned image's state that the per-draw bindless pass checks
+// (RenderExecutor::CommitBindings): its layout, render-target use and registration. A heap is
+// rechecked only when this changed since it was last checked, or for the images resolved since.
+inline std::atomic<uint64_t> g_bindless_state_generation {1};
+inline void NoteBindlessStateChange(const Image& image) noexcept {
+	if (image.bindless_pinned) {
+		g_bindless_state_generation.fetch_add(1, std::memory_order_relaxed);
+	}
+}
 
 namespace ImageOps {
 

@@ -208,6 +208,9 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
+	if (state.layout != destination_layout) {
+		NoteBindlessStateChange(*this);
+	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }

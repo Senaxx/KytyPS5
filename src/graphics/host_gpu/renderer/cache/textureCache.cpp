@@ -245,6 +245,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
+	NoteBindlessStateChange(image);
 	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
 }
@@ -255,6 +256,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		return;
 	}
 	if (image.bindless_pinned) {
+		NoteBindlessStateChange(image);
 		image.bindless_pinned = false;
 		if (on_bindless_unregister) {
 			on_bindless_unregister(id);
@@ -871,6 +873,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		if (cached.binding.is_target && !m_slot_images[merged_id].binding.is_target) {
+			NoteBindlessStateChange(m_slot_images[merged_id]);
+		}
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));

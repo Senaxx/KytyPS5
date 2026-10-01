@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
@@ -48,10 +49,10 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
 	std::array<uint32_t, 3>               dispatch_dimensions {};
-	// Bindless: flattened-SRT words to patch (offset, region, entries) and resolved images to
-	// keep readable for this draw.
+	// Bindless: flattened-SRT words to patch (offset, region, entries) and the heaps whose
+	// resolved images must be readable for this draw (stable: the table keeps heaps in a deque).
 	std::vector<std::array<uint32_t, 3>>  bindless_patches;
-	std::vector<ImageId>                  bindless_images;
+	std::vector<BindlessTable::Heap*>     bindless_heaps;
 };
 
 [[nodiscard]] vk::DescriptorType

@@ -74,6 +74,10 @@ public:
 		std::vector<uint32_t>               slots;    // per key; 0 = not resolved
 		std::vector<uint8_t>                settled;  // per key; resolved, or known placeholder
 		std::vector<ImageId>                resolved; // images to keep readable for draws
+		// What RenderExecutor::CommitBindings last checked: g_bindless_state_generation then, and
+		// how many resolved images. Unchanged since, only the images resolved after need a look.
+		uint64_t checked_generation = 0;
+		size_t   checked_count      = 0;
 	};
 
 	// The heap for (base, table offset, view binding), created with every entry pending and

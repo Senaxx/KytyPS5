@@ -896,7 +896,10 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 }
 
 void RenderExecutor::BindRenderTarget(ImageId id) {
-	auto& image             = m_context.GetTextureCache().GetImage(id);
+	auto& image = m_context.GetTextureCache().GetImage(id);
+	if (!image.binding.is_target) {
+		NoteBindlessStateChange(image);
+	}
 	image.binding.is_target = true;
 	m_bound_images.push_back(id);
 }
@@ -904,6 +907,9 @@ void RenderExecutor::BindRenderTarget(ImageId id) {
 void RenderExecutor::ResetBindings() {
 	for (const auto id: m_bound_images) {
 		if (auto* image = m_context.GetTextureCache().m_slot_images.try_get(id); image != nullptr) {
+			if (image->binding.is_target) {
+				NoteBindlessStateChange(*image);
+			}
 			image->binding = {};
 		}
 	}
@@ -1143,7 +1149,7 @@ void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
 void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
                                           PreparedBindings& prepared) {
 	prepared.bindless_patches.clear();
-	prepared.bindless_images.clear();
+	prepared.bindless_heaps.clear();
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	auto&       table    = m_context.GetBindlessTable();
@@ -1170,8 +1176,7 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 		}
 		prepared.bindless_patches.push_back(
 		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
-		prepared.bindless_images.insert(prepared.bindless_images.end(), heap->resolved.begin(),
-		                                heap->resolved.end());
+		prepared.bindless_heaps.push_back(heap);
 	}
 }
 
@@ -1456,6 +1461,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
+				if (old_image->binding.is_target) {
+					NoteBindlessStateChange(*old_image);
+				}
 				old_image->binding = {};
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -1508,6 +1516,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
+				if (old_image->binding.is_target) {
+					NoteBindlessStateChange(*old_image);
+				}
 				old_image->binding = {};
 			}
 			target.desc.view_info.base_level = target.guest_mip_level;
@@ -1611,18 +1622,49 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
-		// Bindless textures are sampled through set 1 with a read-only layout.
-		for (const auto id: descriptors.bindless_images) {
-			auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-			if (image == nullptr || !image->registered || image->binding.is_target ||
-			    image->info.data.Empty()) {
-				continue;
+		// Bindless textures are sampled through set 1 with a read-only layout. A heap holds
+		// thousands of resolved images; one whose images' states did not change since it was
+		// last checked (g_bindless_state_generation) needs a look only at the images resolved
+		// since. KYTY_BINDLESS_VERIFY=1 checks every image and stops if a skipped one needed it.
+		static const bool verify = std::getenv("KYTY_BINDLESS_VERIFY") != nullptr;
+		for (auto* heap: descriptors.bindless_heaps) {
+			const auto& resolved = heap->resolved;
+			size_t      begin =
+			    heap->checked_generation ==
+			            g_bindless_state_generation.load(std::memory_order_relaxed) &&
+			            heap->checked_count <= resolved.size()
+			         ? heap->checked_count
+			         : 0;
+			if (verify) {
+				begin = 0;
 			}
-			const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-			                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
-			if (image->backing.state.layout != layout) {
-				image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
+			const auto skipped =
+			    heap->checked_generation ==
+			            g_bindless_state_generation.load(std::memory_order_relaxed) &&
+			            heap->checked_count <= resolved.size()
+			        ? heap->checked_count
+			        : 0;
+			for (size_t i = begin; i < resolved.size(); i++) {
+				auto* image = m_context.GetTextureCache().m_slot_images.try_get(resolved[i]);
+				if (image == nullptr || !image->registered || image->binding.is_target ||
+				    image->info.data.Empty()) {
+					continue;
+				}
+				const auto layout = image->info.IsDepth()
+				                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+				                        : vk::ImageLayout::eShaderReadOnlyOptimal;
+				if (image->backing.state.layout != layout) {
+					if (verify && i < skipped) {
+						EXIT("bindless: image %u of heap 0x%016" PRIx64
+						     " changed layout without a state generation change\n",
+						     static_cast<uint32_t>(i), heap->base);
+					}
+					image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
+				}
 			}
+			// After the transitions above, which bump the generation themselves.
+			heap->checked_generation = g_bindless_state_generation.load(std::memory_order_relaxed);
+			heap->checked_count      = resolved.size();
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
