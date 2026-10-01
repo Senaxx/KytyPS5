@@ -8,7 +8,28 @@ namespace Libs::Graphics {
 static_assert(std::atomic<void*>::is_always_lock_free);
 
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
-	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_regions           = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
+	m_present_regions   = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
+	m_cpu_dirty_regions = std::make_unique<std::atomic<uint64_t>[]>(REGION_COUNT / 64);
+}
+
+bool MemoryTracker::IsRangeCpuCleanHint(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+		return false;
+	}
+	const uint64_t first = vaddr / TRACKER_REGION_SIZE;
+	const uint64_t last  = (vaddr + size - 1) / TRACKER_REGION_SIZE;
+	for (uint64_t word = first / 64; word <= last / 64; word++) {
+		const uint64_t low  = word == first / 64 ? first % 64 : 0;
+		const uint64_t high = word == last / 64 ? last % 64 : 63;
+		const uint64_t mask =
+		    high - low == 63 ? ~uint64_t {0} : ((uint64_t {1} << (high - low + 1)) - 1) << low;
+		if ((m_present_regions[word].load(std::memory_order_acquire) & mask) != mask ||
+		    (m_cpu_dirty_regions[word].load(std::memory_order_acquire) & mask) != 0) {
+			return false;
+		}
+	}
+	return true;
 }
 
 MemoryTracker::~MemoryTracker() = default;
@@ -63,12 +84,20 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
+	// A new region is all CPU-dirty (its summary starts true): mirror that before it exists.
+	const uint64_t bit = uint64_t {1} << (index % 64);
+	m_cpu_dirty_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
+	ptr->SetCpuSummaryBit(&m_cpu_dirty_regions[index / 64], bit);
+	m_present_regions[index / 64].fetch_or(bit, std::memory_order_acq_rel);
 	m_regions[index].store(ptr, std::memory_order_release);
 	return ptr;
 }
 
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	if (g_tracker_skip_clean && g_tracker_bitmap && IsRangeCpuCleanHint(vaddr, size)) {
+		return false;
+	}
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		if (g_tracker_skip_clean && !manager->MaybeModified<DirtySource::Cpu>()) {
 			return false;

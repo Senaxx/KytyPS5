@@ -647,6 +647,58 @@ void TestCrossRegionUpload() {
   Release(memory);
 }
 
+// IsRangeCpuCleanHint mirrors the regions' CPU summaries one bit per region; the read-only upload
+// walk is skipped only when every region of the range exists and is clean.
+void TestRegionBitmapHint() {
+  constexpr uintptr_t base = 0x0000000200000000ull;
+  constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  const auto page_size = harness.page_manager.GetPageSize();
+  auto *memory = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  Check(!tracker.IsRangeCpuCleanHint(address, region_size * 2),
+        "regions that do not exist yet were reported clean");
+
+  uint32_t ranges = 0;
+  tracker.ForEachUploadRange(
+      address, region_size * 2, false,
+      [&](uint64_t, uint64_t) noexcept { ranges++; }, []() noexcept {});
+  Check(ranges == 2 && tracker.IsRangeCpuCleanHint(address, region_size * 2) &&
+            !tracker.IsRegionCpuModified(address, region_size * 2),
+        "uploading two whole regions did not leave them clean in the hint");
+
+  tracker.MarkRegionAsCpuModified(address + region_size + page_size, 16);
+  Check(!tracker.IsRangeCpuCleanHint(address, region_size * 2) &&
+            !tracker.IsRangeCpuCleanHint(address + region_size, page_size) &&
+            tracker.IsRangeCpuCleanHint(address, region_size),
+        "a CPU write did not clear the hint of its region only");
+
+  ranges = 0;
+  bool uploaded = false;
+  tracker.ForEachUploadRange(
+      address, region_size * 2, false,
+      [&](uint64_t upload_address, uint64_t upload_size) noexcept {
+        Check(upload_address == address + region_size + page_size &&
+                  upload_size == page_size,
+              "the dirty page was not the one uploaded");
+        ranges++;
+      },
+      [&]() noexcept { uploaded = true; });
+  Check(ranges == 1 && uploaded &&
+            tracker.IsRangeCpuCleanHint(address, region_size * 2),
+        "the upload walk missed the dirty page or left the hint dirty");
+
+  Check(!tracker.IsRangeCpuCleanHint(address, region_size * 3),
+        "a range reaching a region that was never created was reported clean");
+  tracker.MarkRegionAsCpuModified(address, region_size * 2);
+  tracker.UntrackMemory(address, region_size * 2);
+  Release(memory);
+}
+
 void TestUploadDoesNotSerializeDisjointRegion() {
   constexpr auto region_size = Libs::Graphics::TRACKER_REGION_SIZE;
   constexpr auto page_size = Libs::Graphics::TRACKER_PAGE_SIZE;
@@ -1038,6 +1090,7 @@ int main(int argc, char **argv) {
   TestExactDirtyIntervalsSharingTrackerPage();
   TestGpuDownloadProtectionMirrors();
   TestCrossRegionUpload();
+  TestRegionBitmapHint();
   TestUploadDoesNotSerializeDisjointRegion();
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();

@@ -116,14 +116,14 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
-			GetSummary<source>().store(true, std::memory_order_release);
+			StoreSummary<source>(true);
 			if constexpr (source == DirtySource::Cpu) {
 				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
 			}
 		} else {
 			bits.UnsetRange(start, end);
 			if (bits.None()) {
-				GetSummary<source>().store(false, std::memory_order_release);
+				StoreSummary<source>(false);
 			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
@@ -141,7 +141,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if (bits.None()) {
-				GetSummary<source>().store(false, std::memory_order_release);
+				StoreSummary<source>(false);
 			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
@@ -154,9 +154,32 @@ public:
 		}
 	}
 
+	// The tracker mirrors the CPU summary in one bit per region (MemoryTracker::IsRangeCpuCleanHint).
+	// Set before the region is published.
+	void SetCpuSummaryBit(std::atomic<uint64_t>* word, uint64_t bit) noexcept {
+		m_cpu_summary_word = word;
+		m_cpu_summary_bit  = bit;
+	}
+
 	TrackingSpinLock lock;
 
 private:
+	// Every summary change goes through here; the CPU one is mirrored in the tracker's bitmap at
+	// the same point, before any page protection changes.
+	template <DirtySource source>
+	void StoreSummary(bool value) {
+		GetSummary<source>().store(value, std::memory_order_release);
+		if constexpr (source == DirtySource::Cpu) {
+			if (m_cpu_summary_word != nullptr) {
+				if (value) {
+					m_cpu_summary_word->fetch_or(m_cpu_summary_bit, std::memory_order_acq_rel);
+				} else {
+					m_cpu_summary_word->fetch_and(~m_cpu_summary_bit, std::memory_order_acq_rel);
+				}
+			}
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -222,6 +245,8 @@ private:
 	// The constructor fills m_cpu_dirty, so the CPU summary starts true.
 	std::atomic<bool> m_cpu_maybe_dirty {true};
 	std::atomic<bool> m_gpu_maybe_dirty {false};
+	std::atomic<uint64_t>* m_cpu_summary_word = nullptr;
+	uint64_t               m_cpu_summary_bit  = 0;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };
