@@ -58,6 +58,9 @@ private:
 	// for (SrtNative.h), compiling it once the plan is refreshed often enough.
 	void BindNative();
 	bool VerifyNative(Value value, bool native_ok, uint64_t native_result);
+	// A value from the native code's tables, evaluated with this walker's frame and mode.
+	bool EvaluateNative(const SrtNativeValue& value, uint64_t& result);
+	[[nodiscard]] bool UseNativeTables() const;
 
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
 	static float Float32(uint64_t bits);

@@ -921,6 +921,40 @@ std::unique_ptr<SrtNativeCode> SrtNativeCode::Compile(const ResourcePlan& progra
 	code->m_memory = memory;
 	// The entry thunk is emitted first.
 	code->m_entry = reinterpret_cast<Entry>(memory);
+	const auto resolve = [&](Value value) {
+		SrtNativeValue out;
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			out.kind = ImmediateBits(value, out.immediate) ? SrtNativeValue::Immediate
+			                                                : SrtNativeValue::Fail;
+			return out;
+		}
+		const auto* inst  = value.TryInstruction();
+		const auto  index = inst->EvaluationIndex(program.evaluation_value_count);
+		if (code->Has(SrtNativeMode::Self, index) && code->Has(SrtNativeMode::Split, index)) {
+			out.kind  = SrtNativeValue::Routine;
+			out.index = index;
+			out.inst  = inst;
+		} else {
+			out.kind = SrtNativeValue::Interpret;
+			out.inst = inst;
+		}
+		return out;
+	};
+	for (const auto& read: program.srt_reads) {
+		code->m_flat_reads.push_back(resolve(read.value));
+	}
+	for (const auto& block: program.control_flow) {
+		code->m_conditions.push_back(block.condition.IsEmpty() ? SrtNativeValue {}
+		                                                       : resolve(block.condition));
+	}
+	code->m_descriptor_dwords.resize(program.descriptor_sources.size() * 8u);
+	for (size_t source = 0; source < program.descriptor_sources.size(); source++) {
+		const auto& descriptor = program.descriptor_sources[source];
+		for (uint32_t dword = 0; dword < descriptor.dword_count && dword < 8u; dword++) {
+			code->m_descriptor_dwords[source * 8u + dword] = resolve(descriptor.dwords[dword]);
+		}
+	}
 	return code;
 }
 

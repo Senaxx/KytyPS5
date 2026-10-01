@@ -49,6 +49,17 @@ struct SrtNativeFrame {
 
 enum class SrtNativeMode : uint32_t { Self = 0, Split = 1 };
 
+// A plan value resolved once at compile time, so the walker's hot entry points (flat SRT reads,
+// descriptor dwords, control-flow conditions) need no Value::Resolve, memo index or routine
+// lookup per call: those touched the scattered IR nodes and were most of the remaining cost.
+struct SrtNativeValue {
+	enum Kind : uint8_t { Fail = 0, Immediate, Routine, Interpret };
+	Kind        kind      = Fail;
+	uint32_t    index     = 0;       // Routine: the instruction's evaluation index.
+	uint64_t    immediate = 0;       // Immediate: its bits, as EvaluateWide returns them.
+	const Inst* inst      = nullptr; // Routine and Interpret: the instruction.
+};
+
 // Totals of the plans compiled so far (SrtWalker.cpp).
 struct SrtNativeStats {
 	uint32_t plans        = 0;
@@ -81,6 +92,13 @@ public:
 	bool Evaluate(SrtNativeFrame& frame, SrtNativeMode mode, uint32_t index,
 	              uint64_t& result) const;
 
+	// The plan's srt_reads, control_flow conditions and descriptor dwords (8 per source).
+	[[nodiscard]] const std::vector<SrtNativeValue>& FlatReads() const { return m_flat_reads; }
+	[[nodiscard]] const std::vector<SrtNativeValue>& Conditions() const { return m_conditions; }
+	[[nodiscard]] const SrtNativeValue* DescriptorDwords(uint32_t source) const {
+		return &m_descriptor_dwords[static_cast<size_t>(source) * 8u];
+	}
+
 	[[nodiscard]] size_t CodeSize() const { return m_size; }
 	[[nodiscard]] uint32_t Instructions() const { return m_instructions; }
 	[[nodiscard]] uint32_t Interpreted() const { return m_interpreted; }
@@ -95,6 +113,9 @@ private:
 	Entry                 m_entry  = nullptr;
 	// Routine offsets by evaluation index, per mode; UINT32_MAX when the index has no routine.
 	std::vector<uint32_t> m_routines[2];
+	std::vector<SrtNativeValue> m_flat_reads;
+	std::vector<SrtNativeValue> m_conditions;
+	std::vector<SrtNativeValue> m_descriptor_dwords;
 	uint32_t              m_instructions = 0;
 	uint32_t              m_interpreted  = 0;
 };
