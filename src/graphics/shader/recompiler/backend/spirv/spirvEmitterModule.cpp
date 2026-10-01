@@ -13,7 +13,7 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 // KYTY_NO_FLOAT_CONTROLS="all" or "hash,hash,...": leave out SignedZeroInfNanPreserve for these
 // shaders. A diagnostic only: on the RTX 5090 (driver 616.92) NVIDIA's code for c7c9148c7b0fa86c is
 // the same with or without the mode (255 registers, 107,264 bytes).
-static bool FloatControlsDisabled(uint64_t shader_hash) {
+bool FloatControlsDisabled(uint64_t shader_hash) {
 	static const auto setting = [] {
 		struct Setting {
 			bool                  all = false;
@@ -798,7 +798,7 @@ void DefineModule(EmitterState& state) {
 	state.entry_label = state.builder.AllocateId();
 
 	state.builder.RequireCapability(spv::CapabilityShader);
-	const bool float_controls = !FloatControlsDisabled(state.program.shader_hash);
+	const bool float_controls = state.float_controls;
 	if (float_controls) {
 		state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
 	}

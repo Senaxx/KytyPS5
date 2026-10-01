@@ -80,6 +80,9 @@ struct SpirvRequirements {
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 
+// KYTY_NO_FLOAT_CONTROLS: shaders built without SignedZeroInfNanPreserve (spirvEmitterModule.cpp).
+bool FloatControlsDisabled(uint64_t shader_hash);
+
 struct EmitterState {
 	EmitterState(const IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -108,6 +111,9 @@ struct EmitterState {
 	uint32_t                                         tess_patch_base     = 0;
 
 	const SpirvRequirements                          requirements;
+	// SignedZeroInfNanPreserve for 32-bit floats: NaN-aware GLSL.std.450 operations (NMin, NMax,
+	// OpIsNan) then have the defined results the guest's IEEE instructions need.
+	const bool float_controls = !FloatControlsDisabled(program.shader_hash);
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
@@ -521,6 +527,9 @@ uint32_t EmitClassMaskBitMatch(EmitterState& state, uint32_t mask, uint32_t bit,
 uint32_t EmitClassMaskF32(EmitterState& state, uint32_t value, uint32_t mask);
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value);
+
+// Whether a 32-bit float is a NaN.
+uint32_t EmitIsNanF32(EmitterState& state, uint32_t value);
 
 inline constexpr auto EmitTruncF32Value = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;
 
