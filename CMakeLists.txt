@@ -430,6 +430,12 @@ if(KYTY_CLANG_CL)
 	target_link_options(shader_batch_tool PRIVATE "/DEBUG:FULL"
 		"/PDB:${CMAKE_CURRENT_BINARY_DIR}/shader_batch_tool.pdb")
 endif()
+# Times the driver's compile of SPIR-V modules, offline; a tool, not a test.
+add_executable(pipeline_build_timer EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PipelineBuildTimer.cpp")
+target_link_libraries(pipeline_build_timer Vulkan::Headers)
+# Checks the emitter's float min/max on the GPU (tests/data/float_minmax_check.spvasm); a tool.
+add_executable(float_minmax_check EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/FloatMinMaxCheck.cpp")
+target_link_libraries(float_minmax_check Vulkan::Headers)
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

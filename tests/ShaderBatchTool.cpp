@@ -478,6 +478,10 @@ void DumpSpirv(const char* subfolder, const std::string& name, const std::vector
 	std::ofstream(base / (name + ".spv"), std::ios::binary)
 	    .write(reinterpret_cast<const char*>(spirv.data()),
 	           static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)));
+	// KYTY_BATCH_DUMP_SPV_ONLY: the module alone, for runs over thousands of shaders.
+	if (std::getenv("KYTY_BATCH_DUMP_SPV_ONLY") != nullptr) {
+		return;
+	}
 	std::string source;
 	spvtools::SpirvTools(SPV_ENV_VULKAN_1_3)
 	    .Disassemble(spirv, &source, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES);

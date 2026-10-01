@@ -1,0 +1,77 @@
+; The float min/max sequence spirvEmitterAluHelpers.cpp emits with float controls on
+; (EmitMinMaxF32Value) and its NaN test (EmitIsNanF32), run by float_minmax_check.
+; Buffer words per invocation: [a, b, max, min, isnan(a), unused].
+               OpCapability Shader
+               OpCapability SignedZeroInfNanPreserve
+               OpExtension "SPV_KHR_float_controls"
+          %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %buf
+               OpExecutionMode %main LocalSize 64 1 1
+               OpExecutionMode %main SignedZeroInfNanPreserve 32
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %rta ArrayStride 4
+               OpMemberDecorate %Buf 0 Offset 0
+               OpDecorate %Buf Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+       %fnty = OpTypeFunction %void
+       %uint = OpTypeInt 32 0
+      %float = OpTypeFloat 32
+       %bool = OpTypeBool
+     %v3uint = OpTypeVector %uint 3
+  %ptr_in_v3 = OpTypePointer Input %v3uint
+        %gid = OpVariable %ptr_in_v3 Input
+        %rta = OpTypeRuntimeArray %uint
+        %Buf = OpTypeStruct %rta
+ %ptr_sb_Buf = OpTypePointer StorageBuffer %Buf
+        %buf = OpVariable %ptr_sb_Buf StorageBuffer
+   %ptr_sb_u = OpTypePointer StorageBuffer %uint
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_2 = OpConstant %uint 2
+     %uint_3 = OpConstant %uint 3
+     %uint_4 = OpConstant %uint 4
+     %uint_6 = OpConstant %uint 6
+   %uint_abs = OpConstant %uint 2147483647
+       %main = OpFunction %void None %fnty
+      %entry = OpLabel
+          %g = OpLoad %v3uint %gid
+          %i = OpCompositeExtract %uint %g 0
+       %base = OpIMul %uint %i %uint_6
+      %ia = OpIAdd %uint %base %uint_0
+      %ib = OpIAdd %uint %base %uint_1
+     %imax = OpIAdd %uint %base %uint_2
+     %imin = OpIAdd %uint %base %uint_3
+     %inan = OpIAdd %uint %base %uint_4
+      %pa = OpAccessChain %ptr_sb_u %buf %uint_0 %ia
+      %pb = OpAccessChain %ptr_sb_u %buf %uint_0 %ib
+   %abits = OpLoad %uint %pa
+   %bbits = OpLoad %uint %pb
+       %a = OpBitcast %float %abits
+       %b = OpBitcast %float %bbits
+    %nmax = OpExtInst %float %glsl NMax %a %b
+    %nmin = OpExtInst %float %glsl NMin %a %b
+    %la = OpBitcast %uint %a
+    %lb = OpBitcast %uint %b
+      %or = OpBitwiseOr %uint %la %lb
+   %orabs = OpBitwiseAnd %uint %or %uint_abs
+      %bz = OpIEqual %bool %orabs %uint_0
+    %andb = OpBitwiseAnd %uint %la %lb
+    %zmax = OpBitcast %float %andb
+    %zmin = OpBitcast %float %or
+    %rmax = OpSelect %float %bz %zmax %nmax
+    %rmin = OpSelect %float %bz %zmin %nmin
+   %omax = OpBitcast %uint %rmax
+   %omin = OpBitcast %uint %rmin
+   %pmax = OpAccessChain %ptr_sb_u %buf %uint_0 %imax
+   %pmin = OpAccessChain %ptr_sb_u %buf %uint_0 %imin
+               OpStore %pmax %omax
+               OpStore %pmin %omin
+     %isn = OpIsNan %bool %a
+    %nanu = OpSelect %uint %isn %uint_1 %uint_0
+   %pnan = OpAccessChain %ptr_sb_u %buf %uint_0 %inan
+               OpStore %pnan %nanu
+               OpReturn
+               OpFunctionEnd
