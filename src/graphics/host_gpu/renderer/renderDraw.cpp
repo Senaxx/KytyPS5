@@ -1148,10 +1148,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
 		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
+		if (draw.instance_count > limits.maxMeshWorkGroupCount[1]) {
 			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
 			     draw.instance_count);
 		}
@@ -1239,14 +1236,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		// at dwords 4-5's address + 8 (the shader's other draw dwords are unused then).
 		const bool     gpu_args = emit.gpu_args_address != 0;
 		const uint32_t draw_data[] {
-		    gpu_args ? 0u : draw.index_count,
-		    gpu_args ? 0u
-		             : draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
-		                                : emit.first_vertex,
-		    gpu_args ? 0u : emit.first_instance,
-		    gpu_args ? 0xFFFFFFFFu : index_source.guest_element_size,
-		    static_cast<uint32_t>(gpu_args ? emit.gpu_args_address : index_source.address),
-		    static_cast<uint32_t>((gpu_args ? emit.gpu_args_address : index_source.address) >> 32u)};
+		gpu_args ? 0u : draw.index_count,
+		gpu_args ? 0u
+		: draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset)
+				: emit.first_vertex,
+		gpu_args ? 0u : emit.first_instance,
+		gpu_args ? 0xFFFFFFFFu : index_source.guest_element_size,
+		static_cast<uint32_t>(gpu_args ? emit.gpu_args_address : index_source.address),
+		static_cast<uint32_t>((gpu_args ? emit.gpu_args_address : index_source.address) >> 32u),
+		0};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
@@ -1313,7 +1311,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (mesh_indirect_buffer) {
 			vk_buffer.drawMeshTasksIndirectEXT(mesh_indirect_buffer, mesh_indirect_offset, 1, 16u);
 		} else {
-			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+			constexpr auto base_offset = (ShaderRecompiler::IR::PushData::MeshDrawDwordCount - 1u) *
+			                             sizeof(uint32_t);
+			const auto& limits = m_context.GetGraphics().mesh_shader_properties;
+			const auto  per_draw =
+				std::min<uint64_t>(limits.maxMeshWorkGroupCount[0],
+								  std::max<uint64_t>(
+										1u, limits.maxMeshWorkGroupTotalCount / draw.instance_count));
+			uint32_t groups_done = 0;
+			do {
+				const auto groups = static_cast<uint32_t>(
+					std::min<uint64_t>(mesh_groups - groups_done, per_draw));
+				if (groups_done != 0) {
+					vk_buffer.pushConstants(pipeline.pipeline_layout,
+											 vk::ShaderStageFlagBits::eMeshEXT, base_offset,
+											 sizeof(groups_done), &groups_done);
+				}
+				vk_buffer.drawMeshTasksEXT(groups, draw.instance_count, 1);
+				groups_done += groups;
+			} while (groups_done < mesh_groups);
 		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
