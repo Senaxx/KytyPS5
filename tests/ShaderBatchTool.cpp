@@ -672,10 +672,9 @@ void RunShader(const std::filesystem::path& folder, const ManifestRow& row) {
 	const auto translate_begin = std::chrono::steady_clock::now();
 	auto       translated      = ShaderRecompiler::TranslateProgram(params.code, options);
 	const auto translate_ms    = MillisecondsSince(translate_begin);
-	const char* outcome        = translated.skip_dispatch ? "ray tracing"
-	                             : translated.unsupported ? "gave up"
-	                                                      : "ok";
-	const bool   ok         = !translated.skip_dispatch && !translated.unsupported;
+	// Upstream executes BVH dispatches now (337f4320): no "ray tracing" outcome any more.
+	const char* outcome        = translated.unsupported ? "gave up" : "ok";
+	const bool   ok         = !translated.unsupported;
 	const bool   dispatcher = ok && translated.program.dispatcher_fallback;
 	const size_t blocks     = ok ? translated.program.blocks.size() : 0;
 	double       plan_ms    = 0;

@@ -662,6 +662,15 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			// A plan without control flow cannot tell a guarded read from an active one: a
+			// failed read through a null base there reads zero (CS 0x0b4b91abfed42248 tests
+			// s[4:5] against zero before its s_load; failing skipped its dispatch every frame).
+			// With control flow, the reachability walk skips guarded reads and a null read in a
+			// reachable block fails (ResourceTrackingTests, guarded scalar descriptor reads).
+			if (base == 0 && m_program.control_flow.empty()) {
+				result = 0;
+				return true;
+			}
 			m_read_failure         = "guest memory unreadable";
 			m_read_failure_address = address;
 			m_read_failure_offset  = 0;

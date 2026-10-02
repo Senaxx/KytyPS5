@@ -655,7 +655,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::EliminateDeadCode(ir.blocks);
 	// Mask reads that fold can make select conditions and phis identical: fold until stable.
 	for (int round = 0; round < 4 && IR::FoldLaneMasks(ir) != 0; round++) {
-		IR::ConstantPropagationPass(ir.blocks);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
@@ -663,7 +663,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
 		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
 		     GetDumpLabel(options), options.shader_hash, folded);
-		IR::ConstantPropagationPass(ir.blocks);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::ResolveControlFlowIdentities(ir);
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
