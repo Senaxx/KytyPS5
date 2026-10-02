@@ -9998,21 +9998,6 @@ void TestCapturedBufferAtomicsX2() {
 
 // DS_ADD_U64 (one engine compute shader) runs as two 32-bit LDS adds: the low dword's, then the
 // high dword's with the low one's carry.
-void TestDsAddU64() {
-  const uint32_t shader[] = {
-      EncodeDs0(0x40, 8), EncodeDs1(0, 2, 1), // ds_add_u64 v1, v[2:3] offset:8
-      0xbf810000u,
-  };
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-  const auto result = RecompileForTest(shader, options);
-  Check(result.decoded_dump.find("DS_ADD_U64") != std::string::npos,
-        "new decoder did not decode DS_ADD_U64");
-  CheckSpirvBinaryValidates(result.spirv);
-  Check(SpirvInstructionOpcodeCount(result.spirv, 234u) == 2u,
-        "DS_ADD_U64 did not become two 32-bit LDS atomic adds");
-}
-
 // A wave reduction as compilers write it for RDNA: with every lane enabled, v_max_u32 over a DPP
 // row_shr scan (1, 2, 4, 8) of each row of 16 lanes, then v_readlane of each row's last lane
 // (wave32: lanes 15 and 31), or, after V_PERMLANEX16 adds the other row's last lane, of each row
@@ -14863,7 +14848,6 @@ int main() {
   TestNewShaderRecompilerBufferLoadsGuardedByExec();
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
-  TestDsAddU64();
   TestFloat64AddAndCompares();
   TestWaveRowReduction();
   TestDisabledDebugBranches();

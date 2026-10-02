@@ -695,7 +695,6 @@ void Translator::FLAT_APERTURE(const Decoder::Instruction& inst, bool store) {
 }
 
 void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
-	if (inst.memory_segment == 0u) return FLAT_APERTURE(inst, false);
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
@@ -724,7 +723,6 @@ void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
 }
 
 void Translator::FLAT_STORE(const Decoder::Instruction& inst) {
-	if (inst.memory_segment == 0u) return FLAT_APERTURE(inst, true);
 	const auto      memory  = MemoryInfoFromDecoded(inst);
 	const auto      data_op = MemorySourceAt(inst, 0);
 	const auto      address = ReadAddressOperands(inst, 1);
@@ -1137,7 +1135,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
-		case Decoder::Opcode::DS_ADD_U64: return DS_ADD_U64(inst);
 
 		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCompareSwap32);
@@ -1181,7 +1178,6 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::FLAT_STORE_DWORDX4: return FLAT_STORE(inst);
 
 		case Decoder::Opcode::IMAGE_GET_RESINFO: return IMAGE_GET_RESINFO(inst);
-		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 		case Decoder::Opcode::IMAGE_GET_LOD: return IMAGE_GET_LOD(inst);
 		case Decoder::Opcode::IMAGE_LOAD:
 		case Decoder::Opcode::IMAGE_LOAD_MIP: return IMAGE_LOAD(inst);

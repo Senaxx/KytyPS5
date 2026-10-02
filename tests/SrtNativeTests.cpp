@@ -176,7 +176,7 @@ ResourcePlan BuildPlan() {
 		auto& read          = b.AppendNewInst(ValueOpcode::ReadConstBuffer, {Value(&buffer_handle), s10});
 		read.SetFlags(MemoryFlags {.index = 2, .pc = 0x44});
 		add(Value(&read));
-		// A null base reads zero.
+		// A null base fails in both, as upstream requires (ResourceTrackingTests, guarded reads).
 		auto& null_handle = b.AppendNewInst(ValueOpcode::GetAddressResource, {Value(0u), Value(0u)});
 		auto& null_read   = b.AppendNewInst(ValueOpcode::LoadAddressU32,
 		                                    {Value(&null_handle), s10, Value(0u), Value(true)});

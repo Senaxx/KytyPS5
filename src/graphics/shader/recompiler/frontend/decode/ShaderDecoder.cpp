@@ -259,9 +259,7 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 235u: operand.kind = OperandKind::SharedBase; return;
 		case 237u: operand.kind = OperandKind::PrivateBase; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
-		case 235u: operand.kind = OperandKind::SharedBase; return;
 		case 236u: operand.kind = OperandKind::SharedLimit; return;
-		case 237u: operand.kind = OperandKind::PrivateBase; return;
 		case 238u: operand.kind = OperandKind::PrivateLimit; return;
 		case 248u:
 			operand.kind      = OperandKind::FloatInlineConstant;
@@ -718,7 +716,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
-		case Opcode::DS_ADD_U64:
 		case Opcode::DS_WRXCHG_RTN_B32:
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:

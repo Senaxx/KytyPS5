@@ -94,10 +94,6 @@ struct SrtNativeHelpers {
 		uint32_t word   = 0;
 		if (walker.m_runtime.read_memory != nullptr) {
 			if (!walker.m_runtime.read_memory(walker.m_runtime.userdata, address, {&word, 1})) {
-				if (base == 0) {
-					*result = 0;
-					return true;
-				}
 				walker.m_read_failure         = "guest memory unreadable";
 				walker.m_read_failure_address = address;
 				walker.m_read_failure_offset  = 0;
