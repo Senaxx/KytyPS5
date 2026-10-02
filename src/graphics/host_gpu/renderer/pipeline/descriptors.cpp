@@ -1588,13 +1588,43 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
+				const auto& extents = writer->runtime->resources->buffer_write_extents;
 				for (uint32_t i = 0; i < writer->buffer_sources.size(); ++i) {
 					const auto resource = program.bindings.descriptors.front().resources[i];
 					if (!program.info.buffers[resource].written) continue;
 					const auto& written = writer->buffer_sources[i];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap a shader buffer write\n");
+					// The bytes the dispatch can store to, when its stores are bounded
+					// (BufferWriteExtent): a title's heap-wide V# otherwise covers the whole
+					// heap and every descriptor read in it.
+					auto written_address = written.address;
+					auto written_size    = written.size;
+					if (resource < extents.size() && extents[resource].valid) {
+						written_address += extents[resource].begin;
+						written_size = extents[resource].end > extents[resource].begin
+						                   ? extents[resource].end - extents[resource].begin
+						                   : 0;
+					}
+					if (written_size != 0 &&
+					    ImageRangeOverlaps(address, size, written_address, written_size)) {
+						// Upstream (6409be28) exits here. Wolverine's CS 0x85a58319a7a75e48 reads a
+						// branch input from a 256-byte buffer the same dispatch updates; the host
+						// evaluates it from the state before the dispatch, as the walk before this
+						// check did (and the game ran correctly). Reported once per shader pair.
+						static std::mutex                   reported_mutex;
+						static std::unordered_set<uint64_t> reported;
+						const auto reader_hash = reader->runtime->program->shader_hash;
+						std::scoped_lock lock(reported_mutex);
+						if (reported.insert(reader_hash ^ (program.shader_hash << 1u)).second) {
+							LOGF("Warning: scalar resource reads overlap a shader buffer write: "
+							     "reader 0x%016" PRIx64 " reads 0x%" PRIx64 "+0x%" PRIx64
+							     ", writer 0x%016" PRIx64 " buffer %u writes 0x%" PRIx64 "+0x%" PRIx64
+							     " (descriptor 0x%" PRIx64 "+0x%" PRIx64 ", extent %s)\n",
+							     reader_hash, address, size, program.shader_hash, resource,
+							     written_address, written_size, written.address, written.size,
+							     resource < extents.size() && extents[resource].valid ? "bounded"
+							                                                          : "none");
+						}
+						continue;
 					}
 				}
 			}
