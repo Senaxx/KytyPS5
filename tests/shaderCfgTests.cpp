@@ -10962,7 +10962,8 @@ void TestMeshInputAssembly() {
     }
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id &&
-              vgprs[test.fast_launch ? 6 : 8] == 9u,
+              // Fast launch: the instance alone; the shader adds its start-instance SGPR.
+              vgprs[test.fast_launch ? 6 : 8] == (test.fast_launch ? 2u : 9u),
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
 }

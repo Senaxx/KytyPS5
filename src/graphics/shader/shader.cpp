@@ -783,10 +783,12 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	// NGG can export indexed primitives independently of the output vertex count. In particular,
 	// meshlet shaders can emit more triangles than vertices - 2 (the title's forest).
 	const auto primitive_amplification = sh.m_geNggSubgrpCntl & 0x1ffu;
-	mesh.max_primitives =
-	    mesh.fast_launch ? mesh.max_vertices
-	                     : group.primitive_group_size *
-	                           std::max(sh.m_vgtGsMaxVertOut - 2u, primitive_amplification);
+	// Fast launch (mesh shader mode) takes its primitive capacity from PRIM_AMP_FACTOR as well:
+	// a meshlet usually emits more triangles than vertices.
+	mesh.max_primitives = mesh.fast_launch
+	                          ? std::max(mesh.max_vertices, primitive_amplification)
+	                          : group.primitive_group_size *
+	                                std::max(sh.m_vgtGsMaxVertOut - 2u, primitive_amplification);
 	mesh.primitives_per_group = std::min({static_cast<uint32_t>(group.primitive_group_size),
 	                                      mesh.InputPrimitiveCount(group.vertex_group_size),
 	                                      mesh.max_vertices / sh.m_vgtGsMaxVertOut});
