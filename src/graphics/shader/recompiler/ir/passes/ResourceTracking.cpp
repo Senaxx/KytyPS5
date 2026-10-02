@@ -1945,9 +1945,11 @@ private:
 	bool TryMakeFiniteImage(Inst& handle, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u)
 			return false;
+		// Only samples switch between the candidates (EmitImageSample; ApplyResourceSpecialization
+		// stops on any other use of an indirect root): a gather through a finite image ended the
+		// emulator on Wolverine's CS 0xe85f0949639c797e at boot.
 		if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
-			const auto op = use.user->GetOpcode();
-			return op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw;
+			return use.user->GetOpcode() != ValueOpcode::ImageSampleRaw;
 		})) return false;
 		bool has_phi = false;
 		for (size_t word = 0; word < handle.NumArgs(); ++word) has_phi |= handle.Arg(word).Resolve().IsPhi();
