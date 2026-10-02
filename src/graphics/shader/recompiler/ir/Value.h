@@ -170,6 +170,10 @@ private:
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
+	// The operand slot itself, whatever storage the arity uses; no use-list bookkeeping.
+	Value& ArgSlot(size_t index);
+	// Back to empty inline storage without touching any use list.
+	void ResetArgStorage();
 
 	static constexpr uint8_t InlineArity = 4;
 	static constexpr uint8_t PhiArity = UINT8_MAX;

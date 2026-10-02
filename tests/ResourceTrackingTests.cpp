@@ -2710,6 +2710,8 @@ void TestFiniteImageBitScanSentinel() {
               image.Instruction()->Arg(0).Instruction()->NumPhiBlocks() == 2,
           "nonzero bit scan retained its impossible sentinel or removed a Phi edge");
   }
+}
+
 // A sampler read from a heap at a GPU-selected key gets a fixed sampler, and the heap reads it
 // strands become planning-only (no load). Six effect shaders also use one of those reads as data
 // (the register is reused after a branch); planning-only, it left that data without a value.

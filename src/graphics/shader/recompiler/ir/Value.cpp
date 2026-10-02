@@ -215,8 +215,8 @@ void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
 	auto* replacement_inst = replacement.TryInstruction();
 	uses.clear();
 	for (const auto& use: old_uses) {
-		EXIT_IF(use.operand >= use.user->args.size() || use.user->args[use.operand].TryInstruction() != this);
-		use.user->args[use.operand] = replacement;
+		EXIT_IF(use.operand >= use.user->NumArgs() || use.user->Arg(use.operand).TryInstruction() != this);
+		use.user->ArgSlot(use.operand) = replacement;
 		if (replacement_inst != nullptr) {
 			// That slot held this instruction until now, so the replacement cannot list it yet.
 			replacement_inst->uses.push_back({use.user, use.operand});
@@ -264,20 +264,19 @@ void Inst::ReplaceUsesForRemoval(Value replacement, const std::unordered_set<con
 		if (use.user == this || removed.contains(use.user)) {
 			continue;
 		}
-		EXIT_IF(use.operand >= use.user->args.size() ||
-		        use.user->args[use.operand].TryInstruction() != this);
-		use.user->args[use.operand] = replacement;
+		EXIT_IF(use.operand >= use.user->NumArgs() ||
+		        use.user->Arg(use.operand).TryInstruction() != this);
+		use.user->ArgSlot(use.operand) = replacement;
 		if (replacement_inst != nullptr) {
 			replacement_inst->uses.push_back({use.user, use.operand});
 		}
 	}
-	for (const auto& arg: args) {
-		if (auto* target = arg.TryInstruction(); target != nullptr && target != this) {
+	for (size_t index = 0; index < NumArgs(); index++) {
+		if (auto* target = Arg(index).TryInstruction(); target != nullptr && target != this) {
 			touched.push_back(target);
 		}
 	}
-	args.clear();
-	phi_blocks.clear();
+	ResetArgStorage();
 	opcode = ValueOpcode::Void;
 }
 
@@ -297,10 +296,30 @@ void Inst::DropRemovedUses(std::span<Inst* const>              touched,
 
 void Inst::DropForDestruction() {
 	// Every instruction that could refer to this one is being destroyed with it.
-	args.clear();
-	phi_blocks.clear();
+	ResetArgStorage();
 	uses.clear();
 	opcode = ValueOpcode::Void;
+}
+
+Value& Inst::ArgSlot(size_t index) {
+	EXIT_IF(index >= NumArgs());
+	if (num_args <= InlineArity) {
+		return fixed_args[index];
+	}
+	return num_args == PhiArity ? phi_args[index].second : large_args[index];
+}
+
+void Inst::ResetArgStorage() {
+	if (num_args == PhiArity) {
+		std::destroy_at(&phi_args);
+		std::construct_at(&fixed_args);
+	} else if (num_args > InlineArity) {
+		std::destroy_at(&large_args);
+		std::construct_at(&fixed_args);
+	} else {
+		fixed_args.fill(Value {});
+	}
+	num_args = 0;
 }
 
 void Inst::ClearArgs() {

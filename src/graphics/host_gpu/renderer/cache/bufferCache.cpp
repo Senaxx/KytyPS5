@@ -126,11 +126,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	const auto capacity = m_download_buffer.Size();
 	bool       any      = false;
 	for (uint64_t offset = 0; offset < size; offset += capacity) {
-		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+		any |= DownloadBufferWindow<async>(buffer, vaddr + offset, std::min(capacity, size - offset));
 	}
 	return any;
 }
 
+template <bool async>
 bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
@@ -170,12 +171,13 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 		for (auto& copy: batch) {
 			copy.dstOffset -= base;
 		}
-		DownloadBufferCopies(buffer, std::move(batch), batch_size);
+		DownloadBufferCopies<async>(buffer, std::move(batch), batch_size);
 		first = last;
 	}
 	return true;
 }
 
+template <bool async>
 void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
                                        uint64_t total_size) {
 	const auto buffer_address = buffer.CpuAddress();
@@ -240,7 +242,6 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
 	}
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -937,7 +938,7 @@ void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
 		auto&      buffer = m_slot_buffers[it->second];
 		const auto begin  = std::max(vaddr, buffer.CpuAddress());
 		const auto end    = std::min(vaddr + size, buffer.CpuAddress() + buffer.Size());
-		if (begin < end && DownloadBufferMemory(buffer, begin, end - begin)) {
+		if (begin < end && DownloadBufferMemory<true>(buffer, begin, end - begin)) {
 			downloaded.emplace_back(begin, end - begin);
 		}
 	}
