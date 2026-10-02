@@ -1565,24 +1565,39 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	// Scalar reads the host specialized on must not overlap what this draw or dispatch writes.
+	// The written ranges are gathered once, and a reader's reads are compared one by one only
+	// against a range that meets their span: a per-read scan of every bound image and written
+	// buffer cost the jungle 1.6 fps (11.1 against 12.7, warm).
+	struct WrittenRange {
+		uint64_t                                address = 0;
+		uint64_t                                size    = 0;
+		const ShaderRecompiler::IR::CompiledShaderInfo* writer = nullptr; // null: an image or target
+		uint32_t                                resource = 0;
+		uint64_t                                descriptor_address = 0;
+		uint64_t                                descriptor_size    = 0;
+		bool                                    bounded  = false;
+	};
+	std::vector<WrittenRange> written_ranges;
+	bool                      written_gathered = false;
 	for (const auto* reader: prepared_bindings) {
 		const auto& reads = reader->runtime->resources->specialization_reads;
 		if (reads.empty()) continue;
-		for (const auto* writer: prepared_bindings) {
-			if (writer->runtime->program->has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+		if (!written_gathered) {
+			written_gathered = true;
+			for (const auto* writer: prepared_bindings) {
+				if (writer->runtime->program->has_address_writes) {
+					EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+				}
 			}
-		}
-		for (const auto [address, size]: reads) {
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
 				    (!image->binding.shader_write && !image->binding.is_target)) continue;
 				for (const auto written: {image->info.data, image->info.stencil,
 				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
-						EXIT("scalar resource reads overlap an image or attachment write\n");
+					if (written.size != 0) {
+						written_ranges.push_back({.address = written.address, .size = written.size});
 					}
 				}
 			}
@@ -1596,37 +1611,62 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					// The bytes the dispatch can store to, when its stores are bounded
 					// (BufferWriteExtent): a title's heap-wide V# otherwise covers the whole
 					// heap and every descriptor read in it.
-					auto written_address = written.address;
-					auto written_size    = written.size;
-					if (resource < extents.size() && extents[resource].valid) {
+					auto       written_address = written.address;
+					auto       written_size    = written.size;
+					const bool bounded = resource < extents.size() && extents[resource].valid;
+					if (bounded) {
 						written_address += extents[resource].begin;
 						written_size = extents[resource].end > extents[resource].begin
 						                   ? extents[resource].end - extents[resource].begin
 						                   : 0;
 					}
-					if (written_size != 0 &&
-					    ImageRangeOverlaps(address, size, written_address, written_size)) {
-						// Upstream (6409be28) exits here. Wolverine's CS 0x85a58319a7a75e48 reads a
-						// branch input from a 256-byte buffer the same dispatch updates; the host
-						// evaluates it from the state before the dispatch, as the walk before this
-						// check did (and the game ran correctly). Reported once per shader pair.
-						static std::mutex                   reported_mutex;
-						static std::unordered_set<uint64_t> reported;
-						const auto reader_hash = reader->runtime->program->shader_hash;
-						std::scoped_lock lock(reported_mutex);
-						if (reported.insert(reader_hash ^ (program.shader_hash << 1u)).second) {
-							LOGF("Warning: scalar resource reads overlap a shader buffer write: "
-							     "reader 0x%016" PRIx64 " reads 0x%" PRIx64 "+0x%" PRIx64
-							     ", writer 0x%016" PRIx64 " buffer %u writes 0x%" PRIx64 "+0x%" PRIx64
-							     " (descriptor 0x%" PRIx64 "+0x%" PRIx64 ", extent %s)\n",
-							     reader_hash, address, size, program.shader_hash, resource,
-							     written_address, written_size, written.address, written.size,
-							     resource < extents.size() && extents[resource].valid ? "bounded"
-							                                                          : "none");
-						}
-						continue;
+					if (written_size != 0) {
+						written_ranges.push_back({.address            = written_address,
+						                          .size               = written_size,
+						                          .writer             = &program,
+						                          .resource           = resource,
+						                          .descriptor_address = written.address,
+						                          .descriptor_size    = written.size,
+						                          .bounded            = bounded});
 					}
 				}
+			}
+		}
+		if (written_ranges.empty()) break;
+		uint64_t span_begin = UINT64_MAX;
+		uint64_t span_end   = 0;
+		for (const auto [address, size]: reads) {
+			span_begin = std::min(span_begin, address);
+			span_end   = std::max(span_end, address + size);
+		}
+		for (const auto& written: written_ranges) {
+			if (span_end <= span_begin ||
+			    !ImageRangeOverlaps(span_begin, span_end - span_begin, written.address, written.size)) {
+				continue;
+			}
+			for (const auto [address, size]: reads) {
+				if (!ImageRangeOverlaps(address, size, written.address, written.size)) continue;
+				if (written.writer == nullptr) {
+					EXIT("scalar resource reads overlap an image or attachment write\n");
+				}
+				// Upstream (6409be28) exits here. Wolverine's CS 0x85a58319a7a75e48 reads a
+				// branch input from a 256-byte buffer the same dispatch updates; the host
+				// evaluates it from the state before the dispatch, as the walk before this
+				// check did (and the game ran correctly). Reported once per shader pair.
+				static std::mutex                   reported_mutex;
+				static std::unordered_set<uint64_t> reported;
+				const auto reader_hash = reader->runtime->program->shader_hash;
+				std::scoped_lock lock(reported_mutex);
+				if (reported.insert(reader_hash ^ (written.writer->shader_hash << 1u)).second) {
+					LOGF("Warning: scalar resource reads overlap a shader buffer write: "
+					     "reader 0x%016" PRIx64 " reads 0x%" PRIx64 "+0x%" PRIx64
+					     ", writer 0x%016" PRIx64 " buffer %u writes 0x%" PRIx64 "+0x%" PRIx64
+					     " (descriptor 0x%" PRIx64 "+0x%" PRIx64 ", extent %s)\n",
+					     reader_hash, address, size, written.writer->shader_hash, written.resource,
+					     written.address, written.size, written.descriptor_address,
+					     written.descriptor_size, written.bounded ? "bounded" : "none");
+				}
+				break;
 			}
 		}
 	}
