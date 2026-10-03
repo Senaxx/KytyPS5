@@ -40,17 +40,42 @@ namespace {
 		}
 	}
 	if (info.IsVolume()) {
-		// 2D views of a volume. RADV refuses them for a block-compressed volume (BC7 sRGB 3D on an
-		// RX 9070 XT, ISSUES.md #16); such a volume is created without them and gets 3D views only
-		// (IsValidViewType).
-		const auto with_2d = flags | vk::ImageCreateFlagBits::e2DArrayCompatible;
-		if (!info.IsBlock() ||
-		    graphics.GetImageFormatProperties(
+		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+	}
+	if (!info.IsVolume() || !info.IsBlock()) {
+		return flags;
+	}
+	// RADV refuses a BC7 sRGB volume with block texel views (RX 9070 XT, ISSUES.md #16; found by
+	// vMohammad24). Optional flags are dropped, least needed first, until the device accepts the
+	// sampled image: uncompressed views (only for guest writes, which need storage usage as well),
+	// 2D views (IsValidViewType then allows 3D views only), then other formats' views.
+	using Bit = vk::ImageCreateFlagBits;
+	const vk::ImageCreateFlags drops[] = {
+	    {},
+	    Bit::eBlockTexelViewCompatible,
+	    Bit::eBlockTexelViewCompatible | Bit::e2DArrayCompatible,
+	    Bit::e2DArrayCompatible | Bit::eBlockTexelViewCompatible | Bit::eExtendedUsage,
+	    Bit::e2DArrayCompatible | Bit::eBlockTexelViewCompatible | Bit::eExtendedUsage |
+	        Bit::eMutableFormat,
+	};
+	for (const auto drop: drops) {
+		const auto candidate = flags & ~drop;
+		if (graphics.GetImageFormatProperties(
 		        info.pixel_format, vk::ImageType::e3D, vk::ImageTiling::eOptimal,
 		        vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
 		            vk::ImageUsageFlagBits::eSampled,
-		        with_2d, nullptr) == vk::Result::eSuccess) {
-			flags = with_2d;
+		        candidate, nullptr) == vk::Result::eSuccess) {
+			if (drop) {
+				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+				if (!logged.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Vulkan image: block-compressed volume {} created without flags 0x{:x} "
+					    "(the device does not support them)\n",
+					    vk::to_string(info.pixel_format),
+					    static_cast<vk::ImageCreateFlags::MaskType>(flags & drop)));
+				}
+			}
+			return candidate;
 		}
 	}
 	return flags;
