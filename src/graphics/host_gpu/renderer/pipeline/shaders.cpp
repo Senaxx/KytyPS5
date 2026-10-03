@@ -330,6 +330,29 @@ PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipel
 		                                      .module = pixel_program.module,
 		                                      .pName  = "main"};
 	}
+	// One guest wave per host subgroup where the device lets the stage require it (mesh and
+	// pixel shaders on AMD); GraphicsSubgroupSize and the mesh's host_subgroup_size agree.
+	for (uint32_t index = 0; index < shader_stage_count; index++) {
+		auto&      stage   = build.stages[index];
+		const bool is_mesh = stage.stage == vk::ShaderStageFlagBits::eMeshEXT;
+		if (!is_mesh && stage.stage != vk::ShaderStageFlagBits::eFragment) {
+			continue;
+		}
+		const auto wave_size = is_mesh ? vs_input_info.mesh.wave_size
+		                               : ps_input_info->stage.program->wave_size;
+		const auto required  = graphics.GraphicsSubgroupSize(stage.stage, wave_size);
+		if (required != 0) {
+			build.subgroup_sizes[index].requiredSubgroupSize = required;
+			stage.pNext = &build.subgroup_sizes[index];
+		} else if (wave_size < graphics.subgroup_size) {
+			static std::atomic_bool logged {false};
+			if (!logged.exchange(true)) {
+				LOGF("Vulkan subgroup: wave%u %s shader on a %u-wide host subgroup the device "
+				     "cannot narrow; its lane operations mix two waves\n",
+				     wave_size, is_mesh ? "mesh" : "pixel", graphics.subgroup_size);
+			}
+		}
+	}
 
 	auto& input_attr = build.input_attr;
 	auto& input_desc = build.input_desc;

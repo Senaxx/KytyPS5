@@ -1001,7 +1001,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	if (mesh_active) {
 		EXIT_NOT_IMPLEMENTED(!m_graphics.mesh_shader_enabled);
 		auto& mesh              = vertex_info[0].mesh;
-		mesh.host_subgroup_size = m_graphics.subgroup_size;
+		// The pipeline requires the wave size where it can (PrepareGraphicsPipeline).
+		const auto required =
+		    m_graphics.GraphicsSubgroupSize(vk::ShaderStageFlagBits::eMeshEXT, mesh.wave_size);
+		mesh.host_subgroup_size = required != 0 ? required : m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
 		// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its
 		// waves in passes; see EmitMeshEntryPoint.
