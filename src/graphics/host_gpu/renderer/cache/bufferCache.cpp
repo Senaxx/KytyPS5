@@ -328,6 +328,16 @@ bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
 	return true;
 }
 
+// A game thread's fault on GPU-written memory no longer makes the GPU thread wait for the GPU.
+// The GPU thread records the download, submits it and goes on; the faulting thread waits for
+// that download's publication itself, then asks again (the window's pages then have no
+// GPU-written bytes left and their protection is lifted). KYTY_ASYNC_READBACK=0 waits on the GPU
+// thread as before.
+static const bool g_async_readback = [] {
+	const char* value = std::getenv("KYTY_ASYNC_READBACK");
+	return value == nullptr || value[0] != '0';
+}();
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	KYTY_PROFILER_FUNCTION();
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -336,102 +346,175 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     vaddr, size);
 	}
 	const bool from_gpu_thread = GuestGpu::IsGpuThread();
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, from_gpu_thread] {
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
+	const bool async           = g_async_readback && !from_gpu_thread;
+	for (;;) {
+		uint64_t wait_tick = 0;
+		m_scheduler.Context().GetGpu().SendCommandSync(
+		    [this, vaddr, size, is_write, from_gpu_thread, async, &wait_tick] {
+			    wait_tick = ReadMemoryStep(vaddr, size, is_write, from_gpu_thread, async);
+		    });
+		if (wait_tick == 0) {
 			return;
 		}
-		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+		m_scheduler.WaitPriorityOperations(wait_tick);
+	}
+}
 
-		// Diagnostics: whether the bytes the faulting access touches were written by the GPU
-		// (true sharing) or only share the page with bytes that were (false sharing).
+// Runs on the GPU thread. Returns 0 when the access may proceed, or (asynchronous readback only)
+// the tick whose download publication the caller must wait for before asking again.
+uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
+                                     bool from_gpu_thread, bool async) {
+	if (is_write && !IsRegionRegistered(vaddr, size)) {
+		return 0;
+	}
+	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+	// Diagnostics: whether the bytes the faulting access touches were written by the GPU
+	// (true sharing) or only share the page with bytes that were (false sharing).
+	{
+		static uint64_t exact = 0;
+		static uint64_t shared = 0;
+		const bool      dirty  = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
+		(dirty ? exact : shared)++;
+		static uint32_t logged = 0;
+		if (!dirty && logged < 32) {
+			logged++;
+			// Which bytes of the 4 KiB page the GPU did write, in 16-byte steps.
+			std::string dirty_ranges;
+			const auto  page  = vaddr & ~uint64_t {0xfff};
+			uint64_t    begin = 0;
+			bool        open  = false;
+			for (uint64_t at = page; at <= page + 0x1000; at += 16) {
+				const bool here = at < page + 0x1000 && HasGpuDirtyBytes(at, 16);
+				if (here && !open) {
+					begin = at;
+					open  = true;
+				} else if (!here && open) {
+					dirty_ranges += fmt::format(" {:x}-{:x}", begin - page, at - page);
+					open = false;
+				}
+			}
+			LOGF("ReadMemory false sharing: vaddr=0x%016" PRIx64 " write=%d page dirty:%s\n",
+			     vaddr, is_write ? 1 : 0, dirty_ranges.c_str());
+		}
+		if ((exact + shared) % 1024 == 0) {
+			LOGF("ReadMemory faults: gpu_written=%" PRIu64 " false_sharing=%" PRIu64 "\n", exact,
+			     shared);
+		}
+	}
+
+	// The page is protected as GPU-written, but none of its bytes are waiting for a download:
+	// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
+	// page. The page is current, so lift its protection. Downloading the window instead drained
+	// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
+	// labels.
+	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+	    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+		// An asynchronous readback of these bytes may not be in guest memory yet: the access
+		// must not see the older bytes, so it waits for that publication first.
+		bool downloading = false;
 		{
-			static uint64_t exact = 0;
-			static uint64_t shared = 0;
-			const bool      dirty  = HasGpuDirtyBytes(vaddr, std::max<uint64_t>(size, 4));
-			(dirty ? exact : shared)++;
-			static uint32_t logged = 0;
-			if (!dirty && logged < 32) {
-				logged++;
-				// Which bytes of the 4 KiB page the GPU did write, in 16-byte steps.
-				std::string dirty_ranges;
-				const auto  page  = vaddr & ~uint64_t {0xfff};
-				uint64_t    begin = 0;
-				bool        open  = false;
-				for (uint64_t at = page; at <= page + 0x1000; at += 16) {
-					const bool here = at < page + 0x1000 && HasGpuDirtyBytes(at, 16);
-					if (here && !open) {
-						begin = at;
-						open  = true;
-					} else if (!here && open) {
-						dirty_ranges += fmt::format(" {:x}-{:x}", begin - page, at - page);
-						open = false;
+			std::shared_lock lock(m_dirty_ranges_mutex);
+			downloading = m_downloading_ranges.Intersects(page_begin, page_end - page_begin);
+		}
+		if (downloading && m_last_async_download_tick != 0) {
+			if (async) {
+				return m_last_async_download_tick;
+			}
+			m_scheduler.WaitPriorityOperations(m_last_async_download_tick);
+		}
+		if (async) {
+			// The whole download window, as the synchronous path lifts it: page by page, each
+			// page of the window faulted on its own and went through the GPU thread again.
+			constexpr uint64_t WindowSize = 512 * 1024;
+			const auto         begin =
+			    std::max(Common::AlignDown(vaddr, WindowSize), buffer.CpuAddress());
+			const auto end = std::min(begin + WindowSize, buffer.CpuAddress() + buffer.Size());
+			std::vector<uint64_t> current;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				for (auto page = Common::AlignDown(begin, TRACKER_PAGE_SIZE); page < end;
+				     page += TRACKER_PAGE_SIZE) {
+					if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+					    !m_downloading_ranges.Intersects(page, TRACKER_PAGE_SIZE)) {
+						current.push_back(page);
 					}
 				}
-				LOGF("ReadMemory false sharing: vaddr=0x%016" PRIx64 " write=%d page dirty:%s\n",
-				     vaddr, is_write ? 1 : 0, dirty_ranges.c_str());
 			}
-			if ((exact + shared) % 1024 == 0) {
-				LOGF("ReadMemory faults: gpu_written=%" PRIu64 " false_sharing=%" PRIu64 "\n", exact,
-				     shared);
-			}
-		}
-
-		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
-		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
-		// page. The page is current, so lift its protection. Downloading the window instead drained
-		// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
-		// labels.
-		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
-		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
-		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
-			if (is_write) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
-			}
-			static uint64_t lifted = 0;
-			if (++lifted % 1024 == 1) {
-				LOGF("ReadMemory: lifted %" PRIu64 " protections of pages without GPU-written "
-				     "bytes\n",
-				     lifted);
-			}
-			return;
-		}
-
-		// Diagnostics: the GPU-written ranges (whole) on the faulting page of the first downloads.
-		{
-			static uint32_t logged = 0;
-			if (logged < 96) {
-				logged++;
-				std::string ranges;
-				uint32_t    count = 0;
-				m_gpu_modified_ranges.ForEachOverlapping(
-				    page_begin, page_end - page_begin, [&](uint64_t begin, uint64_t end) {
-					    if (count++ < 4) {
-						    ranges += fmt::format(" {:x}+{:x}", begin, end - begin);
-					    }
-				    });
-				LOGF("ReadMemory download: vaddr=0x%016" PRIx64
-				     " write=%d gpu_thread=%d ranges=%u:%s\n",
-				     vaddr, is_write ? 1 : 0, from_gpu_thread ? 1 : 0, count, ranges.c_str());
+			// One lift per run of neighbouring pages: each lift is a protection change, and
+			// page by page they were most of the GPU thread's VirtualProtect calls.
+			for (size_t first = 0; first < current.size();) {
+				size_t last = first + 1;
+				while (last < current.size() &&
+				       current[last] == current[last - 1] + TRACKER_PAGE_SIZE) {
+					last++;
+				}
+				const auto run_begin = current[first];
+				const auto run_size  = current[last - 1] + TRACKER_PAGE_SIZE - run_begin;
+				if (m_memory_tracker.IsRegionGpuModified(run_begin, run_size)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(run_begin, run_size);
+				}
+				first = last;
 			}
 		}
-
-		// Widen nearby CPU reads so they share one GPU drain.
-		constexpr uint64_t WindowSize   = 512 * 1024;
-		const auto         buffer_begin = buffer.CpuAddress();
-		const auto         buffer_end   = buffer_begin + buffer.Size();
-		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
-		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
-
-		Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
-		if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
-		}
+		m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
-	});
+		static uint64_t lifted = 0;
+		if (++lifted % 1024 == 1) {
+			LOGF("ReadMemory: lifted %" PRIu64 " protections of pages without GPU-written "
+			     "bytes\n",
+			     lifted);
+		}
+		return 0;
+	}
+
+	// Diagnostics: the GPU-written ranges (whole) on the faulting page of the first downloads.
+	{
+		static uint32_t logged = 0;
+		if (logged < 96) {
+			logged++;
+			std::string ranges;
+			uint32_t    count = 0;
+			m_gpu_modified_ranges.ForEachOverlapping(
+			    page_begin, page_end - page_begin, [&](uint64_t begin, uint64_t end) {
+				    if (count++ < 4) {
+					    ranges += fmt::format(" {:x}+{:x}", begin, end - begin);
+				    }
+			    });
+			LOGF("ReadMemory download: vaddr=0x%016" PRIx64
+			     " write=%d gpu_thread=%d ranges=%u:%s\n",
+			     vaddr, is_write ? 1 : 0, from_gpu_thread ? 1 : 0, count, ranges.c_str());
+		}
+	}
+
+	// Widen nearby CPU reads so they share one GPU drain.
+	constexpr uint64_t WindowSize   = 512 * 1024;
+	const auto         buffer_begin = buffer.CpuAddress();
+	const auto         buffer_end   = buffer_begin + buffer.Size();
+	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
+	const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
+
+	Timeline::Mark("readmem", vaddr, from_gpu_thread ? 1u : 0u);
+	if (async) {
+		// The download publishes when its tick completes; the page stays protected until the
+		// caller's next step finds its bytes downloaded and lifts it.
+		const auto tick = m_scheduler.CurrentTick();
+		if (DownloadBufferMemory<true>(buffer, window_begin, window_end - window_begin)) {
+			m_scheduler.Flush();
+			m_last_async_download_tick = tick;
+			return tick;
+		}
+	} else if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
+		m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
+	}
+	if (is_write) {
+		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+	}
+	return 0;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {

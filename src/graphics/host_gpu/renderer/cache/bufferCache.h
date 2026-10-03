@@ -152,6 +152,9 @@ private:
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	// One readback attempt on the GPU thread: 0 when done, else the tick to wait for.
+	[[nodiscard]] uint64_t ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_write,
+	                                      bool from_gpu_thread, bool async);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
@@ -173,6 +176,8 @@ private:
 	RangeSet                                           m_gpu_modified_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
+	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
+	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against
 	// IsCleanForConcurrentRead; the GPU thread reads them without it.
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
