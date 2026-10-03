@@ -74,6 +74,12 @@ public:
 		std::vector<uint32_t>               slots;    // per key; 0 = not resolved
 		std::vector<uint8_t>                settled;  // per key; resolved, or known placeholder
 		std::vector<ImageId>                resolved; // images to keep readable for draws
+		// Per settled key, the T# it was settled from and the image it resolved to (none for a
+		// placeholder). The guest rewrites entries as it streams textures out and others in;
+		// RenderExecutor::RevalidateBindlessKeys settles a key whose T# changed again.
+		std::vector<std::array<uint32_t, 8>> descriptors;
+		std::vector<ImageId>                 images;
+		uint32_t                             revalidate_cursor = 0; // next key to compare
 		// What RenderExecutor::CommitBindings last checked: g_bindless_state_generation then, and
 		// how many resolved images. Unchanged since, only the images resolved after need a look.
 		uint64_t checked_generation = 0;
@@ -106,6 +112,11 @@ public:
 	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
+	// The key no longer samples what it was settled to: it is pending again, and its image loses
+	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;
+	// a new resolution takes a new slot. True when the image has no reference left, so it need
+	// not stay pinned in the texture cache.
+	[[nodiscard]] bool ReleaseKey(Heap& heap, uint32_t key);
 
 	// A guest sampler heap as one kind of use samples it: a region of the sampler array that
 	// mirrors its S# records, key for key. Uses differ in whether the depth-compare function is

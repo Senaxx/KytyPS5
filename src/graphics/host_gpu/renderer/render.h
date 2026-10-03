@@ -174,6 +174,9 @@ public:
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void ResolveBindlessRequests();
 	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
+	// they were settled; returns how many it resolved.
+	uint32_t RevalidateBindlessKeys(uint32_t budget);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -235,6 +238,7 @@ private:
 	                    int32_t host_vertex_offset, uint32_t host_first_instance, bool indirect);
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
 	std::vector<uint32_t>                 m_bindless_srt;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

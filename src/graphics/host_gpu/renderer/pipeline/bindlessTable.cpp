@@ -394,6 +394,8 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	m_next_region += capacity;
 	heap.slots.resize(capacity, 0u);
 	heap.settled.resize(capacity, 0u);
+	heap.descriptors.resize(capacity);
+	heap.images.resize(capacity);
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
 	auto* feedback    = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
 	for (uint32_t key = 0; key < capacity; key++) {
@@ -535,6 +537,33 @@ void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
 	m_image_refs[ImageKey(id)].emplace_back(&heap, key);
 }
 
+bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
+	const auto id      = heap.images[key];
+	bool       no_refs = false;
+	if (id) {
+		const auto found = m_image_refs.find(ImageKey(id));
+		if (found != m_image_refs.end()) {
+			std::erase(found->second, std::pair<Heap*, uint32_t> {&heap, key});
+			const bool in_heap = std::any_of(found->second.begin(), found->second.end(),
+			                                 [&](const auto& ref) { return ref.first == &heap; });
+			if (!in_heap) {
+				std::erase(heap.resolved, id);
+				// Erasing shifts the images RenderExecutor::CommitBindings counted as checked.
+				heap.checked_generation = 0;
+			}
+			if (found->second.empty()) {
+				m_image_refs.erase(found);
+				no_refs = true;
+			}
+		}
+	}
+	heap.slots[key]   = 0;
+	heap.settled[key] = 0;
+	heap.images[key]  = {};
+	SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+	return no_refs;
+}
+
 void BindlessTable::OnImageUnregistered(ImageId id) {
 	const auto found = m_image_refs.find(ImageKey(id));
 	if (found == m_image_refs.end()) {
@@ -547,6 +576,7 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		}
 		heap->slots[key]   = 0;
 		heap->settled[key] = 0;
+		heap->images[key]  = {};
 		SetTranslation(*heap, key, ShaderRecompiler::IR::BindlessPending);
 		std::erase(heap->resolved, id);
 	}
