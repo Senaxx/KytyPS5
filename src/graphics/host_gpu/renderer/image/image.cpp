@@ -40,7 +40,18 @@ namespace {
 		}
 	}
 	if (info.IsVolume()) {
-		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
+		// 2D views of a volume. RADV refuses them for a block-compressed volume (BC7 sRGB 3D on an
+		// RX 9070 XT, ISSUES.md #16); such a volume is created without them and gets 3D views only
+		// (IsValidViewType).
+		const auto with_2d = flags | vk::ImageCreateFlagBits::e2DArrayCompatible;
+		if (!info.IsBlock() ||
+		    graphics.GetImageFormatProperties(
+		        info.pixel_format, vk::ImageType::e3D, vk::ImageTiling::eOptimal,
+		        vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+		            vk::ImageUsageFlagBits::eSampled,
+		        with_2d, nullptr) == vk::Result::eSuccess) {
+			flags = with_2d;
+		}
 	}
 	return flags;
 }
