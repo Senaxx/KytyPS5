@@ -720,15 +720,18 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 // A wave64 workgroup shader on a 64-wide host subgroup (compute and mesh shaders on AMD) runs
-// natively. Its scalar branch decides for the wave as well, as the two emulated halves below do;
-// a lane's own bit would split the wave. Lanes a partial workgroup lacks are not in the ballot,
-// so a zero condition holds when no present lane fails it.
+// natively. Its VCC and EXEC branches decide for the wave as well, as the two emulated halves
+// below do; a lane's own bit would split the wave. Lanes a partial workgroup lacks are not in the
+// ballot, so a zero condition holds when no present lane fails it. SCC is computed from scalars
+// and whole-wave mask words, so it is the same in every lane already.
 static uint32_t EmitNativeWaveCondition(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto kind  = inst.Flags<CFG::BranchCondition>();
-	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
-	const bool zero = kind == CFG::BranchCondition::ExecZero ||
-	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+	const bool zero  = kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
+	if (!zero && kind != CFG::BranchCondition::ExecNonZero &&
+	    kind != CFG::BranchCondition::VccNonZero) {
+		return ctx.Arg(inst, 0);
+	}
 	auto predicate = ctx.Arg(inst, 0);
 	if (zero) {
 		predicate = Unary(state, spv::OpLogicalNot, TypeBool(state), predicate);
