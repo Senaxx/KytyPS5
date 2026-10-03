@@ -622,6 +622,8 @@ struct ResourcePlan {
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable uint32_t                       evaluation_depth       = 0;
 	mutable std::vector<uint8_t>            active_sources;
+	// active_sources before the walk (sources no block guards), built once per plan.
+	mutable std::vector<uint8_t>            active_initial;
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;

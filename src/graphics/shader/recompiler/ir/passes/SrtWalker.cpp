@@ -1146,10 +1146,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return true;
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
-	active.assign(m_program.descriptor_sources.size(), 1u);
-	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) active.at(source) = 0u;
+	// The sources no block guards are active on every walk: built once per plan, copied per call
+	// (rebuilding it walked every block's sources on every draw).
+	auto& initial = m_program.active_initial;
+	if (initial.size() != m_program.descriptor_sources.size()) {
+		initial.assign(m_program.descriptor_sources.size(), 1u);
+		for (const auto& block: m_program.control_flow) {
+			for (const auto source: block.sources) initial.at(source) = 0u;
+		}
 	}
+	active = initial;
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
 	auto& walk    = m_program.active_walk;
