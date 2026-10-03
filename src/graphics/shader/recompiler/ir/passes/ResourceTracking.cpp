@@ -1703,6 +1703,72 @@ private:
 		return false;
 	}
 
+	// A descriptor word that is a Phi web where the shader's register held the image descriptor
+	// on the sampling paths and a data value on others (the register reused after the last
+	// sample: Wolverine's claw material 0x5e3edde52562876c reloads words 0-4 with a float that
+	// is also read as one). The one leaf read from the descriptor's own table (`reference`, the
+	// table of its plain words) is the word; every other leaf must be plainly data (used
+	// outside Phis and image handles), so two real descriptors still count as selected.
+	Value ResolveDescriptorPhi(Value value, const Inst* reference) const {
+		if (const auto invariant = ResolveInvariantPhi(m_program, value); !invariant.IsEmpty()) {
+			return invariant;
+		}
+		value            = value.Resolve();
+		const auto* root = value.TryInstruction();
+		if (reference == nullptr || root == nullptr || root->GetOpcode() != ValueOpcode::Phi) {
+			return {};
+		}
+		Value                           found;
+		std::vector<const Inst*>        pending {root};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty()) {
+			const auto* phi = pending.back();
+			pending.pop_back();
+			if (!seen.insert(phi).second) {
+				continue;
+			}
+			for (size_t i = 0; i < phi->NumArgs(); i++) {
+				const auto  leaf = phi->Arg(i).Resolve();
+				const auto* inst = leaf.TryInstruction();
+				if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+					pending.push_back(inst);
+					continue;
+				}
+				// Plain data first: a value the shader also uses as data is no descriptor word,
+				// even when it was read from the descriptor's own table; nor is a constant (the
+				// register on a path that never wrote it).
+				const bool data =
+				    leaf.IsImmediate() ||
+				    (inst != nullptr && std::ranges::any_of(inst->Uses(), [](const Use& use) {
+					     const auto op = use.user->GetOpcode();
+					     return op != ValueOpcode::Phi && op != ValueOpcode::GetImageResource;
+				     }));
+				if (data) {
+					continue;
+				}
+				// Nor is a value the shader computed (it reached the register on a path that
+				// built no descriptor). A pure descriptor read from another table is: that
+				// descriptor is genuinely selected.
+				uint32_t    memory_index = 0;
+				const auto* memory = inst != nullptr ? ScalarReadMemory(*inst, memory_index) : nullptr;
+				if (memory == nullptr) {
+					// User data can hold a whole descriptor (upstream's finite images): not ignored.
+					if (inst != nullptr && inst->GetOpcode() == ValueOpcode::GetUserData) {
+						return {};
+					}
+					continue;
+				}
+				const auto* table = inst->Arg(0).Resolve().TryInstruction();
+				if (table == nullptr || !EquivalentValue(m_program, Value(table), Value(reference)) ||
+				    (!found.IsEmpty() && !EquivalentValue(m_program, found, leaf))) {
+					return {};
+				}
+				found = leaf;
+			}
+		}
+		return found;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -1711,11 +1777,22 @@ private:
 		Value    key;
 		uint32_t table_offset = 0;
 		uint32_t key_mask     = UINT32_MAX;
+		// The table of the descriptor's plain (non-Phi) words, for ResolveDescriptorPhi.
+		const Inst* reference_table = nullptr;
+		for (uint32_t dword = 0; dword < plan.reads.size() && reference_table == nullptr; ++dword) {
+			const auto* plain = ResolveInvariantPhi(m_program, handle.Arg(dword)).TryInstruction();
+			uint32_t    memory_index = 0;
+			if (plain != nullptr && plain->GetOpcode() != ValueOpcode::Phi &&
+			    ScalarReadMemory(*plain, memory_index) != nullptr) {
+				reference_table = plain->Arg(0).Resolve().TryInstruction();
+			}
+		}
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			// A descriptor can be carried unchanged through nested loops. Resolve only
-			// Phi webs whose incoming values agree, leaving genuinely selected descriptors
-			// unsupported here. Keep the original reads alive when other GPU users need them.
-			auto* read = ResolveInvariantPhi(m_program, handle.Arg(dword)).TryInstruction();
+			// Phi webs whose incoming values agree (or carry this descriptor's table read
+			// against plain data), leaving genuinely selected descriptors unsupported here.
+			// Keep the original reads alive when other GPU users need them.
+			auto* read = ResolveDescriptorPhi(handle.Arg(dword), reference_table).TryInstruction();
 			if (read == nullptr) {
 				return RejectIndirect(handle, __LINE__);
 			}
