@@ -10609,7 +10609,9 @@ void TestMergedShaderUserDataSnapshot() {
   options.back_code = {};
   const auto fast_result = RecompileForTest(fast_code, options);
   CheckSpirvBinaryValidates(fast_result.spirv);
-  Check(fast_result.program.memory_info.empty(),
+  // Only the start-vertex read of a GPU-read DRAW_INDIRECT; no index-buffer resource.
+  Check(fast_result.program.memory_info.size() == 1 &&
+            fast_result.program.memory_info[0].kind == ShaderRecompiler::IR::ResourceKind::Global,
         "compiled fast-launch entry retained an unused index-buffer resource");
   const auto fast_source = DisassembleSpirvBinary(fast_result.spirv);
   Check(SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputVertices 32") &&
@@ -10937,7 +10939,11 @@ void TestMeshInputAssembly() {
     }
     ConstantPropagationPass(program.blocks);
     if (test.fast_launch) {
-      Check(load == nullptr && program.memory_info.empty(),
+      // Draw dword 3 is not the GPU-arguments marker here: the indirect start-vertex read is
+      // predicated off, and there is no index-buffer resource.
+      Check(load != nullptr && load->Arg(1).Resolve().U32() == 8u &&
+                load->Arg(3).Resolve().IsImmediate() && !load->Arg(3).Resolve().U1() &&
+                program.memory_info.size() == 1,
             "fast launch emitted an ordinary input-assembly index resource");
     } else {
       Check(load != nullptr && load->Arg(1).Resolve().U32() == test.byte_offset &&

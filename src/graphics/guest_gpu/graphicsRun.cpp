@@ -63,6 +63,15 @@ static bool GraphicsRunDebugDumpEnabled() {
 // KYTY_LOG_INDIRECT_DRAWS=<n>: log the arguments of the first n indirect draws, including
 // multi-draws whose GPU-written count is zero. A diagnostic for draws that GPU work generation
 // (culling passes) should have filled.
+// KYTY_GPU_INDIRECT_DRAWS=0 reads every DRAW_INDIRECT's arguments on the CPU, as before.
+static bool GpuIndirectDraws() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_GPU_INDIRECT_DRAWS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 static bool LogIndirectDraw() {
 	static const uint32_t budget = [] {
 		const char* value = std::getenv("KYTY_LOG_INDIRECT_DRAWS");
@@ -305,6 +314,7 @@ void CommandProcessor::Reset() {
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
 	m_num_instances                    = 1;
+	m_num_instances_args               = 0;
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -957,7 +967,8 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances      = num_instances;
+	m_num_instances_args = 0;
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -1014,7 +1025,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -1046,6 +1057,15 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
 
+	if (!indexed && GpuIndirectDraws() && ((m_ctx.GetShaderStages() >> 19u) & 3u) == 1u) {
+		// Fast launch: the GPU reads the counts (RenderExecutor::ExecutePreparedDraw). The
+		// arguments are usually written by a dispatch just before; reading them here waited for
+		// the whole GPU (6.7 % of the GPU thread in the jungle, 2026-10-03).
+		m_num_instances_args = reinterpret_cast<uint64_t>(args_addr);
+		DrawIndexAuto({.offset_source    = DrawOffsetSource::IndirectArgs,
+		               .gpu_args_address = reinterpret_cast<uint64_t>(args_addr)});
+		return;
+	}
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));
@@ -1055,6 +1075,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 			     args.instance_count, args.start_vertex_location);
 		}
 		m_num_instances = args.instance_count;
+		m_num_instances_args = 0;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
 		               .first_vertex   = args.start_vertex_location,
@@ -1095,6 +1116,7 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	}
 
 	m_num_instances = args.instance_count;
+	m_num_instances_args = 0;
 	DrawIndex({.index_count    = index_count,
 	           .index_addr     = index_addr,
 	           .instance_count = args.instance_count,
@@ -1157,6 +1179,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		if (!indexed) {
 			auto* args      = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
 			m_num_instances = args->instance_count;
+			m_num_instances_args = 0;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
 			               .first_vertex   = args->start_vertex_location,
@@ -1184,6 +1207,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		m_num_instances = args->instance_count;
+		m_num_instances_args = 0;
 		DrawIndex({.index_count    = index_count,
 		           .index_addr     = index_addr,
 		           .instance_count = args->instance_count,
@@ -1239,9 +1263,19 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	m_renderer.GetRenderExecutor().DispatchIndirect(m_submit_id, CurrentBuffer(), args_addr, mode);
 }
 
+uint32_t CommandProcessor::NumInstances() {
+	if (m_num_instances_args != 0) {
+		DrawIndirectArgs args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(m_num_instances_args), sizeof(args));
+		m_num_instances      = args.instance_count;
+		m_num_instances_args = 0;
+	}
+	return m_num_instances;
+}
+
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
-	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+	if (args.instance_count == 0 && args.gpu_args_address == 0) {
+		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	CompleteDraw();

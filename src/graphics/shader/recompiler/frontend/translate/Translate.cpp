@@ -1207,7 +1207,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
 				// The instance VGPR excludes the start instance, as on hardware: the shader adds
 				// its instance-offset SGPR itself, and draw(2) holds that SGPR's value.
-				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+				// A DRAW_INDIRECT the GPU reads (draw(3) = 0xFFFFFFFF): the start vertex is the
+				// third dword of the guest DrawIndirectArgs at draw(4..5); the CPU never has it.
+				const auto gpu_args       = entry_ir.IEqual(draw(3), u32(0xFFFFFFFFu));
+				const auto args_resource  = entry_ir.Emit(IR::ValueOpcode::GetAddressResource,
+				                                          {entry_ir.BitwiseAnd(draw(4), u32(~3u)), draw(5)});
+				const auto args_memory    = static_cast<uint32_t>(result.memory_info.size());
+				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+				const auto args_start     = IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::LoadAddressU32, {args_resource, u32(8), u32(0), gpu_args},
+				    IR::MemoryFlags {.index = args_memory}));
+				const auto start_vertex = IR::U32(entry_ir.Select(gpu_args, args_start, draw(1)));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+				                      entry_ir.IAdd(start_vertex, group));
 				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(6),
 				                      builtin(IR::StageInputKind::WorkgroupId, 1));
 			} else {
