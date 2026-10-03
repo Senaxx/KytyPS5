@@ -671,6 +671,8 @@ std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
+// Whether the translation path validates the IR (debug builds, or KYTY_VALIDATE_IR=1).
+bool  IrValidationEnabled();
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const ResourcePlan& program, Value left, Value right);
 Value ResolveInvariantPhi(const ResourcePlan& program, Value value);

@@ -1,6 +1,8 @@
 #include "common/assert.h"
+#include "common/config.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <cstdlib>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -206,6 +208,22 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+// The IR consistency check: every block, edge and instruction, with hash maps. It only finds bugs
+// in the passes, and ran twice per translation on the GPU thread (2 % of it in the jungle, warm,
+// 2026-10-03). The translation path runs it in debug builds, and in release builds with
+// KYTY_VALIDATE_IR=1; direct calls (the tests) always validate.
+bool IrValidationEnabled() {
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	return true;
+#else
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_VALIDATE_IR");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+#endif
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

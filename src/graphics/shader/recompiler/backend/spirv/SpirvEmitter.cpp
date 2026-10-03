@@ -470,7 +470,9 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 		Fail(program, "SPIR-V emitter requires a fully planned native shader program");
 	}
 	ValidateNativeProgram(program);
-	IR::ValidateProgram(program, true);
+	if (IR::IrValidationEnabled()) {
+		IR::ValidateProgram(program, true);
+	}
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
