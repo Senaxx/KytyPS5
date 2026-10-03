@@ -719,8 +719,43 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                                ctx.Arg(inst, 1));
 }
 
+// A wave64 workgroup shader on a 64-wide host subgroup (compute and mesh shaders on AMD) runs
+// natively. Its scalar branch decides for the wave as well, as the two emulated halves below do;
+// a lane's own bit would split the wave. Lanes a partial workgroup lacks are not in the ballot,
+// so a zero condition holds when no present lane fails it.
+static uint32_t EmitNativeWaveCondition(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto kind  = inst.Flags<CFG::BranchCondition>();
+	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+	auto predicate = ctx.Arg(inst, 0);
+	if (zero) {
+		predicate = Unary(state, spv::OpLogicalNot, TypeBool(state), predicate);
+	}
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
+	const auto ballot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
+	                          ConstantU32(state, spv::ScopeSubgroup), predicate);
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	const auto any = Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+	return Binary(state, zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(state), any,
+	              ConstantU32(state, 0));
+}
+
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
+	if (ctx.other_half == nullptr) {
+		const auto* workgroup = ShaderWorkgroupInput(ctx.state.program.stage, ctx.state.input_info);
+		if (workgroup != nullptr && ctx.state.program.wave_size == 64u &&
+		    workgroup->host_subgroup_size == 64u) {
+			return EmitNativeWaveCondition(ctx, inst);
+		}
+		return ctx.Arg(inst, 0);
+	}
 	// A native scalar branch makes one decision for both emulated wave halves.
 	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
