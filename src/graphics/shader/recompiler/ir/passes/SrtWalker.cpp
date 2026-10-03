@@ -1145,6 +1145,69 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		return true;
 	}
+	// 0 false, 1 true, 2 not known (no condition, no reader, or it could not be evaluated).
+	auto&      predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	const auto outcome   = [&](uint32_t index, const ResourceBlock& block) -> uint8_t {
+		if (block.condition.IsEmpty() || m_runtime.read_specialization_memory == nullptr) {
+			return 2u;
+		}
+		uint32_t condition = 0;
+		bool     known     = false;
+		if (predicate.UseNativeTables()) {
+			uint64_t wide = 0;
+			known     = predicate.EvaluateNative(predicate.m_native->Conditions()[index], wide);
+			condition = static_cast<uint32_t>(wide);
+		} else {
+			known = predicate.Evaluate(block.condition, condition);
+		}
+		return known ? (condition != 0u ? 1u : 0u) : 2u;
+	};
+	// Replay: in the jungle a program's walk visited ~88 of ~97 blocks for only ~4.7 conditions,
+	// and 84 % of walks gave the same result as the program's previous one. Conditions that give
+	// the outcomes of the last walk visit the same blocks, so only its reads are evaluated again
+	// and its active sources taken over: no visited/pending bookkeeping per block.
+	const uint8_t key = (m_runtime.read_specialization_memory != nullptr ? 1u : 0u) |
+	                    (m_clean_evaluator != nullptr ? 2u : 0u);
+	if (m_program.active_walk_valid && m_program.walk_key == key) {
+		bool same = true;
+		for (const auto& [index, recorded]: m_program.active_walk) {
+			if (outcome(index, m_program.control_flow[index]) != recorded) {
+				same = false;
+				break;
+			}
+		}
+		if (same) {
+			flat.assign(m_program.srt_reads.size(), 0u);
+			for (const auto slot: m_program.walk_slots) {
+				if (!refresh(slot)) return false;
+			}
+			active = m_program.active_walk_result;
+			// KYTY_WALK_VERIFY=1: walk anyway and stop if the replay differs.
+			static const bool verify = std::getenv("KYTY_WALK_VERIFY") != nullptr;
+			if (!verify) {
+				return true;
+			}
+			const auto replay_flat   = flat;
+			const auto replay_active = active;
+			static std::atomic<uint64_t> verified {0};
+			if (!WalkBlocks(flat, refresh, outcome, key) || flat != replay_flat ||
+			    active != replay_active) {
+				EXIT("SRT walk replay differs from the walk\n");
+			}
+			if (verified.fetch_add(1, std::memory_order_relaxed) % 100000 == 0) {
+				std::fprintf(stderr, "SRT walk replay verified: %llu\n",
+				             static_cast<unsigned long long>(verified.load()));
+			}
+			return true;
+		}
+	}
+	return WalkBlocks(flat, refresh, outcome, key);
+}
+
+template <typename Refresh, typename Outcome>
+bool SrtWalker::WalkBlocks(std::vector<uint32_t>& flat, const Refresh& refresh,
+                           const Outcome& outcome, uint8_t key) {
+	auto& active = m_program.active_sources;
 	flat.assign(m_program.srt_reads.size(), 0u);
 	// The sources no block guards are active on every walk: built once per plan, copied per call
 	// (rebuilding it walked every block's sources on every draw).
@@ -1159,10 +1222,21 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
 	auto& walk    = m_program.active_walk;
+	auto& slots   = m_program.walk_slots;
+	auto& stamps  = m_program.walk_slot_stamps;
 	visited.assign(m_program.control_flow.size(), 0u);
 	pending.clear();
 	pending.push_back(0u);
 	walk.clear();
+	slots.clear();
+	m_program.active_walk_valid = false;
+	// A read listed under several blocks was evaluated once per block (91.6 evaluations per walk
+	// for 65.3 reads in the jungle); each is evaluated once per walk now.
+	if (stamps.size() != m_program.srt_reads.size() || ++m_program.walk_generation == 0u) {
+		stamps.assign(m_program.srt_reads.size(), 0u);
+		m_program.walk_generation = 1u;
+	}
+	const auto stamp = m_program.walk_generation;
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
@@ -1171,26 +1245,26 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) active[source] = 1u;
 		for (const auto slot: block.srt_reads) {
-			if (!refresh(slot)) return false;
-		}
-		uint32_t condition = 0;
-		auto&    predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-		bool     known     = false;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr) {
-			if (predicate.UseNativeTables()) {
-				uint64_t wide = 0;
-				known     = predicate.EvaluateNative(predicate.m_native->Conditions()[index], wide);
-				condition = static_cast<uint32_t>(wide);
-			} else {
-				known = predicate.Evaluate(block.condition, condition);
+			if (slot < stamps.size()) {
+				if (stamps[slot] == stamp) continue;
+				stamps[slot] = stamp;
 			}
+			if (!refresh(slot)) return false;
+			slots.push_back(slot);
 		}
-		if (known) {
-			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		const auto result = outcome(index, block);
+		if (!block.condition.IsEmpty()) {
+			walk.emplace_back(index, result);
+		}
+		if (result != 2u) {
+			pending.push_back(block.successors[result != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
+	m_program.active_walk_result = active;
+	m_program.walk_key           = key;
+	m_program.active_walk_valid  = true;
 	return true;
 }
 

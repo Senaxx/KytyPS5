@@ -52,6 +52,10 @@ public:
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
+	// RefreshFlatBuffer's full walk over the control flow (records the walk for replay).
+	template <typename Refresh, typename Outcome>
+	bool WalkBlocks(std::vector<uint32_t>& flat, const Refresh& refresh, const Outcome& outcome,
+	                uint8_t key);
 	friend struct SrtNativeHelpers;
 
 	// Binds this walker to the plan's native code when the configuration is one it was compiled

@@ -628,11 +628,16 @@ struct ResourcePlan {
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
 	// The plan compiled into x86-64 code (SrtNative.h) once it is refreshed often enough.
-	// FindActiveSources' last walk: the blocks it visited in order with their condition outcomes
-	// (0 false, 1 true, 2 not evaluated), and its result. A walk whose conditions give the same
-	// outcomes is the same walk.
+	// SrtWalker::RefreshFlatBuffer's last walk: the visited blocks that have a condition, with
+	// its outcome (0 false, 1 true, 2 not known), the reads it evaluated (each once, in order),
+	// the active sources it left and the reader setup it ran with. A walk whose conditions give
+	// the same outcomes visits the same blocks.
 	mutable std::vector<std::pair<uint32_t, uint8_t>> active_walk;
 	mutable std::vector<uint8_t>                      active_walk_result;
+	mutable std::vector<uint32_t>                     walk_slots;
+	mutable std::vector<uint32_t>                     walk_slot_stamps;
+	mutable uint32_t                                  walk_generation   = 0;
+	mutable uint8_t                                   walk_key          = 0;
 	mutable bool                                      active_walk_valid = false;
 	mutable std::shared_ptr<const SrtNativeCode> native_code;
 	mutable uint32_t                             native_uses      = 0;
