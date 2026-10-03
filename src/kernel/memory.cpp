@@ -219,6 +219,7 @@ public:
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -249,6 +250,7 @@ public:
 
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -280,6 +282,7 @@ public:
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -295,6 +298,7 @@ public:
 	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -342,6 +346,7 @@ public:
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -354,12 +359,14 @@ public:
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
+		m_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -422,6 +429,10 @@ public:
 
 		out->clear();
 		return false;
+	}
+
+	[[nodiscard]] uint64_t Generation() const noexcept {
+		return m_generation.load(std::memory_order_acquire);
 	}
 
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
@@ -650,6 +661,9 @@ private:
 
 	std::vector<Range> m_ranges;
 	Common::Mutex      m_mutex;
+	// Bumped by every change of the ranges: TryClampRangeSize's per-thread answers are valid
+	// while it is unchanged.
+	std::atomic<uint64_t> m_generation {1};
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -914,7 +928,28 @@ bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data,
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
+	// Every buffer of every draw asks; a heap-wide descriptor spans thousands of mappings, each
+	// walked under the lock (3.8 % of the GPU thread in the jungle, 2026-10-03). The answer stays
+	// valid until the ranges change, so each thread remembers its recent ones.
+	struct Answer {
+		uint64_t generation = 0;
+		uint64_t vaddr      = 0;
+		uint64_t size       = 0;
+		uint64_t clamped    = 0;
+	};
+	// KYTY_CLAMP_CACHE=0 walks the ranges every time, as before.
+	static const bool cached = [] {
+		const char* value = std::getenv("KYTY_CLAMP_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	thread_local std::array<Answer, 64> answers {};
+	const auto generation = g_virtual_ranges->Generation();
+	auto&      answer     = answers[((vaddr >> 12u) ^ (size >> 12u) ^ size) & 63u];
+	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
+		return answer.clamped;
+	}
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	answer                  = {generation, vaddr, size, clamped_size};
 	if (clamped_size != 0 && clamped_size != size) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
 		     " to 0x%016" PRIx64 "\n",
