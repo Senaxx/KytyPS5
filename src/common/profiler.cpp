@@ -15,6 +15,12 @@ void SetThreadName(const char* name) {
 	}
 }
 
+void MarkFrame() {
+	if (tracy::ProfilerAvailable()) {
+		FrameMark;
+	}
+}
+
 void Initialize() {
 	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
 		tracy::StartupProfiler();

@@ -1044,6 +1044,7 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 }
 
 uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
+	KYTY_PROFILER_FUNCTION();
 	// The guest rewrites heap entries as it streams textures out and others in. A key settled
 	// from the old T# kept sampling the old texture, and kept it pinned in the texture cache for
 	// the rest of the run (in the jungle, 14-21 keys and 44-65 MB at any time). Each frame a
@@ -1091,6 +1092,7 @@ uint32_t RenderExecutor::RevalidateBindlessKeys(uint32_t budget) {
 }
 
 void RenderExecutor::ResolveBindlessRequests() {
+	KYTY_PROFILER_FUNCTION();
 	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
 	if (frame == m_bindless_frame) {
 		return;

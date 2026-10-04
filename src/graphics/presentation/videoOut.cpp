@@ -1249,6 +1249,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
+		Profiler::MarkFrame();
 	}
 
 	m_mutex.Lock();

@@ -23,6 +23,8 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 namespace Profiler {
 
 void SetThreadName(const char* name);
+// Ends a frame in Tracy's frame view: one call per presented frame.
+void MarkFrame();
 
 void Initialize();
 void Shutdown();
