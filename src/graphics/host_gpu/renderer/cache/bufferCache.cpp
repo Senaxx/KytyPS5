@@ -112,11 +112,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
-	} else {
-		m_slot_buffers.erase(id);
-	}
+	// As TextureCache::DeleteImage: earlier command buffers may still use the buffer on the GPU.
+	m_scheduler.DeferRelease([this, id] { m_slot_buffers.erase(id); });
 }
 
 template <bool async>

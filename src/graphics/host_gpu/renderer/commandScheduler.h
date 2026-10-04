@@ -62,6 +62,10 @@ public:
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	// As DeferOperation, also between guest command buffers (no active command buffer): runs
+	// once the GPU has finished the current tick, so work submitted earlier, still running, can
+	// keep using what the operation releases.
+	void                      DeferRelease(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 	// Hands later submissions to a dedicated queue thread, which submits them in tick order, so

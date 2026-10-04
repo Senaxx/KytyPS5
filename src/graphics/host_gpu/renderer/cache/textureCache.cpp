@@ -312,11 +312,10 @@ void TextureCache::DeleteImage(ImageId id) {
 		}
 	}
 	UnregisterImage(id);
-	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
-	} else {
-		m_slot_images.erase(id);
-	}
+	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
+	// earlier may still be sampling the image on the GPU. Destroying it at once let them read
+	// freed memory (device loss at the title, 2026-10-04).
+	m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
 }
 
 void TextureCache::FreeImage(ImageId id) {

@@ -331,6 +331,10 @@ void CommandScheduler::PopPendingOperations() {
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
 	CheckActive();
+	DeferRelease(std::move(operation));
+}
+
+void CommandScheduler::DeferRelease(Common::UniqueFunction<void>&& operation) {
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
