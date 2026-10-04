@@ -719,6 +719,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		LOGF("Vulkan shader device clock: timestamp period %.3f ns, S_MEMREALTIME shift %u\n",
 		     period_ns, shift);
 	}
+	// NVIDIA reloads coherent loads without a barrier; AMD's drivers need one (SpirvEmitter.h).
+	ShaderRecompiler::Spirv::SetCoherentLoadAcquire(properties2.properties.vendorID != 0x10deu);
+	LOGF("Vulkan coherent loads: acquire barrier %s\n",
+	     ShaderRecompiler::Spirv::GetCoherentLoadAcquire() ? "on" : "off");
 	vk::PhysicalDeviceAddressBindingReportFeaturesEXT address_binding {};
 	if (graphics.address_binding_report_enabled) {
 		address_binding.reportAddressBinding = VK_TRUE;

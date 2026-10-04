@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <bit>
 #include <optional>
 #include <vector>
@@ -437,7 +439,20 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 namespace {
 std::atomic_bool     g_image_min_lod {false};
 std::atomic_uint32_t g_device_clock_shift {3};
+std::atomic_bool     g_coherent_load_acquire {false};
 } // namespace
+
+void SetCoherentLoadAcquire(bool enabled) {
+	g_coherent_load_acquire.store(enabled, std::memory_order_relaxed);
+}
+
+bool GetCoherentLoadAcquire() {
+	static const int forced = [] {
+		const char* value = std::getenv("KYTY_COHERENT_LOAD_ACQUIRE");
+		return value == nullptr ? -1 : (std::strcmp(value, "0") != 0 ? 1 : 0);
+	}();
+	return forced >= 0 ? forced == 1 : g_coherent_load_acquire.load(std::memory_order_relaxed);
+}
 
 void SetDeviceClockShift(uint32_t shift) {
 	g_device_clock_shift.store(shift, std::memory_order_relaxed);
