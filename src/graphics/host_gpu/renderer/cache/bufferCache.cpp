@@ -113,7 +113,23 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 	Unregister(id);
 	// As TextureCache::DeleteImage: earlier command buffers may still use the buffer on the GPU.
-	m_scheduler.DeferRelease([this, id] { m_slot_buffers.erase(id); });
+	m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+}
+
+void BufferCache::ReleaseBuffer(BufferId id) {
+	const auto* buffer = m_slot_buffers.try_get(id);
+	if (buffer != nullptr && !m_scheduler.IsFree(buffer->last_use_tick)) {
+		// Bound after it was dropped, in a tick the GPU has not finished: keep it until then.
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 16) {
+			LOGF("BufferCache: buffer guest=0x%016" PRIx64 "+0x%" PRIx64 " used in tick %" PRIu64
+			     " after its release was queued; destruction waits for that tick\n",
+			     buffer->CpuAddress(), buffer->Size(), buffer->last_use_tick);
+		}
+		m_scheduler.DeferRelease([this, id] { ReleaseBuffer(id); });
+		return;
+	}
+	m_slot_buffers.erase(id);
 }
 
 template <bool async>
@@ -821,6 +837,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		MarkGpuWritten(vaddr, size);
@@ -840,6 +857,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 		id = FindBuffer(vaddr, size);
 	}
 	auto& buffer = m_slot_buffers[id];
+	buffer.last_use_tick = m_scheduler.CurrentTick();
 	TouchBuffer(buffer);
 	// The whole binding is current on the GPU, as for a written buffer; only the bytes the
 	// stores can reach become GPU-written.

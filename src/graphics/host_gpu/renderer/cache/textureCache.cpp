@@ -319,10 +319,22 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::ReleaseImage(ImageId id) {
-	if (const auto* image = m_slot_images.try_get(id);
-	    image != nullptr && on_image_release && on_image_release(*image)) {
+	const auto* image = m_slot_images.try_get(id);
+	if (image != nullptr && on_image_release && on_image_release(*image)) {
 		// Work recorded with the repointed slot runs until the current tick is done.
-		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+		return;
+	}
+	if (image != nullptr && !m_scheduler.IsFree(image->tick_accessed_last)) {
+		// Used after it was dropped, in a tick the GPU has not finished: keep it until then.
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 16) {
+			LOGF("TextureCache: image %ux%u guest=0x%016" PRIx64 " used in tick %" PRIu64
+			     " after its release was queued; destruction waits for that tick\n",
+			     image->info.extent.width, image->info.extent.height, image->info.data.address,
+			     image->tick_accessed_last);
+		}
+		m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
 		return;
 	}
 	m_slot_images.erase(id);
