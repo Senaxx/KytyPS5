@@ -33,6 +33,9 @@ class TextureCache {
 public:
 	// Called before a bindless-pinned image is unregistered.
 	std::function<void(ImageId)> on_bindless_unregister;
+	// Called right before an image is destroyed; true keeps it one more GPU tick (a bindless slot
+	// still held one of its views and was repointed).
+	std::function<bool(const Image&)> on_image_release;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -118,6 +121,7 @@ private:
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
+	void                      ReleaseImage(ImageId id);
 	void                      FreeImage(ImageId id);
 	void                      TouchImage(Image& image);
 	void                      TrackImage(ImageId id);

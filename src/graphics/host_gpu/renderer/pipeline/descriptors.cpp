@@ -1025,6 +1025,13 @@ bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 	BindImage(binding.image_id, false);
 	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
 	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image != nullptr && !image->registered) {
+		// Dropped by the cache (its destruction waits for the GPU): a slot holding its view would
+		// outlive it, since its unregistration is over. The key is asked for again next frame.
+		heap.settled[key] = 0;
+		table.SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+		return false;
+	}
 	const auto slot = table.AllocateSlot(heap.binding);
 	if (image == nullptr || view == nullptr || slot == 0) {
 		table.SetTranslation(heap, key, 0u);

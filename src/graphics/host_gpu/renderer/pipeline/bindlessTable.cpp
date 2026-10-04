@@ -459,6 +459,75 @@ void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView vie
 	write.descriptorType  = vk::DescriptorType::eSampledImage;
 	write.pImageInfo      = &info;
 	m_graphics.device.updateDescriptorSets(1, &write, 0, nullptr);
+	if (binding >= ImageArrays) {
+		return;
+	}
+	auto& views = m_slot_views[binding];
+	if (views.size() <= slot) {
+		views.resize(slot + 1u);
+	}
+	if (const auto old = views[slot]; old != nullptr) {
+		if (const auto found = m_view_slots.find(static_cast<VkImageView>(old));
+		    found != m_view_slots.end()) {
+			std::erase(found->second, std::pair {binding, slot});
+			if (found->second.empty()) {
+				m_view_slots.erase(found);
+			}
+		}
+	}
+	const bool placeholder =
+	    std::ranges::find(m_placeholder_views, view) != m_placeholder_views.end();
+	views[slot] = placeholder ? vk::ImageView {} : view;
+	if (!placeholder && view != nullptr) {
+		m_view_slots[static_cast<VkImageView>(view)].emplace_back(binding, slot);
+	}
+}
+
+bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
+	bool held = false;
+	for (const auto view: views) {
+		const auto found = m_view_slots.find(static_cast<VkImageView>(view));
+		if (found == m_view_slots.end()) {
+			continue;
+		}
+		const auto slots = found->second;
+		for (const auto& [binding, slot]: slots) {
+			held = true;
+			for (auto& heap: m_heaps) {
+				if (heap.binding != binding) {
+					continue;
+				}
+				for (uint32_t key = 0; key < heap.slots.size(); key++) {
+					if (heap.slots[key] != slot) {
+						continue;
+					}
+					if (const auto id = heap.images[key]; id) {
+						if (const auto refs = m_image_refs.find(ImageKey(id)); refs != m_image_refs.end()) {
+							std::erase(refs->second, std::pair<Heap*, uint32_t> {&heap, key});
+							if (refs->second.empty()) {
+								m_image_refs.erase(refs);
+							}
+						}
+						std::erase(heap.resolved, id);
+						heap.checked_generation = 0;
+					}
+					heap.slots[key]   = 0;
+					heap.settled[key] = 0;
+					heap.images[key]  = {};
+					SetTranslation(heap, key, ShaderRecompiler::IR::BindlessPending);
+				}
+			}
+			WriteSlot(binding, slot, m_placeholder_views[binding * PlaceholderColors],
+			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 16) {
+				LOGF("Bindless: binding %u slot %u still held an image being destroyed; "
+				     "repointed to the placeholder\n",
+				     binding, slot);
+			}
+		}
+	}
+	return held;
 }
 
 void BindlessTable::SetTranslation(const Heap& heap, uint32_t key, uint32_t slot) {

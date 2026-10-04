@@ -315,7 +315,17 @@ void TextureCache::DeleteImage(ImageId id) {
 	// Also between guest command buffers (a guest unmap runs there): command buffers submitted
 	// earlier may still be sampling the image on the GPU. Destroying it at once let them read
 	// freed memory (device loss at the title, 2026-10-04).
-	m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
+	m_scheduler.DeferRelease([this, id] { ReleaseImage(id); });
+}
+
+void TextureCache::ReleaseImage(ImageId id) {
+	if (const auto* image = m_slot_images.try_get(id);
+	    image != nullptr && on_image_release && on_image_release(*image)) {
+		// Work recorded with the repointed slot runs until the current tick is done.
+		m_scheduler.DeferRelease([this, id] { m_slot_images.erase(id); });
+		return;
+	}
+	m_slot_images.erase(id);
 }
 
 void TextureCache::FreeImage(ImageId id) {

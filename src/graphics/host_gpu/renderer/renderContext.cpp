@@ -31,6 +31,17 @@ RenderContext::RenderContext(GraphicContext& graphics)
 	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
 		m_bindless_table.OnImageUnregistered(id);
 	};
+	m_texture_cache.on_image_release = [this](const Image& image) {
+		if (!m_bindless_table.Enabled()) {
+			return false;
+		}
+		std::vector<vk::ImageView> views;
+		views.reserve(image.views.size());
+		for (const auto& cached: image.views) {
+			views.push_back(cached.view);
+		}
+		return m_bindless_table.ReleaseViews(views);
+	};
 	// vkQueueSubmit, and the queue lock that present also holds, runs on a queue thread instead
 	// of the GPU thread. Frames reach the presenter only after their flip tick completed, and the
 	// presenter's own scheduler stays synchronous. KYTY_ASYNC_SUBMIT=0 submits on the GPU thread.

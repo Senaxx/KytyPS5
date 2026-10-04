@@ -148,6 +148,10 @@ public:
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.
 	void OnImageUnregistered(ImageId id);
+	// Before an image is destroyed: a slot that still holds one of its views is repointed to the
+	// placeholder and the keys that use it are pending again. True when one did, so the caller
+	// keeps the image until the GPU has finished the work recorded with that slot.
+	[[nodiscard]] bool ReleaseViews(std::span<const vk::ImageView> views);
 
 private:
 	[[nodiscard]] bool AllocateRegion(Heap& heap, uint32_t entries);
@@ -182,6 +186,9 @@ private:
 	std::unique_ptr<Buffer> m_feedback;
 	std::unique_ptr<Buffer> m_feedback_snapshot;
 	uint64_t                m_snapshot_tick = 0; // 0 = none recorded
+	// The view each image slot holds, and the slots each view is in (placeholders excluded).
+	std::array<std::vector<vk::ImageView>, ImageArrays>                        m_slot_views;
+	std::unordered_map<VkImageView, std::vector<std::pair<uint32_t, uint32_t>>> m_view_slots;
 };
 
 } // namespace Libs::Graphics
