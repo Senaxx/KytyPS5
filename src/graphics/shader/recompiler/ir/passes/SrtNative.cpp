@@ -809,12 +809,30 @@ private:
 			case ValueOpcode::UGreaterThan32: EmitCompare(mode, inst, CondA, fail); return;
 			case ValueOpcode::ULessThanEqual32: EmitCompare(mode, inst, CondBE, fail); return;
 			case ValueOpcode::SGreaterThanEqual32: EmitCompare(mode, inst, CondGE, fail); return;
+			// As the interpreter (upstream 6409be28): one known operand can decide. A false
+			// left side of an AND (a true one of an OR) gives the result without the right
+			// side, and when the left side cannot be evaluated a false (true) right side still
+			// gives it. Evaluating both strictly failed where the interpreter did not.
 			case ValueOpcode::LogicalAnd:
-				EmitOperands(mode, inst, 2, fail), EmitBool(RAX), EmitBool(RCX), a.And(RAX, RCX);
+			case ValueOpcode::LogicalOr: {
+				const bool is_and      = inst.GetOpcode() == ValueOpcode::LogicalAnd;
+				const auto left_failed = a.NewLabel();
+				const auto done        = a.NewLabel();
+				EmitValue(mode, inst.Arg(0), left_failed);
+				EmitBool(RAX);
+				a.Test(RAX, RAX);
+				a.Jcc(is_and ? CondE : CondNE, done);
+				EmitValue(mode, inst.Arg(1), fail);
+				EmitBool(RAX);
+				a.Jmp(done);
+				a.Bind(left_failed);
+				EmitValue(mode, inst.Arg(1), fail);
+				a.Test(RAX, RAX);
+				a.Jcc(is_and ? CondNE : CondE, fail);
+				EmitBool(RAX);
+				a.Bind(done);
 				return;
-			case ValueOpcode::LogicalOr:
-				EmitOperands(mode, inst, 2, fail), EmitBool(RAX), EmitBool(RCX), a.Or(RAX, RCX);
-				return;
+			}
 			case ValueOpcode::LogicalXor:
 				EmitOperands(mode, inst, 2, fail), EmitBool(RAX), EmitBool(RCX), a.Xor(RAX, RCX);
 				return;
