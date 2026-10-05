@@ -1278,47 +1278,6 @@ bool SrtWalker::WalkBlocks(std::vector<uint32_t>& flat, const Refresh& refresh,
 
 // Replay traces (SrtWalker.h).
 
-struct SrtTraceOp {
-	enum Kind : uint8_t {
-		Pure,            // ApplyPureOp over the operands
-		UserData,        // user data word `imm`
-		ShaderBase,
-		Pass,            // the operand (Phi, bit casts, ReadConst, ConditionRef, extract of a pair)
-		Extract64,       // a 64-bit operand's dword `flags`
-		AddCarryExtract, // IAddCarry32 of two operands, dword `flags`
-		Select,          // predicate, then the arm `flags` (1 or 2) the recording took
-		LogicalAnd,      // the interpreter's short-circuit rules
-		LogicalOr,
-		RawRead,         // EvaluateRawRead; `flags` 1 for a constant buffer, `imm` the offset
-	};
-	Kind        kind   = Pure;
-	uint8_t     walker = 0;     // 0 the clean walker, 1 the ordinary one
-	uint8_t     count  = 0;     // operands
-	uint8_t     flags  = 0;
-	bool        ok     = false; // what the recording got
-	ValueOpcode opcode = ValueOpcode::Void;
-	int32_t     imm    = 0;
-	int32_t     args[5] {};     // SrtTraceSession::Event refs
-	const Inst* inst = nullptr;
-};
-
-struct SrtTraceCall {
-	Value       raw;                 // the requested value as given (matched without resolving)
-	const Inst* inst      = nullptr; // null: an immediate
-	uint64_t    immediate = 0;
-	uint32_t    end       = 0;       // ops up to here are evaluated for it
-	int32_t     result    = 0;       // an Event ref
-	uint8_t     walker    = 0;
-	bool        ok        = false;
-};
-
-struct SrtTrace {
-	std::vector<SrtTraceOp>   ops;
-	std::vector<uint64_t>     immediates;
-	std::vector<SrtTraceCall> calls;
-	uint8_t                   key = 0;
-};
-
 namespace {
 
 bool TraceEnabled() {
@@ -1479,7 +1438,7 @@ void SrtTraceSession::Abandon(const char* reason) {
 	}
 }
 
-bool SrtTraceSession::Evaluate(SrtWalker& walker, Value value, uint64_t& result) {
+bool SrtTraceSession::EvaluateSlow(SrtWalker& walker, Value value, uint64_t& result) {
 	if (m_mode == Mode::Serve) {
 		if (m_frames.empty()) {
 			return Serve(walker, value, result);
