@@ -12,7 +12,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
+
+#include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -325,6 +329,259 @@ private:
 
 } // namespace
 
+namespace {
+
+// Operand count of an instruction whose value is a pure function of its operands, evaluated in
+// order (the first failing operand fails it), or -1. EvaluateInst and the replay trace share
+// ApplyPureOp, so both compute exactly the same thing.
+int PureArity(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::UndefU1:
+		case ValueOpcode::UndefU8:
+		case ValueOpcode::UndefU16:
+		case ValueOpcode::UndefU32:
+		case ValueOpcode::UndefU64: return 0;
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::FPTrunc32:
+		case ValueOpcode::FPRecipIFlag32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::LogicalNot: return 1;
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::IMul64:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftLeftLogical64:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::ShiftRightLogical64:
+		case ValueOpcode::ShiftRightArithmetic32:
+		case ValueOpcode::ShiftRightArithmetic64:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SGreaterThanEqual32:
+		case ValueOpcode::LogicalXor: return 2;
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::BitFieldSExtract: return 3;
+		case ValueOpcode::BitFieldInsert: return 4;
+		default: return -1;
+	}
+}
+
+float AsFloat32(uint64_t bits) {
+	return std::bit_cast<float>(static_cast<uint32_t>(bits));
+}
+
+bool ApplyPureOp(ValueOpcode op, const Inst& inst, const uint64_t* v, uint64_t& result) {
+	const uint64_t a = v[0];
+	const uint64_t b = v[1];
+	const uint64_t c = v[2];
+	switch (op) {
+		case ValueOpcode::CompositeConstructU64:
+			result =
+			    static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			return true;
+		case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); return true;
+		case ValueOpcode::IAdd64: result = a + b; return true;
+		case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); return true;
+		case ValueOpcode::ISub64: result = a - b; return true;
+		case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); return true;
+		case ValueOpcode::IMul64: result = a * b; return true;
+		case ValueOpcode::UMulHi:
+			result = (uint64_t {static_cast<uint32_t>(a)} * static_cast<uint32_t>(b)) >> 32u;
+			return true;
+		case ValueOpcode::UMin32:
+			result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+			return true;
+		case ValueOpcode::ConvertF32U32:
+			result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
+			return true;
+		case ValueOpcode::ConvertU32F32: {
+			const auto value = AsFloat32(a);
+			if (!std::isfinite(value) || value < 0.0f || static_cast<double>(value) > UINT32_MAX) {
+				return false;
+			}
+			result = static_cast<uint32_t>(value);
+			return true;
+		}
+		case ValueOpcode::FPMul32: {
+			// As MULSS (and the native walker): a NaN operand gives itself, quieted, the first
+			// one when both are. Left to the compiler, a * b may be emitted as b * a.
+			const auto bits_a = static_cast<uint32_t>(a);
+			const auto bits_b = static_cast<uint32_t>(b);
+			if ((bits_a & 0x7fffffffu) > 0x7f800000u) {
+				result = bits_a | 0x00400000u;
+			} else if ((bits_b & 0x7fffffffu) > 0x7f800000u) {
+				result = bits_b | 0x00400000u;
+			} else {
+				result = std::bit_cast<uint32_t>(AsFloat32(a) * AsFloat32(b));
+			}
+			return true;
+		}
+		case ValueOpcode::FPTrunc32:
+			result = std::bit_cast<uint32_t>(std::trunc(AsFloat32(a)));
+			return true;
+		case ValueOpcode::FPRecipIFlag32: {
+			const auto bits     = static_cast<uint32_t>(a);
+			const auto exponent = (bits >> 23u) & 255u;
+			// Exact normal power-of-two reciprocals avoid host/device approximation drift.
+			if ((bits & 0x807fffffu) != 0u || exponent == 0u || exponent >= 254u) return false;
+			result = (254u - exponent) << 23u;
+			return true;
+		}
+		case ValueOpcode::FPIsNan32: result = std::isnan(AsFloat32(a)); return true;
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32: {
+			const auto operand = [&](uint64_t bits) {
+				if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
+				    (bits & 0x7fffffffu) < 0x00800000u) {
+					bits &= 0x80000000u;
+				}
+				return AsFloat32(bits);
+			};
+			result = op == ValueOpcode::FPOrdLessThanEqual32 ? operand(a) <= operand(b)
+			                                                 : operand(a) >= operand(b);
+			return true;
+		}
+		case ValueOpcode::BitwiseAnd32: result = static_cast<uint32_t>(a & b); return true;
+		case ValueOpcode::BitwiseAnd64: result = a & b; return true;
+		case ValueOpcode::BitwiseOr32: result = static_cast<uint32_t>(a | b); return true;
+		case ValueOpcode::BitwiseXor32: result = static_cast<uint32_t>(a ^ b); return true;
+		case ValueOpcode::BitwiseNot32: result = ~static_cast<uint32_t>(a); return true;
+		case ValueOpcode::ShiftLeftLogical32:
+			result = static_cast<uint32_t>(a) << (b & 31u);
+			return true;
+		case ValueOpcode::ShiftLeftLogical64: result = a << (b & 63u); return true;
+		case ValueOpcode::ShiftRightLogical32:
+			result = static_cast<uint32_t>(a) >> (b & 31u);
+			return true;
+		case ValueOpcode::ShiftRightLogical64: result = a >> (b & 63u); return true;
+		case ValueOpcode::ShiftRightArithmetic32:
+			result = static_cast<uint32_t>(std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >>
+			                               (b & 31u));
+			return true;
+		case ValueOpcode::ShiftRightArithmetic64:
+			result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
+			return true;
+		case ValueOpcode::BitFieldUExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			const auto mask = width == 32u  ? UINT32_MAX
+			                  : width == 0u ? 0u
+			                                : (uint32_t {1} << width) - 1u;
+			result          = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+			return true;
+		}
+		case ValueOpcode::BitFieldSExtract: {
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = 0;
+				return true;
+			}
+			const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
+			auto       bits = (static_cast<uint32_t>(a) >> offset) & mask;
+			if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
+				bits |= ~mask;
+			}
+			result = bits;
+			return true;
+		}
+		case ValueOpcode::BitFieldInsert: {
+			const auto offset = static_cast<uint32_t>(c);
+			const auto width  = static_cast<uint32_t>(v[3]);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = static_cast<uint32_t>(a);
+				return true;
+			}
+			const auto mask = width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+			result =
+			    (static_cast<uint32_t>(a) & ~mask) | ((static_cast<uint32_t>(b) << offset) & mask);
+			return true;
+		}
+		case ValueOpcode::IEqual32:
+			result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::INotEqual32:
+			result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::ULessThan32:
+			result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::UGreaterThan32:
+			result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::ULessThanEqual32:
+			result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::SGreaterThanEqual32:
+			result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+			         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+			return true;
+		case ValueOpcode::LogicalXor: result = (a != 0u) != (b != 0u); return true;
+		case ValueOpcode::LogicalNot: result = a == 0u; return true;
+		default: return false; // Undef*
+	}
+}
+
+// LoadAddressU32 / ReadConstBuffer after its operands (EvaluateRawRead's address computation):
+// Read with the address to read, Zero for a constant buffer read past the end (reads zero), or
+// Fail.
+enum class RawAddress : uint8_t { Fail, Read, Zero };
+RawAddress ComputeRawAddress(bool const_buffer, int64_t immediate, uint64_t low, uint64_t high,
+                             uint64_t offset, uint64_t records, uint64_t& base, uint64_t& address) {
+	base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	if (const_buffer) {
+		if (immediate < 0) {
+			return RawAddress::Fail;
+		}
+		const auto byte_offset = (static_cast<uint64_t>(immediate) & ~uint64_t {3}) +
+		                         (static_cast<uint32_t>(offset) & ~3u);
+		const auto stride = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		const auto size   = stride == 0u
+		                        ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                        : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			// A scalar buffer read past the end returns zero (PS5 ISA, scalar buffer addressing),
+			// as the shader's own load does (EmitReadConstBuffer). Failing skipped the draw.
+			return RawAddress::Zero;
+		}
+		address = (base & ~uint64_t {3}) + byte_offset;
+		return RawAddress::Read;
+	}
+	const auto relative =
+	    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+	return AddSignedAddress(base & ~uint64_t {3}, relative, address) ? RawAddress::Read
+	                                                                  : RawAddress::Fail;
+}
+
+} // namespace
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
                      Value active_mask)
@@ -505,25 +762,33 @@ float SrtWalker::Float32(uint64_t bits) {
 	return std::bit_cast<float>(static_cast<uint32_t>(bits));
 }
 
-bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
+bool SrtWalker::EvaluateWideImpl(Value value, uint64_t& result) {
 	value = value.Resolve();
 	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
 		result = 1u;
 		return true;
 	}
 	if (value.IsImmediate()) {
+		bool ok = true;
 		switch (value.GetType()) {
-			case Type::U1: result = value.U1(); return true;
-			case Type::U8: result = value.U8(); return true;
-			case Type::U16: result = value.U16(); return true;
-			case Type::U32: result = value.U32(); return true;
-			case Type::U64: result = value.U64(); return true;
-			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
-			default: return false;
+			case Type::U1: result = value.U1(); break;
+			case Type::U8: result = value.U8(); break;
+			case Type::U16: result = value.U16(); break;
+			case Type::U32: result = value.U32(); break;
+			case Type::U64: result = value.U64(); break;
+			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); break;
+			default: ok = false; break;
 		}
+		if (m_trace != nullptr) {
+			m_trace->OnImmediate(ok, result);
+		}
+		return ok;
 	}
 	auto* inst = value.TryInstruction();
 	if (inst == nullptr) {
+		if (m_trace != nullptr) {
+			m_trace->Abort("no instruction");
+		}
 		return false;
 	}
 	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) && inst->NumArgs() == 3 &&
@@ -541,10 +806,16 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	if (m_context.values[index].generation == m_context.generation) {
 		result = m_context.values[index].value;
+		if (m_trace != nullptr) {
+			m_trace->OnMemoHit(*this, index, result);
+		}
 		return true;
 	}
 	// The low generation bit marks an instruction that is still being evaluated.
 	if (m_context.values[index].generation == (m_context.generation | 1u)) {
+		if (m_trace != nullptr) {
+			m_trace->Abort("cycle");
+		}
 		return false;
 	}
 	m_context.values[index].generation = m_context.generation | 1u;
@@ -553,6 +824,9 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	// Recursive evaluation may grow the dense memo vector.
 	m_native_frame.memo = m_context.values.data();
 	auto& memo          = m_context.values[index];
+	if (m_trace != nullptr) {
+		m_trace->OnInst(*this, *inst, index, evaluated, out);
+	}
 	if (!evaluated) {
 		if (m_failed_value == nullptr) m_failed_value = inst;
 		memo.generation = 0;
@@ -627,38 +901,26 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
 		return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
-		uint64_t records = 0;
-		uint64_t word3   = 0;
+	const bool const_buffer = inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+	uint64_t   records      = 0;
+	if (const_buffer) {
+		uint64_t word3 = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
 			return false;
 		}
-		if (immediate < 0) {
-			return false;
-		}
-		const auto byte_offset =
-		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
-		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
-		const auto size = stride == 0u
-		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			// A scalar buffer read past the end returns zero (PS5 ISA, scalar buffer addressing),
-			// as the shader's own load does (EmitReadConstBuffer). Failing skipped the draw.
-			result = 0;
-			return true;
-		}
-		address = (base & ~uint64_t {3}) + byte_offset;
-	} else {
-		const auto relative =
-		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
-		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
-		}
 	}
+	uint64_t base    = 0;
+	uint64_t address = 0;
+	switch (ComputeRawAddress(const_buffer, static_cast<int32_t>(mem.offset), low, high, offset,
+	                          records, base, address)) {
+		case RawAddress::Fail: return false;
+		case RawAddress::Zero: result = 0; return true;
+		case RawAddress::Read: break;
+	}
+	return ReadRawWord(address, base, result);
+}
+
+bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
@@ -725,12 +987,19 @@ bool SrtWalker::EvaluateBufferRead(const Inst& inst, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
-	uint64_t   a       = 0;
-	uint64_t   b       = 0;
-	uint64_t   c       = 0;
-	const auto binary  = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
-	const auto ternary = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c); };
-	switch (inst.GetOpcode()) {
+	const auto op = inst.GetOpcode();
+	if (const int arity = PureArity(op); arity >= 0) {
+		uint64_t operands[4] {};
+		for (int i = 0; i < arity; i++) {
+			if (!Arg(inst, static_cast<size_t>(i), operands[i])) {
+				return false;
+			}
+		}
+		return ApplyPureOp(op, inst, operands, result);
+	}
+	uint64_t a = 0;
+	uint64_t b = 0;
+	switch (op) {
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 			if (reg < m_program.user_data_base ||
@@ -752,13 +1021,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
-		case ValueOpcode::CompositeConstructU64:
-			if (!binary()) {
-				return false;
-			}
-			result =
-			    static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
-			return true;
 		case ValueOpcode::ReadConst: {
 			const auto slot = inst.Arg(1).Resolve();
 			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
@@ -779,232 +1041,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			break;
 		case ValueOpcode::LoadBufferU32: return EvaluateBufferRead(inst, result);
-		case ValueOpcode::IAdd32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a + b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::IAdd64:
-			if (binary()) {
-				result = a + b;
-				return true;
-			}
-			return false;
-		case ValueOpcode::ISub32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a - b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ISub64:
-			if (binary()) {
-				result = a - b;
-				return true;
-			}
-			return false;
-		case ValueOpcode::IMul32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a * b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::IMul64:
-			if (binary()) {
-				result = a * b;
-				return true;
-			}
-			return false;
-		case ValueOpcode::UMulHi:
-			if (!binary()) return false;
-			result = (uint64_t {static_cast<uint32_t>(a)} * static_cast<uint32_t>(b)) >> 32u;
-			return true;
-		case ValueOpcode::UMin32:
-			if (binary()) {
-				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
-				return true;
-			}
-			return false;
-		case ValueOpcode::ConvertF32U32:
-			if (Arg(inst, 0, a)) {
-				result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
-				return true;
-			}
-			return false;
-		case ValueOpcode::ConvertU32F32:
-			if (Arg(inst, 0, a)) {
-				const auto value = Float32(a);
-				if (!std::isfinite(value) || value < 0.0f ||
-				    static_cast<double>(value) > UINT32_MAX) {
-					return false;
-				}
-				result = static_cast<uint32_t>(value);
-				return true;
-			}
-			return false;
-		case ValueOpcode::FPMul32:
-			if (binary()) {
-				result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
-				return true;
-			}
-			return false;
-		case ValueOpcode::FPTrunc32:
-			if (Arg(inst, 0, a)) {
-				result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
-				return true;
-			}
-			return false;
-		case ValueOpcode::FPRecipIFlag32: {
-			if (!Arg(inst, 0, a)) return false;
-			const auto bits     = static_cast<uint32_t>(a);
-			const auto exponent = (bits >> 23u) & 255u;
-			// Exact normal power-of-two reciprocals avoid host/device approximation drift.
-			if ((bits & 0x807fffffu) != 0u || exponent == 0u || exponent >= 254u) return false;
-			result = (254u - exponent) << 23u;
-			return true;
-		}
-		case ValueOpcode::FPIsNan32:
-			if (Arg(inst, 0, a)) {
-				result = std::isnan(Float32(a));
-				return true;
-			}
-			return false;
-		case ValueOpcode::FPOrdLessThanEqual32:
-		case ValueOpcode::FPOrdGreaterThanEqual32:
-			if (binary()) {
-				const auto operand = [&](uint64_t bits) {
-					if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
-					    (bits & 0x7fffffffu) < 0x00800000u) {
-						bits &= 0x80000000u;
-					}
-					return Float32(bits);
-				};
-				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
-				             ? operand(a) <= operand(b)
-				             : operand(a) >= operand(b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitwiseAnd32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a & b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitwiseAnd64:
-			if (binary()) {
-				result = a & b;
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitwiseOr32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a | b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitwiseXor32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a ^ b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitwiseNot32:
-			if (Arg(inst, 0, a)) {
-				result = ~static_cast<uint32_t>(a);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ShiftLeftLogical32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) << (b & 31u);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ShiftLeftLogical64:
-			if (binary()) {
-				result = a << (b & 63u);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ShiftRightLogical32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) >> (b & 31u);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ShiftRightLogical64:
-			if (binary()) {
-				result = a >> (b & 63u);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ShiftRightArithmetic32:
-			if (binary()) {
-				result = static_cast<uint32_t>(std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >>
-				                               (b & 31u));
-				return true;
-			}
-			return false;
-		case ValueOpcode::ShiftRightArithmetic64:
-			if (binary()) {
-				result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitFieldUExtract:
-			if (ternary()) {
-				const auto offset = static_cast<uint32_t>(b);
-				const auto width  = static_cast<uint32_t>(c);
-				if (offset > 32u || width > 32u - offset) {
-					return false;
-				}
-				const auto mask = width == 32u  ? UINT32_MAX
-				                  : width == 0u ? 0u
-				                                : (uint32_t {1} << width) - 1u;
-				result          = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitFieldSExtract:
-			if (ternary()) {
-				const auto offset = static_cast<uint32_t>(b);
-				const auto width  = static_cast<uint32_t>(c);
-				if (offset > 32u || width > 32u - offset) {
-					return false;
-				}
-				if (width == 0u) {
-					result = 0;
-					return true;
-				}
-				const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
-				auto       bits = (static_cast<uint32_t>(a) >> offset) & mask;
-				if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
-					bits |= ~mask;
-				}
-				result = bits;
-				return true;
-			}
-			return false;
-		case ValueOpcode::BitFieldInsert: {
-			uint64_t d = 0;
-			if (!ternary() || !Arg(inst, 3, d)) {
-				return false;
-			}
-			const auto offset = static_cast<uint32_t>(c);
-			const auto width  = static_cast<uint32_t>(d);
-			if (offset > 32u || width > 32u - offset) {
-				return false;
-			}
-			if (width == 0u) {
-				result = static_cast<uint32_t>(a);
-				return true;
-			}
-			const auto mask = width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
-			result =
-			    (static_cast<uint32_t>(a) & ~mask) | ((static_cast<uint32_t>(b) << offset) & mask);
-			return true;
-		}
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectF32: {
@@ -1014,41 +1050,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		}
-		case ValueOpcode::IEqual32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::INotEqual32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ULessThan32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::UGreaterThan32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
-				return true;
-			}
-			return false;
-		case ValueOpcode::ULessThanEqual32:
-			if (!binary()) return false;
-			result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
-			return true;
-		case ValueOpcode::SGreaterThanEqual32:
-			if (binary()) {
-				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
-				         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
-				return true;
-			}
-			return false;
 		case ValueOpcode::LogicalAnd: {
 			const bool left = Arg(inst, 0, a);
 			if (left && a == 0u) {
@@ -1069,28 +1070,12 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			result = b != 0u;
 			return true;
 		}
-		case ValueOpcode::LogicalXor:
-			if (binary()) {
-				result = (a != 0u) != (b != 0u);
-				return true;
-			}
-			return false;
 		case ValueOpcode::ConditionRef: return Arg(inst, 0, result);
-		case ValueOpcode::LogicalNot:
-			if (Arg(inst, 0, a)) {
-				result = a == 0u;
-				return true;
-			}
-			return false;
-		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU8:
-		case ValueOpcode::UndefU16:
-		case ValueOpcode::UndefU32:
-		case ValueOpcode::UndefU64: return false;
 		default: break;
 	}
 	return false;
 }
+
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	if (source >= m_program.descriptor_sources.size()) {
 		return false;
@@ -1265,6 +1250,568 @@ bool SrtWalker::WalkBlocks(std::vector<uint32_t>& flat, const Refresh& refresh,
 	m_program.active_walk_result = active;
 	m_program.walk_key           = key;
 	m_program.active_walk_valid  = true;
+	return true;
+}
+
+// Replay traces (SrtWalker.h).
+
+struct SrtTraceOp {
+	enum Kind : uint8_t {
+		Pure,            // ApplyPureOp over the operands
+		UserData,        // user data word `imm`
+		ShaderBase,
+		Pass,            // the operand (Phi, bit casts, ReadConst, ConditionRef, extract of a pair)
+		Extract64,       // a 64-bit operand's dword `flags`
+		AddCarryExtract, // IAddCarry32 of two operands, dword `flags`
+		Select,          // predicate, then the arm `flags` (1 or 2) the recording took
+		LogicalAnd,      // the interpreter's short-circuit rules
+		LogicalOr,
+		RawRead,         // EvaluateRawRead; `flags` 1 for a constant buffer, `imm` the offset
+	};
+	Kind        kind   = Pure;
+	uint8_t     walker = 0;     // 0 the clean walker, 1 the ordinary one
+	uint8_t     count  = 0;     // operands
+	uint8_t     flags  = 0;
+	bool        ok     = false; // what the recording got
+	ValueOpcode opcode = ValueOpcode::Void;
+	int32_t     imm    = 0;
+	int32_t     args[5] {};     // SrtTraceSession::Event refs
+	const Inst* inst = nullptr;
+};
+
+struct SrtTraceCall {
+	const Inst* inst      = nullptr; // null: an immediate
+	uint64_t    immediate = 0;
+	uint32_t    end       = 0;       // ops up to here are evaluated for it
+	int32_t     result    = 0;       // an Event ref
+	uint8_t     walker    = 0;
+	bool        ok        = false;
+};
+
+struct SrtTrace {
+	std::vector<SrtTraceOp>   ops;
+	std::vector<uint64_t>     immediates;
+	std::vector<SrtTraceCall> calls;
+	uint8_t                   key = 0;
+};
+
+namespace {
+
+bool TraceEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SRT_TRACE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+bool TraceStatsEnabled() {
+	static const bool enabled = std::getenv("KYTY_SRT_TRACE_STATS") != nullptr;
+	return enabled;
+}
+
+// A program records once it has been refreshed this often; after this many abandoned replays in a
+// row it stops recording for `TraceBackoff` refreshes.
+constexpr uint32_t TraceAfterUses = 4;
+constexpr uint32_t TraceMaxMisses = 4;
+constexpr uint32_t TraceBackoff   = 256;
+constexpr size_t   TraceMaxOps    = 8192;
+
+struct TraceStats {
+	uint64_t served = 0, abandoned = 0, recorded = 0, aborted = 0, off = 0, refreshes = 0;
+	std::unordered_map<std::string, uint64_t> reasons;
+};
+TraceStats g_trace_stats;
+
+void CountTrace(uint64_t TraceStats::*field, const char* reason = nullptr) {
+	if (!TraceStatsEnabled()) {
+		return;
+	}
+	g_trace_stats.*field += 1;
+	if (reason != nullptr) {
+		g_trace_stats.reasons[reason]++;
+	}
+}
+
+uint8_t TraceKey(const ResourcePlan& program, const SrtRuntime& runtime) {
+	return (runtime.read_specialization_memory != nullptr ? 1u : 0u) |
+	       (program.capture_specialization_reads ? 2u : 0u);
+}
+
+void PrintTraceStats() {
+	std::string reasons;
+	for (const auto& [reason, count]: g_trace_stats.reasons) {
+		reasons += fmt::format(" {}={}", reason, count);
+	}
+	std::fprintf(stderr, "SRT trace: refreshes=%llu served=%llu abandoned=%llu recorded=%llu aborted=%llu "
+	             "off=%llu;%s\n",
+	             static_cast<unsigned long long>(g_trace_stats.refreshes),
+	             static_cast<unsigned long long>(g_trace_stats.served),
+	             static_cast<unsigned long long>(g_trace_stats.abandoned),
+	             static_cast<unsigned long long>(g_trace_stats.recorded),
+	             static_cast<unsigned long long>(g_trace_stats.aborted),
+	             static_cast<unsigned long long>(g_trace_stats.off), reasons.c_str());
+}
+
+} // namespace
+
+bool& SrtTraceSession::Suppressed() {
+	thread_local bool suppressed = false;
+	return suppressed;
+}
+
+SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, SrtWalker& walker,
+                                 const SrtRuntime& runtime)
+    : m_program(program), m_walkers {&clean, &walker} {
+	if (!TraceEnabled() || Suppressed() || !program.srt_plan_complete) {
+		return;
+	}
+	CountTrace(&TraceStats::refreshes);
+	if (TraceStatsEnabled() && g_trace_stats.refreshes % 200000 == 0) {
+		PrintTraceStats();
+	}
+	const auto key = TraceKey(program, runtime);
+	if (program.srt_trace_backoff != 0) {
+		program.srt_trace_backoff--;
+		CountTrace(&TraceStats::off);
+		return;
+	}
+	if (program.srt_trace != nullptr && program.srt_trace->key == key) {
+		m_mode  = Mode::Serve;
+		m_trace = program.srt_trace;
+		m_values.resize(m_trace->ops.size());
+		m_status.resize(m_trace->ops.size());
+	} else if (++program.srt_trace_uses >= TraceAfterUses) {
+		m_mode      = Mode::Record;
+		m_recording = std::make_unique<SrtTrace>();
+		m_recording->key = key;
+		for (auto& slots: m_slots) {
+			slots.assign(program.evaluation_value_count, -1);
+		}
+	} else {
+		return;
+	}
+	for (uint8_t id = 0; id < 2; id++) {
+		m_walkers[id]->m_trace    = this;
+		m_walkers[id]->m_trace_id = id;
+		// Recording sees every evaluation only through the interpreter; replay needs none.
+		m_native[id]              = m_walkers[id]->m_native;
+		m_walkers[id]->m_native   = nullptr;
+	}
+}
+
+SrtTraceSession::~SrtTraceSession() {
+	if (m_mode == Mode::Off) {
+		return;
+	}
+	for (auto* walker: m_walkers) {
+		walker->m_trace = nullptr;
+	}
+	if (m_mode == Mode::Record) {
+		if (m_succeeded && m_abort == nullptr && m_frames.empty()) {
+			m_program.srt_trace = std::move(m_recording);
+			CountTrace(&TraceStats::recorded);
+		} else {
+			CountTrace(&TraceStats::aborted, m_abort != nullptr ? m_abort : "refresh failed");
+			if (m_abort != nullptr && ++m_program.srt_trace_misses >= TraceMaxMisses) {
+				m_program.srt_trace_misses  = 0;
+				m_program.srt_trace_backoff = TraceBackoff;
+			}
+		}
+	} else if (m_mode == Mode::Serve) {
+		m_program.srt_trace_misses = 0;
+		CountTrace(&TraceStats::served);
+	}
+}
+
+void SrtTraceSession::RestoreNative() {
+	for (uint8_t id = 0; id < 2; id++) {
+		m_walkers[id]->m_native = m_native[id];
+	}
+}
+
+void SrtTraceSession::Abort(const char* reason) {
+	if (m_mode == Mode::Record && m_abort == nullptr) {
+		m_abort = reason;
+	}
+}
+
+void SrtTraceSession::Abandon(const char* reason) {
+	m_mode = Mode::Passthrough;
+	RestoreNative();
+	CountTrace(&TraceStats::abandoned, reason);
+	// The trace no longer matches what the program does: record again, unless that keeps
+	// happening.
+	m_program.srt_trace = nullptr;
+	if (++m_program.srt_trace_misses >= TraceMaxMisses) {
+		m_program.srt_trace_misses  = 0;
+		m_program.srt_trace_backoff = TraceBackoff;
+	}
+}
+
+bool SrtTraceSession::Evaluate(SrtWalker& walker, Value value, uint64_t& result) {
+	if (m_mode == Mode::Serve) {
+		if (m_frames.empty()) {
+			return Serve(walker, value, result);
+		}
+	}
+	if (m_mode != Mode::Record) {
+		return walker.EvaluateWideImpl(value, result);
+	}
+	const bool top   = m_frames.empty();
+	auto       first = static_cast<uint32_t>(m_recording->ops.size());
+	(void)first;
+	m_frames.emplace_back();
+	const bool ok    = walker.EvaluateWideImpl(value, result);
+	const auto frame = m_frames.back();
+	m_frames.pop_back();
+	if (m_abort != nullptr) {
+		return ok;
+	}
+	if (!frame.have) {
+		// Nothing told the frame what happened (native code or an evaluation the hooks do not
+		// see): this refresh cannot be recorded.
+		Abort("unrecorded evaluation");
+		return ok;
+	}
+	if (frame.result.ok != ok) {
+		Abort("result mismatch");
+		return ok;
+	}
+	if (top) {
+		const auto resolved = value.Resolve();
+		SrtTraceCall call;
+		call.inst   = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
+		call.end    = static_cast<uint32_t>(m_recording->ops.size());
+		call.result = frame.result.ref;
+		call.walker = walker.m_trace_id;
+		call.ok     = ok;
+		if (call.inst == nullptr) {
+			call.immediate = result;
+		}
+		m_recording->calls.push_back(call);
+		return ok;
+	}
+	auto& parent = m_frames.back();
+	if (parent.count == parent.events.size()) {
+		Abort("too many operands");
+		return ok;
+	}
+	parent.events[parent.count++] = frame.result;
+	return ok;
+}
+
+void SrtTraceSession::OnImmediate(bool ok, uint64_t bits) {
+	if (m_mode != Mode::Record || m_frames.empty()) {
+		return;
+	}
+	auto& frame = m_frames.back();
+	if (!ok) {
+		frame.result = {Failed, false};
+	} else {
+		auto& imms = m_recording->immediates;
+		imms.push_back(bits);
+		frame.result = {-1 - static_cast<int32_t>(imms.size() - 1), true, bits};
+	}
+	frame.have = true;
+}
+
+void SrtTraceSession::OnMemoHit(const SrtWalker& walker, uint32_t index, uint64_t value) {
+	if (m_mode != Mode::Record || m_frames.empty()) {
+		return;
+	}
+	auto& slots = m_slots[walker.m_trace_id];
+	if (index >= slots.size() || slots[index] < 0) {
+		Abort("memo hit without op");
+		return;
+	}
+	auto& frame  = m_frames.back();
+	frame.result = {slots[index], true, value};
+	frame.have   = true;
+}
+
+void SrtTraceSession::OnInst(const SrtWalker& walker, const Inst& inst, uint32_t index, bool ok,
+                             uint64_t value) {
+	if (m_mode != Mode::Record || m_frames.empty() || m_abort != nullptr) {
+		return;
+	}
+	auto&      frame = m_frames.back();
+	SrtTraceOp op;
+	op.walker = walker.m_trace_id;
+	op.ok     = ok;
+	op.inst   = &inst;
+	op.opcode = inst.GetOpcode();
+	op.count  = static_cast<uint8_t>(frame.count);
+	if (frame.count > std::size(op.args)) {
+		Abort("too many operands");
+		return;
+	}
+	for (uint32_t i = 0; i < frame.count; i++) {
+		op.args[i] = frame.events[i].ref;
+	}
+	const auto strict = [&](uint32_t expected) {
+		// Operands in order; the first that fails stops the instruction.
+		if (frame.count > expected) return false;
+		if (frame.count < expected) {
+			return frame.count != 0 && !frame.events[frame.count - 1].ok && !ok;
+		}
+		return true;
+	};
+	bool supported = false;
+	if (const int arity = PureArity(op.opcode); arity >= 0) {
+		op.kind   = SrtTraceOp::Pure;
+		supported = strict(static_cast<uint32_t>(arity));
+	} else {
+		switch (op.opcode) {
+			case ValueOpcode::GetUserData: {
+				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+				op.kind        = SrtTraceOp::UserData;
+				op.imm         = static_cast<int32_t>(reg) - static_cast<int32_t>(m_program.user_data_base);
+				supported      = frame.count == 0;
+				break;
+			}
+			case ValueOpcode::GetShaderBase:
+				op.kind   = SrtTraceOp::ShaderBase;
+				supported = frame.count == 0;
+				break;
+			case ValueOpcode::Phi:
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32:
+			case ValueOpcode::ReadConst:
+			case ValueOpcode::ConditionRef:
+				op.kind   = SrtTraceOp::Pass;
+				supported = frame.count == 1;
+				break;
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x2: {
+				const auto component = inst.Arg(1).Resolve();
+				if (!component.IsImmediate() || component.GetType() != Type::U32 ||
+				    component.U32() >= 2u) {
+					break;
+				}
+				op.flags            = static_cast<uint8_t>(component.U32());
+				const auto* source  = inst.Arg(0).ResolveInstruction();
+				if (op.opcode == ValueOpcode::CompositeExtractU64) {
+					op.kind   = SrtTraceOp::Extract64;
+					supported = frame.count == 1;
+				} else if (source != nullptr &&
+				           source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+					op.kind   = SrtTraceOp::Pass;
+					supported = frame.count == 1;
+				} else if (source != nullptr && source->GetOpcode() == ValueOpcode::IAddCarry32) {
+					op.kind   = SrtTraceOp::AddCarryExtract;
+					supported = strict(2);
+				}
+				break;
+			}
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectF32:
+				op.kind = SrtTraceOp::Select;
+				if (frame.count == 1) {
+					supported = !frame.events[0].ok && !ok;
+				} else if (frame.count == 2 && frame.events[0].ok) {
+					// The arm the predicate chose.
+					op.flags  = frame.events[0].value != 0u ? 1u : 2u;
+					supported = true;
+				}
+				break;
+			case ValueOpcode::LogicalAnd:
+				op.kind   = SrtTraceOp::LogicalAnd;
+				supported = frame.count == 1 || frame.count == 2;
+				break;
+			case ValueOpcode::LogicalOr:
+				op.kind   = SrtTraceOp::LogicalOr;
+				supported = frame.count == 1 || frame.count == 2;
+				break;
+			case ValueOpcode::LoadAddressU32:
+			case ValueOpcode::ReadConstBuffer: {
+				if (!IsRawRead(m_program, inst)) break;
+				const auto  flags  = inst.Flags<MemoryFlags>();
+				const auto* handle = inst.Arg(0).ResolveInstruction();
+				if (handle == nullptr) break;
+				op.kind  = SrtTraceOp::RawRead;
+				op.imm   = static_cast<int32_t>(m_program.memory_info[flags.index].offset);
+				op.flags = op.opcode == ValueOpcode::ReadConstBuffer ? 1u : 0u;
+				if (op.flags != 0u && handle->NumArgs() != 4u) break;
+				supported = strict(op.flags != 0u ? 5u : 3u);
+				break;
+			}
+			default: break;
+		}
+	}
+	if (!supported) {
+		Abort("unsupported instruction");
+		return;
+	}
+	auto& ops = m_recording->ops;
+	if (ops.size() >= TraceMaxOps) {
+		Abort("trace too long");
+		return;
+	}
+	ops.push_back(op);
+	const auto ref = static_cast<int32_t>(ops.size() - 1);
+	if (ok) {
+		auto& slots = m_slots[walker.m_trace_id];
+		if (index < slots.size()) {
+			slots[index] = ref;
+		}
+	}
+	frame.result = {ref, ok, value};
+	frame.have   = true;
+}
+
+bool SrtTraceSession::Serve(SrtWalker& walker, Value value, uint64_t& result) {
+	const auto& trace = *m_trace;
+	if (m_cursor >= trace.calls.size()) {
+		Abandon("more calls than recorded");
+		return walker.EvaluateWideImpl(value, result);
+	}
+	const auto& call     = trace.calls[m_cursor];
+	const auto  resolved = value.Resolve();
+	const Inst* inst     = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
+	if (call.walker != walker.m_trace_id || call.inst != inst) {
+		Abandon("different call");
+		return walker.EvaluateWideImpl(value, result);
+	}
+	if (inst == nullptr) {
+		m_cursor++;
+		return walker.EvaluateWideImpl(value, result);
+	}
+	if (!RunOps(call.end)) {
+		Abandon("guard");
+		return walker.EvaluateWideImpl(value, result);
+	}
+	m_cursor++;
+	if (call.result == Failed) {
+		return false;
+	}
+	if (call.result < 0) {
+		result = trace.immediates[static_cast<size_t>(-1 - call.result)];
+		return true;
+	}
+	result = m_values[static_cast<size_t>(call.result)];
+	return m_status[static_cast<size_t>(call.result)] != 0u;
+}
+
+bool SrtTraceSession::RunOps(uint32_t end) {
+	const auto& trace = *m_trace;
+	const auto* ops   = trace.ops.data();
+	const auto* imms  = trace.immediates.data();
+	auto*       vals  = m_values.data();
+	auto*       stat  = m_status.data();
+	for (uint32_t i = m_next_op; i < end; i++) {
+		const auto& op = ops[i];
+		uint64_t    v[5] {};
+		bool        ok[5] {};
+		bool        all = true;
+		for (uint32_t j = 0; j < op.count; j++) {
+			const auto ref = op.args[j];
+			if (ref >= 0) {
+				v[j]  = vals[ref];
+				ok[j] = stat[ref] != 0u;
+			} else if (ref != Failed) {
+				v[j]  = imms[-1 - ref];
+				ok[j] = true;
+			}
+			all = all && ok[j];
+		}
+		bool     status = false;
+		uint64_t value  = 0;
+		switch (op.kind) {
+			case SrtTraceOp::Pure:
+				status = all && op.count == static_cast<uint32_t>(PureArity(op.opcode)) &&
+				         ApplyPureOp(op.opcode, *op.inst, v, value);
+				break;
+			case SrtTraceOp::UserData: {
+				const auto& user = m_walkers[op.walker]->m_runtime.user_data;
+				status           = op.imm >= 0 && static_cast<size_t>(op.imm) < user.size();
+				value            = status ? user[static_cast<size_t>(op.imm)] : 0u;
+				break;
+			}
+			case SrtTraceOp::ShaderBase:
+				status = true;
+				value  = m_walkers[op.walker]->m_runtime.shader_base;
+				break;
+			case SrtTraceOp::Pass:
+				status = ok[0];
+				value  = v[0];
+				break;
+			case SrtTraceOp::Extract64:
+				status = ok[0];
+				value  = static_cast<uint32_t>(v[0] >> (op.flags * 32u));
+				break;
+			case SrtTraceOp::AddCarryExtract: {
+				status = all && op.count == 2;
+				const auto sum =
+				    static_cast<uint64_t>(static_cast<uint32_t>(v[0])) + static_cast<uint32_t>(v[1]);
+				value = op.flags == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
+				break;
+			}
+			case SrtTraceOp::Select:
+				if (op.count == 1) {
+					// The predicate failed when recorded; if it succeeds now an arm is needed.
+					if (ok[0]) return false;
+					status = false;
+				} else {
+					if (!ok[0] || (v[0] != 0u ? 1u : 2u) != op.flags) return false;
+					status = ok[1];
+					value  = v[1];
+				}
+				break;
+			case SrtTraceOp::LogicalAnd:
+				if (ok[0] && v[0] == 0u) {
+					if (op.count != 1) return false;
+					status = true;
+					value  = 0u;
+				} else {
+					if (op.count != 2) return false;
+					status = ok[1] && !(v[1] != 0u && !ok[0]);
+					value  = v[1] != 0u;
+				}
+				break;
+			case SrtTraceOp::LogicalOr:
+				if (ok[0] && v[0] != 0u) {
+					if (op.count != 1) return false;
+					status = true;
+					value  = 1u;
+				} else {
+					if (op.count != 2) return false;
+					status = ok[1] && !(v[1] == 0u && !ok[0]);
+					value  = v[1] != 0u;
+				}
+				break;
+			case SrtTraceOp::RawRead: {
+				const bool const_buffer = op.flags != 0u;
+				if (!all || op.count != (const_buffer ? 5u : 3u)) {
+					status = false;
+					break;
+				}
+				uint64_t base    = 0;
+				uint64_t address = 0;
+				switch (ComputeRawAddress(const_buffer, op.imm, v[0], v[1], v[2],
+				                          const_buffer ? v[3] : 0u, base, address)) {
+					case RawAddress::Fail: status = false; break;
+					case RawAddress::Zero:
+						status = true;
+						value  = 0u;
+						break;
+					case RawAddress::Read:
+						status = m_walkers[op.walker]->ReadRawWord(address, base, value);
+						break;
+				}
+				break;
+			}
+		}
+		if (status != op.ok) {
+			return false;
+		}
+		vals[i] = value;
+		stat[i] = status ? 1u : 0u;
+	}
+	if (end > m_next_op) {
+		m_next_op = end;
+	}
 	return true;
 }
 

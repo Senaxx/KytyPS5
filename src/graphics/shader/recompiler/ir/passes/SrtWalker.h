@@ -5,7 +5,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtNative.h"
 
 #include <array>
+#include <memory>
 #include <span>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -36,6 +38,86 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+class SrtWalker;
+
+// Replay traces (KYTY_SRT_TRACE=0 turns them off). A resource refresh evaluates one program's
+// values through two walkers (clean and ordinary) with memoized, recursive, lazy evaluation; the
+// walk was a third of the GPU thread in the jungle (DEBUGGING.md, 2026-10-05). A trace records
+// one refresh as a flat list of the instructions it evaluated, in order, with the operands each
+// used, and the top-level requests (calls) it served. The next refresh of the program replays
+// the list in a loop: no memo, no recursion, no operand resolution.
+//
+// Every data-dependent choice the recording made is a guard: an instruction that succeeded or
+// failed must do the same, a select must pick the same arm, a logical AND/OR must take the same
+// short-circuit path, and the refresh must request the same values in the same order. A guard
+// that does not hold abandons the trace: that request and the rest of the refresh are evaluated
+// as before (the memo is untouched by replay), and the program records again.
+// KYTY_SRT_TRACE_VERIFY=1 evaluates every replayed refresh again without the trace and stops on
+// a difference; KYTY_SRT_TRACE_STATS=1 reports how refreshes went.
+struct SrtTrace;
+
+class SrtTraceSession {
+public:
+	SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, SrtWalker& walker,
+	                const SrtRuntime& runtime);
+	~SrtTraceSession();
+	SrtTraceSession(const SrtTraceSession&)            = delete;
+	SrtTraceSession& operator=(const SrtTraceSession&) = delete;
+
+	// The refresh succeeded: a recording becomes the program's trace.
+	void Succeeded() { m_succeeded = true; }
+	// The refresh was served from the trace from start to end.
+	[[nodiscard]] bool FullyServed() const { return m_mode == Mode::Serve; }
+
+	// Turns tracing off on this thread (verification re-runs).
+	static bool& Suppressed();
+
+private:
+	friend class SrtWalker;
+	enum class Mode : uint8_t { Off, Record, Serve, Passthrough };
+
+	struct Event {
+		int32_t  ref   = 0; // >= 0: an op; < 0: immediate -1 - ref; Failed: an operand that failed
+		bool     ok    = false;
+		uint64_t value = 0; // while recording
+	};
+	static constexpr int32_t Failed = INT32_MIN;
+	struct Frame {
+		std::array<Event, 6> events {};
+		uint32_t             count  = 0;
+		Event                result {Failed, false, 0};
+		bool                 have   = false;
+	};
+
+	bool Evaluate(SrtWalker& walker, Value value, uint64_t& result);
+	bool Serve(SrtWalker& walker, Value value, uint64_t& result);
+	bool RunOps(uint32_t end);
+	void Abandon(const char* reason);
+	void Abort(const char* reason);
+	// Recording hooks, called from SrtWalker::EvaluateWideImpl.
+	void OnImmediate(bool ok, uint64_t bits);
+	void OnMemoHit(const SrtWalker& walker, uint32_t index, uint64_t value);
+	void OnInst(const SrtWalker& walker, const Inst& inst, uint32_t index, bool ok, uint64_t value);
+	void RestoreNative();
+
+	const ResourcePlan&    m_program;
+	SrtWalker*             m_walkers[2];
+	const SrtNativeCode*   m_native[2] {};
+	Mode                   m_mode      = Mode::Off;
+	bool                   m_succeeded = false;
+	// Recording.
+	std::unique_ptr<SrtTrace> m_recording;
+	std::vector<Frame>        m_frames;
+	std::vector<int32_t>      m_slots[2]; // evaluation index -> op, per walker
+	const char*               m_abort = nullptr;
+	// Serving.
+	std::shared_ptr<SrtTrace> m_trace;
+	std::vector<uint64_t>     m_values;
+	std::vector<uint8_t>      m_status;
+	uint32_t                  m_cursor  = 0;
+	uint32_t                  m_next_op = 0;
+};
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
@@ -57,6 +139,7 @@ private:
 	bool WalkBlocks(std::vector<uint32_t>& flat, const Refresh& refresh, const Outcome& outcome,
 	                uint8_t key);
 	friend struct SrtNativeHelpers;
+	friend class SrtTraceSession;
 
 	// Binds this walker to the plan's native code when the configuration is one it was compiled
 	// for (SrtNative.h), compiling it once the plan is refreshed often enough.
@@ -68,11 +151,19 @@ private:
 
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
 	static float Float32(uint64_t bits);
-	bool EvaluateWide(Value value, uint64_t& result);
+	bool EvaluateWide(Value value, uint64_t& result) {
+		if (m_trace != nullptr) [[unlikely]] {
+			return m_trace->Evaluate(*this, value, result);
+		}
+		return EvaluateWideImpl(value, result);
+	}
+	bool EvaluateWideImpl(Value value, uint64_t& result);
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	// EvaluateRawRead's read once the address is known.
+	bool ReadRawWord(uint64_t address, uint64_t base, uint64_t& result);
 	bool EvaluateBufferRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
@@ -86,6 +177,8 @@ private:
 	const SrtNativeCode*            m_native      = nullptr;
 	SrtNativeMode                   m_native_mode = SrtNativeMode::Self;
 	SrtNativeFrame                  m_native_frame;
+	SrtTraceSession*                m_trace    = nullptr;
+	uint8_t                         m_trace_id = 0;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;
 	uint64_t    m_read_failure_address = 0;

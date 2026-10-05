@@ -8,6 +8,9 @@
 #include "graphics/shader/shaderBindings.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cinttypes>
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <cstdio>
@@ -1386,8 +1389,12 @@ int LastIndirectImageFailureLine() {
 	return g_indirect_failure_line;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+namespace {
+
+bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& runtime,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                              bool& served) {
+	served                  = false;
 	g_indirect_failure_line = 0;
 	snapshot.bindless_heaps.clear();
 	snapshot.bindless_sampler_heaps.clear();
@@ -1408,6 +1415,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
+	SrtTraceSession trace(program, clean, walker, observed);
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return FailIndirect(__LINE__);
 	}
@@ -1557,7 +1565,66 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	                                 runtime.float_image_atomics)) {
 		return FailIndirect(__LINE__);
 	}
+	served = trace.FullyServed();
+	trace.Succeeded();
 	return true;
+}
+
+// KYTY_SRT_TRACE_VERIFY=1: a refresh served from a replay trace is evaluated again without it,
+// and any difference stops the emulator.
+void VerifyTracedRefresh(const ResourcePlan& program, const SrtRuntime& runtime,
+                         const ResourceSnapshot& snapshot,
+                         const ResourceSpecialization& specialization) {
+	ResourceSnapshot       reference_snapshot;
+	ResourceSpecialization reference_specialization;
+	bool                   served = false;
+	auto&                  suppressed = SrtTraceSession::Suppressed();
+	suppressed                        = true;
+	const bool ok = MaterializeResourcesImpl(program, runtime, reference_snapshot,
+	                                         reference_specialization, served);
+	suppressed    = false;
+	auto reads           = snapshot.specialization_reads;
+	auto reference_reads = reference_snapshot.specialization_reads;
+	std::ranges::sort(reads);
+	reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
+	std::ranges::sort(reference_reads);
+	reference_reads.erase(std::unique(reference_reads.begin(), reference_reads.end()),
+	                      reference_reads.end());
+	const char* field = nullptr;
+	if (!ok) field = "reference refresh failed";
+	else if (snapshot.flattened_srt != reference_snapshot.flattened_srt) field = "flattened_srt";
+	else if (snapshot.buffers != reference_snapshot.buffers) field = "buffers";
+	else if (snapshot.images != reference_snapshot.images) field = "images";
+	else if (snapshot.samplers != reference_snapshot.samplers) field = "samplers";
+	else if (snapshot.user_data != reference_snapshot.user_data) field = "user_data";
+	else if (snapshot.buffer_write_extents != reference_snapshot.buffer_write_extents) field = "buffer_write_extents";
+	else if (snapshot.bindless_heaps != reference_snapshot.bindless_heaps) field = "bindless_heaps";
+	else if (snapshot.bindless_sampler_heaps != reference_snapshot.bindless_sampler_heaps) field = "bindless_sampler_heaps";
+	else if (!(snapshot.uniform_fill == reference_snapshot.uniform_fill)) field = "uniform_fill";
+	else if (reads != reference_reads) field = "specialization_reads";
+	else if (!(specialization == reference_specialization)) field = "specialization";
+	if (field != nullptr) {
+		EXIT("SRT trace replay differs from the walk: shader %016" PRIx64 " stage %u: %s\n",
+		     program.shader_hash, static_cast<uint32_t>(program.stage), field);
+	}
+	static std::atomic<uint64_t> verified {0};
+	if (verified.fetch_add(1, std::memory_order_relaxed) % 100000 == 0) {
+		std::fprintf(stderr, "SRT trace replay verified: %llu\n",
+		             static_cast<unsigned long long>(verified.load()));
+	}
+}
+
+} // namespace
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	bool       served = false;
+	const bool ok     = MaterializeResourcesImpl(program, runtime, snapshot, specialization, served);
+	static const bool verify = std::getenv("KYTY_SRT_TRACE_VERIFY") != nullptr;
+	if (ok && served && verify) {
+		VerifyTracedRefresh(program, runtime, snapshot, specialization);
+	}
+	return ok;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

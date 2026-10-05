@@ -575,6 +575,7 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 class SrtNativeCode;
+struct SrtTrace;
 
 struct ResourcePlan {
 	struct EvaluationContext {
@@ -642,6 +643,11 @@ struct ResourcePlan {
 	mutable std::shared_ptr<const SrtNativeCode> native_code;
 	mutable uint32_t                             native_uses      = 0;
 	mutable bool                                 native_attempted = false;
+	// The replay trace of the last refresh (SrtWalker.h, SrtTraceSession), and how recording went.
+	mutable std::shared_ptr<SrtTrace> srt_trace;
+	mutable uint32_t                  srt_trace_uses    = 0;
+	mutable uint32_t                  srt_trace_misses  = 0;
+	mutable uint32_t                  srt_trace_backoff = 0;
 };
 
 struct Program: ResourcePlan {
