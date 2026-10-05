@@ -29,6 +29,10 @@ void MarkFrame();
 void Initialize();
 void Shutdown();
 
+// KYTY_PROFILE_ZONES=0: no zones, only Tracy's call-stack sampling and context switches (with an
+// elevated process). ~300,000 zones a frame inflated the share of small functions that open one.
+inline bool g_zones = true;
+
 struct Lifecycle {
 	static constexpr const char* name               = "Profiler";
 	static constexpr auto        initialize         = Profiler::Initialize;
@@ -53,7 +57,7 @@ struct Lifecycle {
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
 	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
 	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
-	    TRACY_CALLSTACK, tracy::ProfilerAvailable())
+	    TRACY_CALLSTACK, tracy::ProfilerAvailable() && Profiler::g_zones)
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 

@@ -5,6 +5,7 @@
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <cstdio>
+#include <cstdlib>
 #include <tracy/Tracy.hpp>
 
 namespace Profiler {
@@ -22,6 +23,9 @@ void MarkFrame() {
 }
 
 void Initialize() {
+	if (const char* zones = std::getenv("KYTY_PROFILE_ZONES"); zones != nullptr && zones[0] == '0') {
+		g_zones = false;
+	}
 	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
 		tracy::StartupProfiler();
 		TracySetProgramName("KytyPS5");
