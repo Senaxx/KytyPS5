@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -252,7 +253,8 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range,
+                    const CommandRecorder&               command_buffer) {
 	// Every use of the image goes through here (layouts), also when no barrier is needed: the
 	// cache keeps a released image until the GPU has finished the last tick that used it.
 	tick_accessed_last = std::max(tick_accessed_last, m_scheduler.CurrentTick());
@@ -302,7 +304,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pBufferMemoryBarriers    = &buffer_barrier;
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
-	auto command                        = m_scheduler.Current().Handle();
+	auto command                        = m_scheduler.Current().Recorder();
 	command.pipelineBarrier2(dependency);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
@@ -342,7 +344,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pBufferMemoryBarriers    = &buffer_barrier;
 	dependency.imageMemoryBarrierCount  = static_cast<uint32_t>(image_barriers.size());
 	dependency.pImageMemoryBarriers     = image_barriers.data();
-	auto command                        = m_scheduler.Current().Handle();
+	auto command                        = m_scheduler.Current().Recorder();
 	command.pipelineBarrier2(dependency);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
@@ -419,7 +421,7 @@ void Image::CopyImage(Image& source) {
 	if (copies.empty()) {
 		return;
 	}
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
@@ -461,7 +463,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
 
 	m_scheduler.EndRendering();
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
 	               resolved_source_range, command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
@@ -528,7 +530,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &barrier;
-	auto command                        = m_scheduler.Current().Handle();
+	auto command                        = m_scheduler.Current().Recorder();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
@@ -610,7 +612,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		copy.dstSubresource = {aspect, mip, layer, destination_layers};
 		copy.extent         = {width, height, depth};
 	}
-	auto command = m_scheduler.Current().Handle();
+	auto command = m_scheduler.Current().Recorder();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);

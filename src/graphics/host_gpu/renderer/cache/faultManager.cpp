@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <bit>
@@ -152,7 +153,7 @@ void FaultManager::ProcessFaultBufferImpl(ShaderFaultReport* report) {
 	}
 
 	m_scheduler.EndRendering();
-	auto               command = m_scheduler.Current().Handle();
+	auto               command = m_scheduler.Current().Recorder();
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;

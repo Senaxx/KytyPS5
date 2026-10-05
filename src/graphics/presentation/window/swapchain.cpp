@@ -16,6 +16,7 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 // A private copy for the frame dump (libPngEnc.cpp has its own, without file output).
 #define STB_IMAGE_WRITE_IMPLEMENTATION

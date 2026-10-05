@@ -9,6 +9,8 @@
 
 namespace Libs::Graphics {
 
+class CommandRecorder;
+
 struct GraphicContext;
 class CommandScheduler;
 
@@ -32,7 +34,7 @@ public:
 	// Records the conversion of the three thread counts at `threads` and returns the workgroup
 	// counts' location, ready for dispatchIndirect. Binds a compute pipeline and push state, so
 	// call it before committing the guest dispatch's bindings.
-	[[nodiscard]] Result Convert(vk::CommandBuffer command, vk::DeviceAddress threads,
+	[[nodiscard]] Result Convert(const CommandRecorder& command, vk::DeviceAddress threads,
 	                             const std::array<uint32_t, 3>& local_size);
 
 private:

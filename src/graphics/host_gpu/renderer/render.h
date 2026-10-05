@@ -37,6 +37,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class CommandRecorder;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -121,7 +122,11 @@ public:
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
+	// The raw command buffer. With the recording thread (CommandScheduler::EnableRecordingThread)
+	// this first waits until the thread has run everything queued; hot paths use Recorder().
 	[[nodiscard]] vk::CommandBuffer Handle() const;
+	// Records directly, or through the recording thread.
+	[[nodiscard]] CommandRecorder Recorder() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
 	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
@@ -141,6 +146,9 @@ private:
 
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
+	CommandScheduler&   m_scheduler;
+	// Begun and not submitted yet; m_buffer is its handle when not recorded on a thread.
+	bool                m_open            = false;
 	vk::CommandBuffer   m_buffer          = nullptr;
 	uint32_t            m_debug_op        = 0;
 	uint64_t            m_debug_submit_id = 0;
