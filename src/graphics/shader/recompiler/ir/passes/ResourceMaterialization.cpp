@@ -1412,6 +1412,8 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;
+		// Reads through the fast page path are captured there.
+		observed.capture_ranges = &reads;
 	}
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);

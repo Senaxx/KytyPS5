@@ -126,6 +126,19 @@ struct GuestPageReadCache {
 	size_t                      count = 0;
 	size_t                      next  = 0;
 
+	// The page's backing bytes when it is GPU-clean, else null (SrtRuntime::map_clean_page).
+	const uint8_t* Map(uint64_t page) {
+		for (size_t i = 0; i < count; i++) {
+			if (entries[i].page == page) {
+				return entries[i].backing;
+			}
+		}
+		auto& slot = count < Capacity ? entries[count++] : entries[next++ % Capacity];
+		slot       = {.page    = page,
+		              .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(page, TRACKER_PAGE_SIZE)};
+		return slot.backing;
+	}
+
 	// True when the page is GPU-clean and the bytes were copied from its backing.
 	bool Read(uint64_t address, std::span<uint32_t> values) {
 		const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
@@ -599,6 +612,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
+		static_assert(TRACKER_PAGE_SIZE == 4096u);
+		runtime.map_clean_page = +[](void* userdata, uint64_t page) {
+			return static_cast<GuestPageReadCache*>(userdata)->Map(page);
+		};
+		runtime.page_userdata = &clean_read_cache;
+		runtime.page_shift    = 12;
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			for (uint32_t axis = 0; axis < 3u; axis++) {
 				runtime.workgroup_count[axis] = input_info.dispatch_groups[axis];
