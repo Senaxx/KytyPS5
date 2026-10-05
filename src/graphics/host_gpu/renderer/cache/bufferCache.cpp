@@ -211,7 +211,9 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 
 	auto& command = m_scheduler.Current();
 	command.EndRendering();
-	const auto              native = command.Handle();
+	// Recorded through the recording thread: a raw Handle() made every readback wait for it to
+	// drain first (4.5 % of the GPU thread at the Leap Attack prompt, 2026-10-05).
+	const auto              native = command.Recorder();
 	vk::BufferMemoryBarrier before {};
 	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
 	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
