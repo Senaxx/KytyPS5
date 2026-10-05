@@ -55,6 +55,10 @@ public:
 	[[nodiscard]] float     F32Value() const;
 
 	bool operator==(const Value& other) const;
+	// Both name the same instruction (without resolving identities); inline, for hot paths.
+	[[nodiscard]] bool SameInstruction(const Value& other) const noexcept {
+		return type == Type::Opaque && other.type == Type::Opaque && inst == other.inst;
+	}
 
 private:
 	Type type = Type::Void;

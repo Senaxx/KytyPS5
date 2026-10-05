@@ -64,7 +64,47 @@ class SrtWalker;
 // as before (the memo is untouched by replay), and the program records again.
 // KYTY_SRT_TRACE_VERIFY=1 evaluates every replayed refresh again without the trace and stops on
 // a difference; KYTY_SRT_TRACE_STATS=1 reports how refreshes went.
-struct SrtTrace;
+struct SrtTraceOp {
+	enum Kind : uint8_t {
+		Pure,            // ApplyPureOp over the operands
+		UserData,        // user data word `imm`
+		ShaderBase,
+		Pass,            // the operand (Phi, bit casts, ReadConst, ConditionRef, extract of a pair)
+		Extract64,       // a 64-bit operand's dword `flags`
+		AddCarryExtract, // IAddCarry32 of two operands, dword `flags`
+		Select,          // predicate, then the arm `flags` (1 or 2) the recording took
+		LogicalAnd,      // the interpreter's short-circuit rules
+		LogicalOr,
+		RawRead,         // EvaluateRawRead; `flags` 1 for a constant buffer, `imm` the offset
+	};
+	Kind        kind   = Pure;
+	uint8_t     walker = 0;     // 0 the clean walker, 1 the ordinary one
+	uint8_t     count  = 0;     // operands
+	uint8_t     flags  = 0;
+	bool        ok     = false; // what the recording got
+	ValueOpcode opcode = ValueOpcode::Void;
+	int32_t     imm    = 0;
+	int32_t     args[5] {};     // SrtTraceSession::Event refs
+	const Inst* inst = nullptr;
+};
+
+struct SrtTraceCall {
+	Value       raw;                 // the requested value as given (matched without resolving)
+	const Inst* inst      = nullptr; // null: an immediate
+	uint64_t    immediate = 0;
+	uint32_t    end       = 0;       // ops up to here are evaluated for it
+	int32_t     result    = 0;       // an Event ref
+	uint8_t     walker    = 0;
+	bool        ok        = false;
+};
+
+struct SrtTrace {
+	std::vector<SrtTraceOp>   ops;
+	std::vector<uint64_t>     immediates;
+	std::vector<SrtTraceCall> calls;
+	uint8_t                   key = 0;
+};
+
 
 class SrtTraceSession {
 public:
@@ -99,7 +139,10 @@ private:
 		bool                 have   = false;
 	};
 
-	bool Evaluate(SrtWalker& walker, Value value, uint64_t& result);
+	// A request the walkers make: answered inline from the trace when it is the next one and
+	// needs no more ops (the common case), else through EvaluateSlow.
+	inline bool Evaluate(SrtWalker& walker, Value value, uint64_t& result);
+	bool EvaluateSlow(SrtWalker& walker, Value value, uint64_t& result);
 	bool Serve(SrtWalker& walker, Value value, uint64_t& result);
 	bool RunOps(uint32_t end);
 	void Abandon(const char* reason);
@@ -198,6 +241,28 @@ private:
 	uint64_t    m_read_failure_offset  = 0;
 	uint64_t    m_read_failure_size    = 0;
 };
+
+inline bool SrtTraceSession::Evaluate(SrtWalker& walker, Value value, uint64_t& result) {
+	if (m_mode == Mode::Serve && m_frames.empty() && m_cursor < m_trace->calls.size()) {
+		const auto& call = m_trace->calls[m_cursor];
+		if (call.walker == walker.m_trace_id && call.raw.SameInstruction(value) &&
+		    (call.end <= m_next_op || RunOps(call.end))) {
+			m_cursor++;
+			if (call.result == Failed) {
+				return false;
+			}
+			if (call.result < 0) {
+				result = m_trace->immediates[static_cast<size_t>(-1 - call.result)];
+				return true;
+			}
+			result = m_values[static_cast<size_t>(call.result)];
+			return m_status[static_cast<size_t>(call.result)] != 0u;
+		}
+	}
+	// Not the expected request, or RunOps failed a guard (Serve then runs those ops again, fails
+	// the same guard and abandons the trace).
+	return EvaluateSlow(walker, value, result);
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
