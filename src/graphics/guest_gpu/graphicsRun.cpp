@@ -1278,7 +1278,15 @@ uint32_t CommandProcessor::NumInstances() {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0 && args.gpu_args_address == 0) {
-		args.instance_count = NumInstances();
+		if (m_num_instances_args != 0 && GpuIndirectDraws()) {
+			// The instance count a DRAW_INDIRECT read on the GPU left: the GPU reads it too
+			// (RenderExecutor::DrawAuto). Reading it here drained the GPU (2.35 % of the GPU
+			// thread at the jungle's Leap Attack prompt, 2026-10-05). Read at this draw, not
+			// latched at the indirect draw: the arguments are not rewritten in between.
+			args.gpu_instance_count_address = m_num_instances_args + sizeof(uint32_t);
+		} else {
+			args.instance_count = NumInstances();
+		}
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 	CompleteDraw();

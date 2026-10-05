@@ -630,8 +630,10 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
-	// Nonzero: a fast-launch mesh draw whose counts the GPU reads from these guest DrawIndirectArgs.
+	// Nonzero: a draw whose counts the GPU reads from these guest DrawIndirectArgs.
 	uint64_t gpu_args_address = 0;
+	// Nonzero: a vertex-pipeline draw whose instance count the GPU reads from this guest dword.
+	uint64_t gpu_instance_count_address = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -1162,6 +1164,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_args_address, 16u, false, false,
 		                                              {}, true);
 	}
+	if (emit.gpu_instance_count_address != 0) {
+		(void)m_context.GetBufferCache().ObtainBuffer(emit.gpu_instance_count_address, 4u, false,
+		                                              false, {}, true);
+	}
 	if (mesh_active && draw.IsIndexed()) {
 		// Register the original guest indices for shader reads; PrepareGraphicsBindings
 		// synchronizes registered BDA ranges before any draw commands are committed.
@@ -1265,8 +1271,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// drawMeshTasksIndirectEXT, outside the render pass; the arguments are never read on the CPU.
 	vk::Buffer     mesh_indirect_buffer = nullptr;
 	vk::DeviceSize mesh_indirect_offset = 0;
-	if (emit.gpu_args_address != 0) {
-		constexpr uint32_t MeshIndirectEntries = 4096;
+	constexpr uint32_t MeshIndirectEntries = 4096;
+	if (mesh_active && emit.gpu_args_address != 0) {
 		auto&              cache = m_context.GetBufferCache();
 		auto&              args  = cache.GetBuffer(cache.FindBuffer(emit.gpu_args_address, 16u));
 		if (m_mesh_indirect == nullptr) {
@@ -1303,7 +1309,41 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// before the indirect read; the arguments are read where the cache holds them.
 	vk::Buffer     vertex_indirect_buffer = nullptr;
 	vk::DeviceSize vertex_indirect_offset = 0;
-	if (!mesh_active && emit.gpu_args_address != 0) {
+	if (!mesh_active && emit.gpu_instance_count_address != 0) {
+		// Only the instance count is on the GPU: a ring entry gets the known counts and offsets,
+		// and the GPU copies the instance count into it.
+		auto& cache  = m_context.GetBufferCache();
+		auto& source = cache.GetBuffer(cache.FindBuffer(emit.gpu_instance_count_address, 4u));
+		if (m_mesh_indirect == nullptr) {
+			m_mesh_indirect = std::make_unique<Buffer>(
+			    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal,
+			    0, vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eIndirectBuffer,
+			    MeshIndirectEntries * 16u);
+		}
+		vertex_indirect_buffer = m_mesh_indirect->Handle();
+		vertex_indirect_offset = (m_mesh_indirect_next++ % MeshIndirectEntries) * 16u;
+		m_context.GetCommandScheduler().EndRendering();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+		                       vk::AccessFlagBits::eTransferWrite |
+		                       vk::AccessFlagBits::eIndirectCommandRead;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr,
+		                          0, nullptr);
+		const uint32_t command[4] {draw.index_count, 0u, emit.first_vertex, emit.first_instance};
+		vk_buffer.updateBuffer(vertex_indirect_buffer, vertex_indirect_offset, sizeof(command),
+		                       command);
+		const vk::BufferCopy copy {source.Offset(emit.gpu_instance_count_address),
+		                           vertex_indirect_offset + sizeof(uint32_t), sizeof(uint32_t)};
+		vk_buffer.copyBuffer(source.Handle(), vertex_indirect_buffer, 1, &copy);
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &after, 0,
+		                          nullptr, 0, nullptr);
+	} else if (!mesh_active && emit.gpu_args_address != 0) {
 		auto& cache = m_context.GetBufferCache();
 		auto& args  = cache.GetBuffer(cache.FindBuffer(emit.gpu_args_address, 16u));
 		vertex_indirect_buffer = args.Handle();
@@ -1517,7 +1557,9 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                    args.first_instance);
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.gpu_args_address == 0 && (args.vertex_count == 0 || args.instance_count == 0)) {
+	if (args.gpu_args_address == 0 &&
+	    (args.vertex_count == 0 ||
+	     (args.instance_count == 0 && args.gpu_instance_count_address == 0))) {
 		LogDrawCensusLine(buffer, "DrawIndexAuto-empty", args.vertex_count, args.instance_count, -1,
 		                  -1, -1);
 		return;
@@ -1585,6 +1627,20 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 			}
 		}
 	}
+	if (args.gpu_instance_count_address != 0) {
+		const bool mesh   = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+		const bool gpu_ok = !mesh && ucfg.GetPrimType() != Prospero::PrimitiveType::kQuadListLegacy;
+		if (!gpu_ok) {
+			std::memcpy(&drawn.instance_count,
+			            reinterpret_cast<const void*>(args.gpu_instance_count_address),
+			            sizeof(uint32_t));
+			drawn.gpu_instance_count_address = 0;
+			if (drawn.instance_count == 0) {
+				ResetBindings();
+				return;
+			}
+		}
+	}
 	const DrawCallInfo drawn_info {CommandBufferDebugOp::DrawIndexAuto, drawn.vertex_count,
 	                               drawn.instance_count, drawn.first_instance};
 
@@ -1612,6 +1668,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(drawn.first_vertex));
 	emit.first_instance = instance_offset;
 	emit.gpu_args_address = drawn.gpu_args_address;
+	emit.gpu_instance_count_address = drawn.gpu_instance_count_address;
 	LogWatchedDraw(drawn_info, state, ucfg.GetIndexOffset(), 0, drawn.first_vertex,
 	               static_cast<int32_t>(emit.first_vertex), emit.first_instance, indirect);
 

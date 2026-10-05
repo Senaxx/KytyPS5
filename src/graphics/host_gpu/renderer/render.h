@@ -81,6 +81,9 @@ struct DrawAutoArgs {
 	// instance count, start vertex, start instance). The counts above are then unknown on the
 	// CPU; only fast-launch mesh draws come this way.
 	uint64_t         gpu_args_address           = 0;
+	// Nonzero (vertex count known): the instance count is the dword the GPU reads there (the
+	// NUM_INSTANCES a DRAW_INDIRECT read on the GPU left).
+	uint64_t         gpu_instance_count_address = 0;
 };
 
 struct SubmitInfo {
