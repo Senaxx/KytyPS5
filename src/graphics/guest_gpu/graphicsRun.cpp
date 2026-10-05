@@ -1058,10 +1058,12 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
 
-	if (!indexed && GpuIndirectDraws() && ((m_ctx.GetShaderStages() >> 19u) & 3u) == 1u) {
-		// Fast launch: the GPU reads the counts (RenderExecutor::ExecutePreparedDraw). The
+	if (!indexed && GpuIndirectDraws()) {
+		// The GPU reads the counts (RenderExecutor::DrawAuto and ExecutePreparedDraw): fast-launch
+		// mesh draws and vertex-pipeline draws; other mesh draws read them there on the CPU. The
 		// arguments are usually written by a dispatch just before; reading them here waited for
-		// the whole GPU (6.7 % of the GPU thread in the jungle, 2026-10-03).
+		// the whole GPU (6.7 % of the GPU thread in the jungle for the fast-launch draws,
+		// 2026-10-03, and 2.9 % for the rest, 2026-10-05).
 		m_num_instances_args = reinterpret_cast<uint64_t>(args_addr);
 		DrawIndexAuto({.offset_source    = DrawOffsetSource::IndirectArgs,
 		               .gpu_args_address = reinterpret_cast<uint64_t>(args_addr)});
