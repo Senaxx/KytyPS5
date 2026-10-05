@@ -193,6 +193,17 @@ public:
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, const vk::BufferCopy& region) const {
 		copyBuffer(source, destination, 1, &region);
 	}
+	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
+	                  const void* data) const {
+		if (!Threaded()) {
+			m_direct.updateBuffer(buffer, offset, size, data);
+			return;
+		}
+		const auto* copy = m_scheduler->Stash(static_cast<const std::byte*>(data), size);
+		m_scheduler->Record([=](vk::CommandBuffer command) {
+			command.updateBuffer(buffer, offset, size, copy);
+		});
+	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
 		Run([=](vk::CommandBuffer command) { command.fillBuffer(buffer, offset, size, value); });
