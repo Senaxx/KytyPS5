@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shaderBindings.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 
 #include <algorithm>
 #include <atomic>
@@ -542,7 +543,7 @@ void BindlessTable::RecordFeedbackSnapshot(CommandScheduler& scheduler) {
 	// Regions are allocated contiguously after word 0, so one copy covers every heap.
 	const vk::DeviceSize size = vk::DeviceSize {m_next_region} * sizeof(uint32_t);
 	scheduler.EndRendering();
-	auto                    command = scheduler.Current().Handle();
+	auto                    command = scheduler.Current().Recorder();
 	vk::BufferMemoryBarrier flags_written {};
 	flags_written.srcAccessMask       = vk::AccessFlagBits::eShaderWrite;
 	flags_written.dstAccessMask       = vk::AccessFlagBits::eTransferRead;

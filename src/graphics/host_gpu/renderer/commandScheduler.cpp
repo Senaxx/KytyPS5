@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/timeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <optional>
@@ -79,12 +80,12 @@ size_t CommandScheduler::CommandPool::Grow() {
 	return first;
 }
 
-vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
+vk::CommandBuffer CommandScheduler::CommandPool::Commit(uint64_t tick) {
 	auto       gpu_tick = m_master.KnownGpuTick();
-	const auto search   = [this, &gpu_tick](size_t begin, size_t end) -> std::optional<size_t> {
+	const auto search = [this, &gpu_tick, tick](size_t begin, size_t end) -> std::optional<size_t> {
 		for (size_t index = begin; index < end; ++index) {
 			if (gpu_tick >= m_ticks[index]) {
-				m_ticks[index] = m_master.CurrentTick();
+				m_ticks[index] = tick;
 				return index;
 			}
 		}
@@ -102,7 +103,7 @@ vk::CommandBuffer CommandScheduler::CommandPool::Commit() {
 	}
 	if (!found) {
 		found           = Grow();
-		m_ticks[*found] = m_master.CurrentTick();
+		m_ticks[*found] = tick;
 	}
 
 	m_hint = (*found + 1) % m_ticks.size();
@@ -153,7 +154,9 @@ void CommandScheduler::Shutdown() {
 	if (m_priority_thread.joinable()) {
 		m_priority_thread.join();
 	}
-	// Every tick was waited on above, so the queue thread has nothing left to submit.
+	// Every tick was waited on above, so the queue and recording threads have nothing left to
+	// submit.
+	StopRecordingThread();
 	StopSubmitThread();
 	{
 		std::lock_guard lock(m_operation_mutex);
@@ -447,7 +450,21 @@ CommandBuffer& CommandScheduler::Current() {
 
 CommandBuffer& CommandScheduler::BeginCommand() {
 	EXIT_IF(!m_command.IsInvalid());
-	m_command.m_buffer = m_command_pool.Commit();
+	m_command.m_open = true;
+	// Ticks are allocated in submit order, so this command buffer will be submitted with the
+	// current one.
+	const auto tick = m_master.CurrentTick();
+	if (m_threaded) {
+		m_command.m_buffer = nullptr;
+		Record([this, tick](vk::CommandBuffer) {
+			m_worker_buffer = m_command_pool.Commit(tick);
+			vk::CommandBufferBeginInfo begin_info {};
+			begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+			EXIT_NOT_IMPLEMENTED(m_worker_buffer.begin(&begin_info) != vk::Result::eSuccess);
+		});
+		return m_command;
+	}
+	m_command.m_buffer = m_command_pool.Commit(tick);
 	m_command.Begin();
 	return m_command;
 }
@@ -473,10 +490,26 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	    .debug_arg4   = m_command.m_debug_arg4,
 	};
 	m_command.m_buffer                = nullptr;
+	m_command.m_open                  = false;
 	m_recorded_release_mem_writes     = 0;
 	m_recorded_release_mem_interrupts = 0;
 	m_recorded_draws                  = 0;
 
+	if (m_threaded) {
+		// The tick is allocated now, in order; the recording thread ends the command buffer and
+		// submits it once it has recorded everything queued before.
+		job.tick = m_master.NextTick();
+		job.submit.AddSignal(m_master.Handle(), job.tick);
+		Record([this, job](vk::CommandBuffer command) mutable {
+			EXIT_NOT_IMPLEMENTED(command.end() != vk::Result::eSuccess);
+			job.buffer = command;
+			QueueSubmit(job);
+			m_worker_buffer = nullptr;
+		});
+		DispatchChunk();
+		ReportRecording();
+		return job.tick;
+	}
 	if (!m_async_submit) {
 		QueueSubmit(job);
 		return job.tick;
@@ -566,6 +599,148 @@ void CommandScheduler::StopSubmitThread() {
 	}
 	std::lock_guard lock(m_submit_mutex);
 	EXIT_IF(!m_submit_jobs.empty());
+}
+
+void CommandScheduler::EnableRecordingThread() {
+	// The owner enables it while constructing, before the first command buffer.
+	EXIT_IF(m_record_thread.joinable() || m_async_submit || !m_command.IsInvalid());
+	// QueueSubmit then takes the tick Submit() allocated, as for the queue thread.
+	m_async_submit  = true;
+	m_threaded      = true;
+	m_record_thread = std::jthread([this](std::stop_token stop) { RecordingThread(stop); });
+}
+
+void* CommandScheduler::Allocate(size_t size, size_t alignment) {
+	EXIT_IF(!m_threaded || size > Chunk::Size);
+	const auto take = [this] {
+		std::lock_guard lock(m_record_mutex);
+		if (m_free_chunks.empty()) {
+			return std::make_unique<Chunk>();
+		}
+		auto chunk = std::move(m_free_chunks.back());
+		m_free_chunks.pop_back();
+		return chunk;
+	};
+	if (m_chunk == nullptr) {
+		m_chunk = take();
+	}
+	auto offset = (m_chunk->used + alignment - 1) & ~(alignment - 1);
+	if (offset + size > Chunk::Size) {
+		DispatchChunk();
+		m_chunk = take();
+		offset  = 0;
+	}
+	m_chunk->used = offset + size;
+	return m_chunk->storage + offset;
+}
+
+void CommandScheduler::DispatchChunk() {
+	if (m_chunk == nullptr || m_chunk->first == nullptr) {
+		return;
+	}
+	{
+		std::lock_guard lock(m_record_mutex);
+		m_record_queue.push_back(std::move(m_chunk));
+		m_chunks_dispatched++;
+	}
+	m_record_available.notify_one();
+}
+
+vk::CommandBuffer CommandScheduler::DrainRecording() {
+	if (!m_threaded) {
+		return m_command.m_buffer;
+	}
+	KYTY_PROFILER_FUNCTION();
+	DispatchChunk();
+	std::unique_lock lock(m_record_mutex);
+	m_drains++;
+	// KYTY_RECORD_DRAIN_STACKS=1: which raw Handle() sites make the GPU thread wait (a host stack
+	// for every 4,999th drain, up to 64).
+	static const bool stacks = std::getenv("KYTY_RECORD_DRAIN_STACKS") != nullptr;
+	if (stacks && m_drains % 4999 == 0 && m_drains / 4999 <= 64) {
+		LOGF("Recording thread drain %" PRIu64 ":\n%s", m_drains,
+		     Common::HostBacktrace().c_str());
+	}
+	m_record_executed.wait(lock, [this] { return m_chunks_executed == m_chunks_dispatched; });
+	return m_worker_buffer;
+}
+
+void CommandScheduler::RecordingThread(std::stop_token stop) {
+	KYTY_PROFILER_THREAD("GpuRecord");
+	// A command's stashed arrays may sit in up to two chunks before its own: executed chunks are
+	// recycled only after the next two have run.
+	std::deque<std::unique_ptr<Chunk>> retained;
+	for (;;) {
+		std::unique_ptr<Chunk> chunk;
+		{
+			std::unique_lock lock(m_record_mutex);
+			// A stop request still runs the queued chunks: their ticks may already be waited on.
+			if (!m_record_available.wait(lock, stop, [this] { return !m_record_queue.empty(); })) {
+				return;
+			}
+			chunk = std::move(m_record_queue.front());
+			m_record_queue.pop_front();
+		}
+		for (auto* command = chunk->first; command != nullptr;) {
+			auto* next = command->next;
+			command->Execute(m_worker_buffer);
+			command->~RecordedCommand();
+			command = next;
+		}
+		chunk->first = nullptr;
+		chunk->last  = nullptr;
+		chunk->used  = 0;
+		retained.push_back(std::move(chunk));
+		std::unique_ptr<Chunk> recycled;
+		if (retained.size() > 2) {
+			recycled = std::move(retained.front());
+			retained.pop_front();
+		}
+		{
+			std::lock_guard lock(m_record_mutex);
+			if (recycled != nullptr) {
+				m_free_chunks.push_back(std::move(recycled));
+			}
+			m_chunks_executed++;
+		}
+		m_record_executed.notify_all();
+	}
+}
+
+// Every 5 s: command buffers submitted, chunks handed over, and drains (raw Handle() uses, which
+// make the GPU thread wait for the recording thread).
+void CommandScheduler::ReportRecording() {
+	m_record_report_buffers++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_record_report_time < std::chrono::seconds(5)) {
+		return;
+	}
+	uint64_t chunks = 0;
+	uint64_t drains = 0;
+	{
+		std::lock_guard lock(m_record_mutex);
+		chunks = m_chunks_dispatched;
+		drains = m_drains;
+	}
+	LOGF("Recording thread (5 s): %" PRIu64 " command buffers, %" PRIu64 " chunks, %" PRIu64
+	     " drains\n",
+	     m_record_report_buffers, chunks - m_record_report_chunks, drains - m_record_report_drains);
+	m_record_report_buffers = 0;
+	m_record_report_chunks  = chunks;
+	m_record_report_drains  = drains;
+	m_record_report_time    = now;
+}
+
+void CommandScheduler::StopRecordingThread() {
+	if (!m_record_thread.joinable()) {
+		return;
+	}
+	(void)DrainRecording();
+	m_record_thread.request_stop();
+	m_record_available.notify_all();
+	m_record_thread.join();
+	LOGF("Recording thread: %" PRIu64 " chunks, %" PRIu64 " drains\n", m_chunks_dispatched,
+	     m_drains);
 }
 
 void CommandScheduler::BeginNext() {

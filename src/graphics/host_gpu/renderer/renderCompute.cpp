@@ -11,6 +11,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/gpuTiming.h"
 #include "graphics/host_gpu/timeline.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
@@ -600,7 +601,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	do {
 		RebindImages(bindings);
 		RebindBuffers(bindings);
-		auto              vk_buffer        = buffer.Handle();
+		const auto        vk_buffer        = buffer.Recorder();
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
@@ -691,7 +692,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 			    std::max(cs_regs.cs_regs.num_thread_y, 1u),
 			    std::max(cs_regs.cs_regs.num_thread_z, 1u)};
 			const auto converted = m_indirect_groups->Convert(
-			    buffer.Handle(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
+			    buffer.Recorder(), args_buffer->BufferDeviceAddress() + args_offset, local_size);
 			indirect_buffer = converted.groups_buffer;
 			indirect_offset = converted.groups_offset;
 			bindings.dispatch_dimensions = {static_cast<uint32_t>(converted.threads),
@@ -701,7 +702,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		PreparedBindings* descriptor_stage = &bindings;
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
-		const auto vk_buffer = buffer.Handle();
+		const auto vk_buffer = buffer.Recorder();
 		const bool has_storage_writes =
 		    HasShaderBufferWrites(input_info.stage) ||
 		    std::any_of(
