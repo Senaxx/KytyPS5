@@ -195,6 +195,10 @@ private:
 
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
+	[[nodiscard]] TextureBinding FindResolvedTexture(
+	    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+	    TextureCache::ImageDesc desc, bool shader_conversion, vk::Format pixel_format,
+	    vk::Format view_format, uint32_t size);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,

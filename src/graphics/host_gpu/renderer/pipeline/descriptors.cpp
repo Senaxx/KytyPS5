@@ -30,6 +30,7 @@
 #include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 
+#include <unordered_map>
 #include <unordered_set>
 #include <mutex>
 #include <algorithm>
@@ -40,6 +41,7 @@
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -682,6 +684,69 @@ static bool ResolveTextureMipView(const TileSurfaceDescription& description, boo
 	return false;
 }
 
+namespace {
+
+// ResolveTexture's description of a texture (tiling, sizes, mip layout, view) depends only on the
+// T# and on how the shader uses the image: it was computed again for every bound image of every
+// draw, 2.4 % of the GPU thread at the jungle prompt (DEBUGGING.md, 2026-10-05). The texture
+// cache lookup that follows still runs every time. KYTY_TEXTURE_DESC_CACHE=0 turns this off.
+struct TextureDescKey {
+	std::array<uint32_t, 8> dwords {};
+	uint32_t                resource_class = 0;
+	uint32_t                numeric_class  = 0;
+	uint32_t                dimension      = 0;
+	uint32_t                mip_mode       = 0;
+	uint32_t                mip_count      = 0;
+	uint32_t                conversion     = 0;
+	uint32_t                swizzle        = 0;
+	uint32_t                flags          = 0;
+
+	bool operator==(const TextureDescKey&) const = default;
+};
+static_assert(sizeof(TextureDescKey) == 64);
+
+struct TextureDescKeyHash {
+	size_t operator()(const TextureDescKey& key) const noexcept {
+		return static_cast<size_t>(XXH3_64bits(&key, sizeof(key)));
+	}
+};
+
+struct TextureDescEntry {
+	TextureCache::ImageDesc desc;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint32_t                size              = 0;
+	bool                    shader_conversion = false;
+};
+
+TextureDescKey MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
+                                  const ShaderRecompiler::IR::DescriptorValue& value) {
+	TextureDescKey key;
+	std::copy_n(value.dwords.begin(), 8, key.dwords.begin());
+	key.resource_class = static_cast<uint32_t>(resource.resource_class);
+	key.numeric_class  = static_cast<uint32_t>(resource.numeric_class);
+	key.dimension      = static_cast<uint32_t>(resource.dimension);
+	key.mip_mode       = static_cast<uint32_t>(resource.mip_mode);
+	key.mip_count      = resource.mip_count;
+	key.conversion     = static_cast<uint32_t>(resource.conversion_format);
+	key.swizzle        = resource.shader_swizzle;
+	key.flags = (resource.read ? 1u : 0u) | (resource.written ? 2u : 0u) |
+	            (resource.atomic ? 4u : 0u) | (resource.depth_compare ? 8u : 0u) |
+	            (resource.cube ? 16u : 0u) | (resource.r128 ? 32u : 0u) |
+	            (resource.bindless ? 64u : 0u) | (value.dword_count << 8u);
+	return key;
+}
+
+bool TextureDescCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TEXTURE_DESC_CACHE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+} // namespace
+
 TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
@@ -696,6 +761,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
+	}
+
+	thread_local std::unordered_map<TextureDescKey, TextureDescEntry, TextureDescKeyHash> cache;
+	const bool use_cache = TextureDescCacheEnabled();
+	const auto key       = use_cache ? MakeTextureDescKey(resource, value) : TextureDescKey {};
+	if (use_cache) {
+		if (const auto it = cache.find(key); it != cache.end()) {
+			return FindResolvedTexture(resource, descriptor, it->second.desc,
+			                           it->second.shader_conversion, it->second.pixel_format,
+			                           it->second.view_format, it->second.size);
+		}
 	}
 
 	const auto address         = descriptor.Base40();
@@ -837,6 +913,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
+	if (use_cache) {
+		if (cache.size() >= 65536) {
+			cache.clear();
+		}
+		cache.emplace(key, TextureDescEntry {desc, pixel_format, view_format, size.size,
+		                                     shader_conversion});
+	}
+	return FindResolvedTexture(resource, descriptor, std::move(desc), shader_conversion,
+	                           pixel_format, view_format, size.size);
+}
+
+// ResolveTexture's texture cache lookup for a description (FindImage may adjust it).
+TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                                   const ShaderTextureResource&               descriptor,
+                                                   TextureCache::ImageDesc desc,
+                                                   bool shader_conversion, vk::Format pixel_format,
+                                                   vk::Format view_format, uint32_t size) {
+	auto&      texture_cache       = m_context.GetTextureCache();
+	const bool storage             = resource.written;
 	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
@@ -847,7 +942,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
