@@ -29,6 +29,16 @@ struct SrtRuntime {
 	// indirect dispatch) and workgroup size bound the invocation IDs in buffer write extents.
 	std::array<uint32_t, 3>   workgroup_count            = {};
 	std::array<uint32_t, 3>   workgroup_size             = {};
+	// Optional fast path for raw reads: the host bytes of a guest page whose contents are current
+	// (no GPU-written byte), or null; such a page is read directly instead of through
+	// read_memory. Valid for one refresh. A reader that cannot read (CleanRuntime without a
+	// strict reader) has none.
+	const uint8_t* (*map_clean_page)(void* userdata, uint64_t page) = nullptr;
+	void*          page_userdata                                     = nullptr;
+	uint32_t       page_shift                                        = 12;
+	// When the refresh captures its reads (specialization_reads), reads taken through the fast
+	// path are recorded here, as read_memory's capture records them.
+	std::vector<std::pair<uint64_t, uint64_t>>* capture_ranges = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -112,8 +122,8 @@ private:
 	const char*               m_abort = nullptr;
 	// Serving.
 	std::shared_ptr<SrtTrace> m_trace;
-	std::vector<uint64_t>     m_values;
-	std::vector<uint8_t>      m_status;
+	uint64_t*                 m_values = nullptr; // thread-local scratch, as large as the trace
+	uint8_t*                  m_status = nullptr;
 	uint32_t                  m_cursor  = 0;
 	uint32_t                  m_next_op = 0;
 };
@@ -179,6 +189,9 @@ private:
 	SrtNativeFrame                  m_native_frame;
 	SrtTraceSession*                m_trace    = nullptr;
 	uint8_t                         m_trace_id = 0;
+	// ReadRawWord's fast path: the last page mapped (SrtRuntime::map_clean_page).
+	uint64_t       m_mapped_page  = UINT64_MAX;
+	const uint8_t* m_mapped_bytes = nullptr;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;
 	uint64_t    m_read_failure_address = 0;

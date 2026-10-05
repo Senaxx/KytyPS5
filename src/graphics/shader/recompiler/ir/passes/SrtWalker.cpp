@@ -21,6 +21,9 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	if (runtime.read_specialization_memory == nullptr) {
+		runtime.map_clean_page = nullptr;
+	}
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
 	                          ? runtime.read_specialization_memory
 	                          : +[](void*, uint64_t, std::span<uint32_t>) { return false; };
@@ -922,6 +925,26 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 
 bool SrtWalker::ReadRawWord(uint64_t address, uint64_t base, uint64_t& result) {
 	uint32_t word = 0;
+	if (m_runtime.map_clean_page != nullptr) {
+		// The reader's own first step (a GPU-clean page is read from its backing), without the
+		// callback chain and its page search for every dword. Raw reads are dword aligned.
+		const auto page = address >> m_runtime.page_shift;
+		if (page != m_mapped_page) {
+			m_mapped_page  = page;
+			m_mapped_bytes = m_runtime.map_clean_page(m_runtime.page_userdata,
+			                                          page << m_runtime.page_shift);
+		}
+		if (m_mapped_bytes != nullptr && (address & 3u) == 0u) {
+			std::memcpy(&word,
+			            m_mapped_bytes + (address & ((uint64_t {1} << m_runtime.page_shift) - 1u)),
+			            sizeof(word));
+			if (m_runtime.capture_ranges != nullptr) {
+				m_runtime.capture_ranges->emplace_back(address, sizeof(word));
+			}
+			result = word;
+			return true;
+		}
+	}
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			// A plan without control flow cannot tell a guarded read from an active one: a
@@ -1280,6 +1303,7 @@ struct SrtTraceOp {
 };
 
 struct SrtTraceCall {
+	Value       raw;                 // the requested value as given (matched without resolving)
 	const Inst* inst      = nullptr; // null: an immediate
 	uint64_t    immediate = 0;
 	uint32_t    end       = 0;       // ops up to here are evaluated for it
@@ -1379,8 +1403,14 @@ SrtTraceSession::SrtTraceSession(const ResourcePlan& program, SrtWalker& clean, 
 	if (program.srt_trace != nullptr && program.srt_trace->key == key) {
 		m_mode  = Mode::Serve;
 		m_trace = program.srt_trace;
-		m_values.resize(m_trace->ops.size());
-		m_status.resize(m_trace->ops.size());
+		thread_local std::vector<uint64_t> values;
+		thread_local std::vector<uint8_t>  status;
+		if (values.size() < m_trace->ops.size()) {
+			values.resize(m_trace->ops.size());
+			status.resize(m_trace->ops.size());
+		}
+		m_values = values.data();
+		m_status = status.data();
 	} else if (++program.srt_trace_uses >= TraceAfterUses) {
 		m_mode      = Mode::Record;
 		m_recording = std::make_unique<SrtTrace>();
@@ -1481,6 +1511,7 @@ bool SrtTraceSession::Evaluate(SrtWalker& walker, Value value, uint64_t& result)
 	if (top) {
 		const auto resolved = value.Resolve();
 		SrtTraceCall call;
+		call.raw    = value;
 		call.inst   = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
 		call.end    = static_cast<uint32_t>(m_recording->ops.size());
 		call.result = frame.result.ref;
@@ -1667,12 +1698,19 @@ bool SrtTraceSession::Serve(SrtWalker& walker, Value value, uint64_t& result) {
 		Abandon("more calls than recorded");
 		return walker.EvaluateWideImpl(value, result);
 	}
-	const auto& call     = trace.calls[m_cursor];
-	const auto  resolved = value.Resolve();
-	const Inst* inst     = resolved.IsImmediate() ? nullptr : resolved.TryInstruction();
-	if (call.walker != walker.m_trace_id || call.inst != inst) {
+	const auto& call = trace.calls[m_cursor];
+	if (call.walker != walker.m_trace_id) {
 		Abandon("different call");
 		return walker.EvaluateWideImpl(value, result);
+	}
+	const Inst* inst = call.inst;
+	if (!(call.raw == value)) {
+		// The same value through another identity chain still matches.
+		const auto resolved = value.Resolve();
+		if ((resolved.IsImmediate() ? nullptr : resolved.TryInstruction()) != call.inst) {
+			Abandon("different call");
+			return walker.EvaluateWideImpl(value, result);
+		}
 	}
 	if (inst == nullptr) {
 		m_cursor++;
@@ -1698,8 +1736,8 @@ bool SrtTraceSession::RunOps(uint32_t end) {
 	const auto& trace = *m_trace;
 	const auto* ops   = trace.ops.data();
 	const auto* imms  = trace.immediates.data();
-	auto*       vals  = m_values.data();
-	auto*       stat  = m_status.data();
+	auto*       vals  = m_values;
+	auto*       stat  = m_status;
 	for (uint32_t i = m_next_op; i < end; i++) {
 		const auto& op = ops[i];
 		uint64_t    v[5] {};
