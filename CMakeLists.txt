@@ -194,6 +194,62 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 config_compiler_and_linker()
 
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
+
+# Profile-guided optimization (clang and clang-cl), after Jetsku's U59 build. Use a separate build
+# directory for each step:
+# 1. KYTY_PGO_GENERATE=ON builds an instrumented emulator. Run it with KYTY_PGO_FILE=<x.profraw>:
+#    it writes its counters every KYTY_PGO_DUMP_SECONDS (default 20) to that file (main.cpp), so a
+#    run stopped with TerminateProcess keeps its last complete dump.
+# 2. llvm-profdata merge -o <x.profdata> <dumps>, with the llvm-profdata of the compiler's version.
+# 3. KYTY_PGO_USE=<x.profdata> builds the optimized emulator.
+# Only Kyty's own targets (declared below) get the flags: third-party code a training run does not
+# exercise (the SPIR-V optimizer, ...) keeps its normal optimization instead of being treated as
+# cold. They are compile options, not CMAKE_CXX_FLAGS.
+option(KYTY_PGO_GENERATE "Instrumented build for profile-guided optimization (clang)" OFF)
+set(KYTY_PGO_USE "" CACHE FILEPATH "llvm-profdata output to optimize with (clang; empty: none)")
+set(KYTY_PGO_RUNTIME "" CACHE FILEPATH "clang_rt.profile-x86_64.lib (clang-cl; empty: search)")
+if(KYTY_PGO_GENERATE OR KYTY_PGO_USE)
+	if(NOT CLANG)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE/KYTY_PGO_USE need clang or clang-cl")
+	endif()
+	if(KYTY_PGO_GENERATE AND KYTY_PGO_USE)
+		message(FATAL_ERROR "KYTY_PGO_GENERATE and KYTY_PGO_USE are separate builds")
+	endif()
+endif()
+if(KYTY_PGO_GENERATE)
+	add_compile_options(-fprofile-instr-generate)
+	add_compile_definitions(KYTY_PGO_GENERATE=1)
+	if(KYTY_CLANG_CL)
+		# lld-link is called directly, so the profile runtime has to be named. Some clang-cl
+		# distributions do not ship it; the one of Visual Studio's LLVM of the same major version
+		# works too (KYTY_PGO_RUNTIME).
+		set(kyty_profile_runtime "${KYTY_PGO_RUNTIME}")
+		if(NOT kyty_profile_runtime)
+			cmake_path(GET CMAKE_CXX_COMPILER PARENT_PATH kyty_llvm_bin)
+			file(GLOB kyty_profile_runtime "${kyty_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+		endif()
+		if(NOT kyty_profile_runtime)
+			message(FATAL_ERROR "KYTY_PGO_GENERATE: clang_rt.profile-x86_64.lib not found next to ${CMAKE_CXX_COMPILER}; set KYTY_PGO_RUNTIME")
+		endif()
+		list(GET kyty_profile_runtime 0 kyty_profile_runtime)
+		link_libraries("${kyty_profile_runtime}")
+		# clang 19 also asks for the runtime by its new name (clang_rt.profile.lib), which the
+		# older-layout runtimes do not have; the one named above provides the same symbols.
+		add_link_options("/NODEFAULTLIB:clang_rt.profile.lib")
+	else()
+		add_link_options(-fprofile-instr-generate)
+	endif()
+	message(STATUS "PGO: instrumented build (run with KYTY_PGO_FILE=<file.profraw>)")
+elseif(KYTY_PGO_USE)
+	if(NOT EXISTS "${KYTY_PGO_USE}")
+		message(FATAL_ERROR "KYTY_PGO_USE: ${KYTY_PGO_USE} does not exist")
+	endif()
+	# No warnings for sources without profile data (launcher, tests) or per function.
+	add_compile_options("-fprofile-instr-use=${KYTY_PGO_USE}" -Wno-profile-instr-unprofiled
+	                    -Wno-profile-instr-out-of-date -Wno-backend-plugin)
+	message(STATUS "PGO: optimizing with ${KYTY_PGO_USE}")
+endif()
+
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
 file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
