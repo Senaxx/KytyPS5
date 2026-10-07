@@ -254,6 +254,13 @@ private:
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
+	// Bindless usage probe (UpdateBindlessUsageProbe): the frame it was armed in (0 = idle), the
+	// first frame the next may start, and the frame the pending feedback snapshot was recorded.
+	uint64_t                              m_bindless_probe_frame      = 0;
+	uint64_t                              m_bindless_next_probe       = 0;
+	uint64_t                              m_bindless_snapshot_frame   = 0;
+	std::vector<ImageId>                  m_bindless_unused;
+	void UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame);
 	std::vector<uint32_t>                 m_bindless_srt;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

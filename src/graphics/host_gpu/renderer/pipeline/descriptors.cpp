@@ -1252,9 +1252,11 @@ void RenderExecutor::ResolveBindlessRequests() {
 	m_bindless_frame = frame;
 	if (!table.SnapshotRecorded()) {
 		table.RecordFeedbackSnapshot(scheduler);
+		m_bindless_snapshot_frame = frame;
 		return;
 	}
 	table.ConsumeSnapshot();
+	const auto snapshot_frame = m_bindless_snapshot_frame;
 	// Each texture may upload and detile; spread first sight of a scene over a few frames.
 	constexpr uint32_t Budget   = 128;
 	uint32_t           resolved = RevalidateBindlessKeys(Budget);
@@ -1292,7 +1294,58 @@ void RenderExecutor::ResolveBindlessRequests() {
 		LOGF("Bindless requests: frame=%" PRIu64 " requested=%u resolved=%u\n", frame,
 		     requested, resolved);
 	}
+	UpdateBindlessUsageProbe(frame, snapshot_frame);
 	table.RecordFeedbackSnapshot(scheduler);
+	m_bindless_snapshot_frame = frame;
+}
+
+// Bindless textures stay pinned in the texture cache while a heap key refers to them, and the
+// guest's heaps refer to every texture it has streamed in: on 4-8 GB cards they grew to 2-5 GB
+// and never shrank, until allocations failed (ISSUES #15). Under memory pressure a probe finds
+// the ones no draw samples any more: it marks every resident key's feedback word, draws that
+// sample a key overwrite its mark, and a snapshot taken ProbeFrames later lists the images whose
+// keys all kept it. The texture cache may then free those like unpinned images; their keys go
+// back to pending, and a draw that samples one again asks for it anew. KYTY_BINDLESS_EVICT=0
+// disables the probe.
+void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_frame) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_EVICT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (!enabled) {
+		return;
+	}
+	constexpr uint64_t ProbeFrames   = 16; // frames a texture must go unsampled
+	constexpr uint64_t ProbeInterval = 32; // frames between the end of one probe and the next
+	auto&              table         = m_context.GetBindlessTable();
+	auto&              texture_cache = m_context.GetTextureCache();
+	if (m_bindless_probe_frame != 0) {
+		// The snapshot read here must have been recorded ProbeFrames after the marks.
+		if (snapshot_frame < m_bindless_probe_frame + ProbeFrames) {
+			return;
+		}
+		m_bindless_unused.clear();
+		table.CollectUnusedImages(m_bindless_unused);
+		texture_cache.SetBindlessEvictable(m_bindless_unused);
+		m_bindless_probe_frame = 0;
+		m_bindless_next_probe  = frame + ProbeInterval;
+		static std::atomic<uint32_t> logged = 0;
+		if (logged.fetch_add(1) < 32) {
+			uint64_t bytes = 0;
+			for (const auto id: m_bindless_unused) {
+				if (const auto* image = texture_cache.m_slot_images.try_get(id); image != nullptr) {
+					bytes += image->AccountedSize();
+				}
+			}
+			LOGF("Bindless probe: frame=%" PRIu64 " unused=%zu (%" PRIu64 " MB) may be evicted\n",
+			     frame, m_bindless_unused.size(), bytes >> 20u);
+		}
+		return;
+	}
+	if (frame >= m_bindless_next_probe && texture_cache.UnderPressure()) {
+		table.ArmUsageProbe();
+		m_bindless_probe_frame = frame;
+	}
 }
 
 // Bindless samplers: the S# records of each sampler heap a draw indexes are mirrored into the

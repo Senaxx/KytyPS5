@@ -19,7 +19,7 @@
 namespace Libs::Graphics {
 
 BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_graphics(graphics) {
+    : m_graphics(graphics), m_scheduler(scheduler) {
 	if (!graphics.bindless_enabled) {
 		return;
 	}
@@ -443,10 +443,31 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 }
 
 uint32_t BindlessTable::AllocateSlot(uint32_t binding) {
-	if (binding >= ImageArrays || m_next_slot[binding] >= m_images_per_array) {
+	if (binding >= ImageArrays) {
+		return 0;
+	}
+	// Keys are settled again whenever the guest rewrites a heap entry or a texture is evicted,
+	// and each settle took a new slot: the array would fill up over a long session.
+	if (auto& free = m_free_slots[binding];
+	    !free.empty() && m_scheduler.IsFree(free.front().second)) {
+		const auto slot = free.front().first;
+		free.pop_front();
+		return slot;
+	}
+	if (m_next_slot[binding] >= m_images_per_array) {
 		return 0;
 	}
 	return m_next_slot[binding]++;
+}
+
+void BindlessTable::ReleaseSlot(uint32_t binding, uint32_t slot) {
+	static const bool reuse = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_SLOT_REUSE");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (reuse && binding < ImageArrays && slot >= PlaceholderColors) {
+		m_free_slots[binding].emplace_back(slot, m_scheduler.CurrentTick());
+	}
 }
 
 void BindlessTable::WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view,
@@ -512,6 +533,7 @@ bool BindlessTable::ReleaseViews(std::span<const vk::ImageView> views) {
 						std::erase(heap.resolved, id);
 						heap.checked_generation = 0;
 					}
+					ReleaseSlot(binding, slot);
 					heap.slots[key]   = 0;
 					heap.settled[key] = 0;
 					heap.images[key]  = {};
@@ -578,9 +600,10 @@ void BindlessTable::TakeRequests(const Heap& heap, std::vector<uint32_t>& keys) 
 	                                heap.entries * sizeof(uint32_t));
 	bool cleared = false;
 	for (uint32_t key = 0; key < heap.entries; key++) {
-		if (snapshot[heap.region + key] != 0) {
+		if (snapshot[heap.region + key] == 1u) {
 			// A flag the GPU sets again after the snapshot may be lost here; a key that is
-			// still pending is flagged again by the next draw that samples it.
+			// still pending is flagged again by the next draw that samples it. Other values
+			// are usage-probe marks (ArmUsageProbe), not requests.
 			feedback[heap.region + key] = 0;
 			keys.push_back(key);
 			cleared = true;
@@ -601,6 +624,39 @@ uint32_t BindlessTable::TakeWordZero() {
 		m_feedback->Flush(0, sizeof(uint32_t));
 	}
 	return value;
+}
+
+void BindlessTable::ArmUsageProbe() {
+	auto* feedback = reinterpret_cast<uint32_t*>(m_feedback->Mapped().data());
+	for (const auto& heap: m_heaps) {
+		bool marked = false;
+		for (uint32_t key = 0; key < heap.entries && key < heap.images.size(); key++) {
+			if (heap.images[key]) {
+				feedback[heap.region + key] = ProbeMark;
+				marked                      = true;
+			}
+		}
+		if (marked) {
+			m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+		}
+	}
+}
+
+void BindlessTable::CollectUnusedImages(std::vector<ImageId>& unused) {
+	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
+	m_feedback_snapshot->Invalidate(0, vk::DeviceSize {m_next_region} * sizeof(uint32_t));
+	// A key resolved, or a heap moved, after the probe was armed reads 0: in use.
+	for (const auto& [image, refs]: m_image_refs) {
+		if (refs.empty()) {
+			continue;
+		}
+		const bool sampled = std::any_of(refs.begin(), refs.end(), [&](const auto& ref) {
+			return snapshot[ref.first->region + ref.second] != ProbeMark;
+		});
+		if (!sampled) {
+			unused.push_back(refs.front().first->images[refs.front().second]);
+		}
+	}
 }
 
 void BindlessTable::AddImageReference(ImageId id, Heap& heap, uint32_t key) {
@@ -627,6 +683,9 @@ bool BindlessTable::ReleaseKey(Heap& heap, uint32_t key) {
 			}
 		}
 	}
+	if (heap.slots[key] != 0) {
+		ReleaseSlot(heap.binding, heap.slots[key]);
+	}
 	heap.slots[key]   = 0;
 	heap.settled[key] = 0;
 	heap.images[key]  = {};
@@ -641,8 +700,12 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 	}
 	for (const auto& [heap, key]: found->second) {
 		if (heap->slots[key] != 0) {
-			WriteSlot(heap->binding, heap->slots[key], m_placeholder_views[heap->binding],
+			// Placeholder 0 of the heap's own view type: m_placeholder_views[binding] was a
+			// placeholder of binding 0's type for every binding below 3.
+			WriteSlot(heap->binding, heap->slots[key],
+			          m_placeholder_views[heap->binding * PlaceholderColors],
 			          vk::ImageLayout::eShaderReadOnlyOptimal);
+			ReleaseSlot(heap->binding, heap->slots[key]);
 		}
 		heap->slots[key]   = 0;
 		heap->settled[key] = 0;

@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <map>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -76,6 +77,15 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// Bindless images no draw sampled during the last usage probe (BindlessTable::
+	// CollectUnusedImages). They stay pinned, but under memory pressure the collector may free
+	// them like any other image; a key that samples one again asks for it anew. Replaces the
+	// previous set.
+	void SetBindlessEvictable(std::span<const ImageId> ids);
+	// Whether the cache's images are above the collector's pressure threshold.
+	[[nodiscard]] bool UnderPressure() const noexcept {
+		return m_total_used_memory >= m_pressure_gc_memory;
+	}
 
 private:
 	enum class TransferDirection { Upload, Download };
@@ -183,6 +193,7 @@ private:
 	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::unordered_set<ImageId>                       m_bindless_evictable;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;

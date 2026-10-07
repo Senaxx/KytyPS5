@@ -2174,6 +2174,7 @@ struct GcSkipStats {
 	uint64_t gpu_download = 0; // GPU-written, write-back failed
 	uint64_t young        = 0; // runs where the LRU had nothing old enough
 	uint64_t written_back = 0; // GPU-written tiled images written back, then freed
+	uint64_t bindless     = 0; // bindless images freed: unsampled in the last usage probe
 };
 GcSkipStats g_gc_skip;
 } // namespace
@@ -2270,7 +2271,14 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->bindless_pinned) {
-				continue;
+				// Pinned for bindless draws; under pressure one no draw sampled during the last
+				// usage probe may go (ISSUES #15: on 4-8 GB cards these grew to 2-5 GB and never
+				// shrank).
+				if (!(pressured || aggressive) || !m_bindless_evictable.contains(id)) {
+					continue;
+				}
+				m_bindless_evictable.erase(id);
+				g_gc_skip.bindless++;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
@@ -2345,12 +2353,19 @@ void TextureCache::RunGarbageCollector() {
 		     m_critical_gc_memory >> 20u);
 		LOGF("TexGc: visited=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) written_back=%" PRIu64
 		     " gone=%" PRIu64 " depth=%" PRIu64 " gpu_tiled=%" PRIu64 " gpu_unpressured=%" PRIu64
-		     " gpu_download_failed=%" PRIu64 " nothing_old_enough=%" PRIu64 "\n",
+		     " gpu_download_failed=%" PRIu64 " nothing_old_enough=%" PRIu64 " bindless=%" PRIu64
+		     "\n",
 		     g_gc_skip.visited, g_gc_skip.freed, g_gc_skip.freed_mb, g_gc_skip.written_back,
 		     g_gc_skip.gone, g_gc_skip.depth, g_gc_skip.gpu_tiled, g_gc_skip.gpu_unpress,
-		     g_gc_skip.gpu_download, g_gc_skip.young);
+		     g_gc_skip.gpu_download, g_gc_skip.young, g_gc_skip.bindless);
 		g_gc_skip = {};
 	}
+}
+
+void TextureCache::SetBindlessEvictable(std::span<const ImageId> ids) {
+	std::scoped_lock lock {m_lock};
+	m_bindless_evictable.clear();
+	m_bindless_evictable.insert(ids.begin(), ids.end());
 }
 
 void TextureCache::ProcessDownloadImages() {

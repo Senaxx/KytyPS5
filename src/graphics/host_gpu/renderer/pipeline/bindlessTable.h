@@ -93,7 +93,8 @@ public:
 	                                     uint32_t entries,
 	                                     const ShaderRecompiler::IR::ImageResource& resource);
 	[[nodiscard]] std::deque<Heap>& Heaps() noexcept { return m_heaps; }
-	// 0 when the array is full (slots are not reused yet).
+	// 0 when the array is full. A released slot is reused once the GPU has finished the work
+	// recorded before its release.
 	[[nodiscard]] uint32_t AllocateSlot(uint32_t binding);
 	void WriteSlot(uint32_t binding, uint32_t slot, vk::ImageView view, vk::ImageLayout layout);
 	// Resolve a key to a slot (0 = placeholder), or back to pending.
@@ -111,6 +112,14 @@ public:
 	// Diagnostics: feedback word 0 (the last out-of-range key, top bit set) in the snapshot,
 	// cleared.
 	[[nodiscard]] uint32_t TakeWordZero();
+	// Usage probe. Every draw that samples a key stores its feedback word (0 for a resident
+	// texture, 1 for a pending one), so marking every resident key's word with ProbeMark and
+	// reading a snapshot some frames later shows which keys no draw sampled in between.
+	// ArmUsageProbe marks them; CollectUnusedImages lists the images all of whose keys still
+	// carry the mark in the current snapshot.
+	static constexpr uint32_t ProbeMark = 2;
+	void                      ArmUsageProbe();
+	void                      CollectUnusedImages(std::vector<ImageId>& unused);
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
 	// the key's reference. Its slot keeps the old view, which frames in flight may still sample;
@@ -166,8 +175,13 @@ private:
 		return static_cast<uint64_t>(id.index) | (static_cast<uint64_t>(id.generation) << 32u);
 	}
 
+	// A key gave up its slot: free it for reuse after the GPU passes the current tick.
+	void ReleaseSlot(uint32_t binding, uint32_t slot);
+
 	GraphicContext&         m_graphics;
+	CommandScheduler&       m_scheduler;
 	std::deque<Heap>        m_heaps;
+	std::array<std::deque<std::pair<uint32_t, uint64_t>>, ImageArrays> m_free_slots; // slot, tick
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;
 	uint32_t                m_next_region = 1; // translation[0] is the out-of-range entry
 	std::array<uint32_t, ImageArrays> m_next_slot {PlaceholderColors, PlaceholderColors,
