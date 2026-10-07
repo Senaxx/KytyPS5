@@ -597,6 +597,87 @@ private:
 	bool                                                 m_stopped = false;
 };
 
+// Graphics shader translation on worker threads (plan.md P1; KYTY_ASYNC_TRANSLATION=0 translates
+// every shader on the GPU thread, as before). A new shader's translation (decode, CFG, IR,
+// resource tracking) took ~85 ms on the GPU thread, and an effect brings dozens: the first
+// Square slash in the jungle stopped the emulated GPU for 2-3 s, a new area for minutes. The
+// translation depends only on the code and the stage inputs, never on guest memory or the draw's
+// user data values (the disk cache's source key holds the same), so a worker can do it while the
+// draw is skipped; the materialization and the SPIR-V that need guest memory stay on the GPU
+// thread. Only draws with the depth test on are deferred (GetGraphicsPrograms): UI and layer
+// draws, which a game may draw once, translate at once, as their pipelines compile at once.
+// Compute always translates at once: a skipped dispatch can leave data unwritten.
+static const bool g_async_translation = [] {
+	const char* value = std::getenv("KYTY_ASYNC_TRANSLATION");
+	return value == nullptr || value[0] != '0';
+}();
+
+struct TranslationJob {
+	std::vector<uint32_t>                code;
+	std::vector<uint32_t>                back_code;
+	std::vector<uint32_t>                user_data;
+	ShaderVertexInputInfo                vertex {};
+	ShaderPixelInputInfo                 pixel {};
+	ShaderRecompiler::CompileOptions     options;
+	ShaderRecompiler::TranslateResult    result;
+	std::chrono::steady_clock::time_point queued;
+	std::atomic<bool>                    done {false};
+};
+
+class TranslationWorkers {
+public:
+	explicit TranslationWorkers(uint32_t threads) {
+		for (uint32_t i = 0; i < threads; i++) {
+			m_threads.emplace_back([this] { Run(); });
+		}
+	}
+	~TranslationWorkers() {
+		{
+			std::lock_guard lock(m_mutex);
+			m_stopped = true;
+			m_queue.clear();
+		}
+		m_work.notify_all();
+		for (auto& thread: m_threads) {
+			thread.join();
+		}
+	}
+	KYTY_CLASS_NO_COPY(TranslationWorkers);
+
+	void Submit(std::shared_ptr<TranslationJob> job) {
+		{
+			std::lock_guard lock(m_mutex);
+			m_queue.push_back(std::move(job));
+		}
+		m_work.notify_one();
+	}
+
+private:
+	void Run() {
+		KYTY_PROFILER_THREAD("ShaderTranslator");
+		for (;;) {
+			std::shared_ptr<TranslationJob> job;
+			{
+				std::unique_lock lock(m_mutex);
+				m_work.wait(lock, [this] { return m_stopped || !m_queue.empty(); });
+				if (m_queue.empty()) {
+					return;
+				}
+				job = std::move(m_queue.front());
+				m_queue.pop_front();
+			}
+			job->result = ShaderRecompiler::TranslateProgram(job->code, job->options);
+			job->done.store(true, std::memory_order_release);
+		}
+	}
+
+	std::mutex                                  m_mutex;
+	std::condition_variable                     m_work;
+	std::deque<std::shared_ptr<TranslationJob>> m_queue;
+	std::vector<std::thread>                    m_threads;
+	bool                                        m_stopped = false;
+};
+
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	std::size_t hash = 0;
 	PipelineKeyHash::Mix(hash, key.rendering.color_count);
@@ -989,6 +1070,17 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 
+		// A translation on the workers (TranslationWorkers): the draw waits for it by being skipped.
+		if (!translating.empty()) {
+			if (const auto job = translating.find(lookup_key);
+			    job != translating.end() && !job->second->done.load(std::memory_order_acquire)) {
+				translation_skips++;
+				Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
+				                                StageLabel(stage), params.hash);
+				return ShaderProgram {};
+			}
+		}
+
 		ShaderStageInputInfo stage_input {};
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage_input.vertex = &input_info;
@@ -1110,7 +1202,44 @@ struct PipelineCache::ProgramCache {
 		compile_zone.SetText("%s 0x%016" PRIx64, stage_name, params.hash);
 		KYTY_PROFILER_PHASE(compile_zone, "Shader compile", profiler::colors::DeepOrangeA200);
 		const auto compile_begin = std::chrono::steady_clock::now();
-		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		ShaderRecompiler::TranslateResult translated;
+		if (const auto job = translating.find(lookup_key); job != translating.end()) {
+			// Done (the check above returned while it was not): take the worker's translation.
+			const auto waited = std::chrono::duration<double, std::milli>(
+			                        std::chrono::steady_clock::now() - job->second->queued)
+			                        .count();
+			if (translations_done++ < 32) {
+				LOGF("ShaderTranslator: %s 0x%016" PRIx64 " ready after %.0f ms, %" PRIu64
+				     " draws skipped so far while translating\n",
+				     stage_name, params.hash, waited, translation_skips);
+			}
+			translated = std::move(job->second->result);
+			translating.erase(job);
+		} else if (defer_translation && stage != ShaderType::Compute && translators != nullptr) {
+			auto job = std::make_shared<TranslationJob>();
+			job->code.assign(compile_code.begin(), compile_code.end());
+			job->back_code.assign(params.back_code.begin(), params.back_code.end());
+			job->user_data.assign(user_data.begin(), user_data.end());
+			job->options           = options;
+			job->options.user_data = job->user_data;
+			job->options.back_code = job->back_code;
+			if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+				job->vertex                   = input_info;
+				job->options.input_info.vertex = &job->vertex;
+			} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+				job->pixel                   = input_info;
+				job->options.input_info.pixel = &job->pixel;
+			}
+			job->queued = std::chrono::steady_clock::now();
+			translating.emplace(lookup_key, job);
+			translators->Submit(std::move(job));
+			translation_skips++;
+			Profiler::CommandZone::Annotate("skipped %s %016" PRIx64 ": translating",
+			                                StageLabel(stage), params.hash);
+			return ShaderProgram {};
+		} else {
+			translated = ShaderRecompiler::TranslateProgram(compile_code, options);
+		}
 		if (translated.unsupported) {
 			// Remember the refusal: a skipped shader is dispatched again every frame, and
 			// re-deriving the same answer costs as much as a compile each time.
@@ -1200,6 +1329,15 @@ struct PipelineCache::ProgramCache {
 		} else {
 			disk = ShaderDiskCache::Store::Open(std::move(disk_directory));
 		}
+		if (g_async_translation) {
+			// KYTY_TRANSLATION_THREADS=<n> (default 2).
+			const char* value   = std::getenv("KYTY_TRANSLATION_THREADS");
+			const auto  threads = std::max<uint32_t>(
+			    value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 2u, 1u);
+			translators = std::make_unique<TranslationWorkers>(threads);
+			PipelineCacheLog("Shader translation: graphics shaders of 3D draws on {} worker threads",
+			                 threads);
+		}
 	}
 
 	void FlushDisk() {
@@ -1252,6 +1390,16 @@ struct PipelineCache::ProgramCache {
 	bool                                                        disk_verify  = false;
 	uint64_t                                                    disk_lookups = 0;
 	std::unique_ptr<ShaderDiskCache::Store>                     disk;
+	// Graphics translations in progress on the workers (KYTY_ASYNC_TRANSLATION), by program.
+	std::unordered_map<ProgramKey, std::shared_ptr<TranslationJob>, ProgramKeyHash> translating;
+	uint64_t                                                    translation_skips = 0;
+	uint64_t                                                    translations_done = 0;
+	// Set by GetGraphicsPrograms for the draw at hand: may its shaders translate in the background?
+	bool                                                        defer_translation = false;
+	// Last: destroyed first, so its threads have stopped before anything else goes.
+	std::unique_ptr<TranslationWorkers>                         translators;
+
+	void SetDeferTranslation(bool value) { defer_translation = value; }
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
@@ -1559,6 +1707,13 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
+	// New shaders of 3D draws (depth test on) translate on the workers while the draw is skipped;
+	// UI and layer draws translate at once (TranslationWorkers).
+	struct DeferScope {
+		ProgramCache& cache;
+		~DeferScope() { cache.SetDeferTranslation(false); }
+	} defer_scope {*m_program_cache};
+	m_program_cache->SetDeferTranslation(context.GetDepthControl().z_enable);
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
