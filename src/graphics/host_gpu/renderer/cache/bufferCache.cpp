@@ -1093,6 +1093,11 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
 void BufferCache::DownloadRangeForDiagnostics(uint64_t vaddr, uint64_t size) {
 	std::vector<std::pair<uint64_t, uint64_t>> downloaded;
 	auto                                       it = m_buffers.upper_bound(vaddr);

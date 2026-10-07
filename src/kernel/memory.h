@@ -123,6 +123,13 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // work has written any of them, else nullptr. Current until the GPU thread marks them
 // GPU-written or the guest remaps them.
 [[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Lets the calling thread make the GPU thread's clean-backing queries (FindGpuCleanBacking,
+// TryReadGpuCleanBacking) while the GPU thread waits for it and makes only the same read-only
+// queries itself: the stage-preparation helper (pipelineCache.cpp, StagePrepWorker).
+void SetGpuReadDelegate(bool delegate);
+// GPU thread or delegate: copies [vaddr, vaddr + size) from the backing store when no GPU work has
+// written any of it. Never downloads, faults or waits; false otherwise.
+[[nodiscard]] bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 // Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
 // it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);

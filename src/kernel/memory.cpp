@@ -916,17 +916,34 @@ bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {
 	return GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
 
+static thread_local bool t_gpu_read_delegate = false;
+
+void SetGpuReadDelegate(bool delegate) {
+	t_gpu_read_delegate = delegate;
+}
+
+// Whether [vaddr, vaddr + size) may hold GPU-written bytes, for the GPU thread or its delegate
+// (true for any other thread: it cannot ask).
+static bool MaybeGpuDirtyForClean(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	if (t_gpu_read_delegate) {
+		return GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
+	}
+	return !Graphics::GuestGpu::IsGpuThread() ||
+	       GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
+}
+
 const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
-	if (g_guest_address_space == nullptr) {
+	if (g_guest_address_space == nullptr || MaybeGpuDirtyForClean(vaddr, size)) {
 		return nullptr;
 	}
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread() ||
-		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
-			return nullptr;
-		}
-	}
 	return g_guest_address_space->FindBacking(vaddr, size);
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	return !MaybeGpuDirtyForClean(vaddr, size) && TryReadBacking(vaddr, data, size);
 }
 
 bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {

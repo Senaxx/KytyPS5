@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -638,10 +639,13 @@ thread_local bool g_native_suppressed = false;
 
 SrtNativeStats g_native_stats;
 bool           g_native_report = false;
+// The stage-preparation helper (pipelineCache.cpp) walks plans of its own concurrently.
+std::mutex     g_native_stats_mutex;
 
 } // namespace
 
 bool TakeSrtNativeReport(SrtNativeStats& stats) {
+	std::lock_guard lock(g_native_stats_mutex);
 	if (!g_native_report) {
 		return false;
 	}
@@ -662,7 +666,8 @@ void SrtWalker::BindNative() {
 		}
 		program.native_attempted = true;
 		program.native_code      = SrtNativeCode::Compile(program);
-		auto& stats              = g_native_stats;
+		std::lock_guard stats_lock(g_native_stats_mutex);
+		auto&           stats = g_native_stats;
 		if (program.native_code == nullptr) {
 			stats.failed++;
 		} else {

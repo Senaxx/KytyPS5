@@ -88,6 +88,8 @@ public:
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
 	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// The same, under the dirty-range lock: for a GPU-read delegate (Memory::SetGpuReadDelegate).
+	[[nodiscard]] bool              HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size);
 	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
 	// memory holds their current value even when their page is protected.
 	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
