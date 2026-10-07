@@ -115,6 +115,7 @@ public:
 		for (const auto& [_, entry]: m_maps) {
 			UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size);
 		}
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			UnmapViewOfFile(m_backing_base);
@@ -127,6 +128,7 @@ public:
 			EXIT_IF(
 			    !UnmapViewPreservePlaceholder(reinterpret_cast<void*>(entry.vaddr), entry.size));
 		}
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.clear();
 		if (m_backing_base != nullptr) {
 			munmap(m_backing_base, m_size);
@@ -220,10 +222,42 @@ public:
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
 			return nullptr;
 		}
+		// The GPU thread's SRT walks ask for every guest page they read (GuestPageReadCache),
+		// tens of thousands of times a frame, and each took this lock and a map lookup. A thread
+		// remembers its recent mappings until the mapping table changes (m_maps_generation).
+		// KYTY_BACKING_CACHE=0 looks up every time.
+		struct Cached {
+			const GuestBackingStore* owner      = nullptr;
+			uint64_t                 generation = 0;
+			uint64_t                 vaddr      = 0;
+			uint64_t                 size       = 0;
+			uint64_t                 offset     = 0;
+		};
+		static const bool cache_enabled = [] {
+			const char* value = std::getenv("KYTY_BACKING_CACHE");
+			return value == nullptr || value[0] != '0';
+		}();
+		thread_local std::array<Cached, 8> cache {};
+		thread_local uint32_t              cache_next = 0;
+		if (cache_enabled) {
+			const auto generation = m_maps_generation.load(std::memory_order_acquire);
+			for (const auto& cached: cache) {
+				if (cached.owner == this && cached.generation == generation &&
+				    vaddr >= cached.vaddr && vaddr + size <= cached.vaddr + cached.size) {
+					const auto offset = cached.offset + vaddr - cached.vaddr;
+					return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
+				}
+			}
+		}
 		std::lock_guard lock(m_mutex);
 		MapEntry        entry {};
 		if (!FindContainingUnlocked(vaddr, size, &entry)) {
 			return nullptr;
+		}
+		if (cache_enabled) {
+			cache[cache_next++ % cache.size()] = {this,
+			                                      m_maps_generation.load(std::memory_order_acquire),
+			                                      entry.vaddr, entry.size, entry.backing_offset};
 		}
 		const auto offset = entry.backing_offset + vaddr - entry.vaddr;
 		return RangeOk(offset, size) ? m_backing_base + offset : nullptr;
@@ -294,6 +328,7 @@ public:
 
 		{
 			std::lock_guard lock(m_mutex);
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		}
 		SetFailure(failure_reason, FailureReason::None);
@@ -305,6 +340,7 @@ public:
 			return false;
 		}
 		RemoveMappingsUnlocked(vaddr, size);
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		EXIT_IF(!m_maps.emplace(vaddr, MapEntry {vaddr, size, backing_offset, mode}).second);
 		SetFailure(failure_reason, FailureReason::None);
 		return true;
@@ -392,6 +428,7 @@ public:
 				if (vaddr + size <= entry->second.vaddr + entry->second.size) {
 					old = entry->second;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+					m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 					m_maps.erase(entry);
 #endif
 				}
@@ -412,6 +449,7 @@ public:
 			    UnmapViewPreservePlaceholder(reinterpret_cast<void*>(old.vaddr), old.size);
 			if (!unmapped) {
 				std::lock_guard lock(m_mutex);
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
@@ -456,6 +494,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(m_mutex);
+		m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 		m_maps.emplace(old.vaddr, old);
 		return false;
 #else
@@ -554,12 +593,15 @@ private:
 				++it;
 				continue;
 			}
+			m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 			it = m_maps.erase(it);
 			if (old.vaddr < vaddr) {
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(old.vaddr,
 				               MapEntry {old.vaddr, vaddr - old.vaddr, old.backing_offset, old.mode});
 			}
 			if (end < old_end) {
+				m_maps_generation.fetch_add(1, std::memory_order_acq_rel);
 				m_maps.emplace(end, MapEntry {end, old_end - end,
 				                             old.backing_offset + end - old.vaddr, old.mode});
 			}
@@ -746,6 +788,8 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+	// Changes with every change of m_maps, made under m_mutex (FindBacking's thread caches).
+	std::atomic<uint64_t>        m_maps_generation {1};
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool                  m_lazy_commit     = false;
 	std::mutex            m_commit_mutex;
