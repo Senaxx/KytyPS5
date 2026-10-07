@@ -766,7 +766,10 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
-		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
+		EXIT("Out of memory: an image fits neither in video memory nor in system memory (the VMA "
+		     "heap lines above give usage and budget). Close other programs; on a card with little "
+		     "video memory lower the resolution; if Windows' commit limit is reached, enlarge the "
+		     "page file. Image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}

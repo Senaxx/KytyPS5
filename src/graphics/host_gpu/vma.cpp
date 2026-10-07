@@ -20,8 +20,10 @@
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -43,6 +45,31 @@ bool GraphicContext::CreateAllocator() {
 	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+	}
+
+	// Testing aid: KYTY_VRAM_LIMIT_MB=<n> caps every device-local heap at n MB, so a large card
+	// behaves like a 4, 6 or 8 GB one: VMA reports the capped budget, allocations past it fail
+	// or spill as they would there, and the caches' collection thresholds follow the budget.
+	std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> heap_limits {};
+	if (const char* value = std::getenv("KYTY_VRAM_LIMIT_MB"); value != nullptr) {
+		const auto  limit      = static_cast<VkDeviceSize>(std::strtoull(value, nullptr, 10)) << 20u;
+		const auto& properties = GetPhysicalDeviceMemoryProperties();
+		if (limit != 0) {
+			for (uint32_t heap = 0; heap < properties.memoryHeapCount; heap++) {
+				const bool device_local = static_cast<bool>(properties.memoryHeaps[heap].flags &
+				                                            vk::MemoryHeapFlagBits::eDeviceLocal);
+				heap_limits[heap] = device_local ? std::min<VkDeviceSize>(
+				                                       limit, properties.memoryHeaps[heap].size)
+				                                 : VK_WHOLE_SIZE;
+				if (device_local) {
+					LOGF("KYTY_VRAM_LIMIT_MB: device heap %u capped at %" PRIu64 " MB (of %" PRIu64
+					     " MB)\n",
+					     heap, static_cast<uint64_t>(heap_limits[heap] >> 20u),
+					     static_cast<uint64_t>(properties.memoryHeaps[heap].size >> 20u));
+				}
+			}
+			info.pHeapSizeLimit = heap_limits.data();
+		}
 	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));

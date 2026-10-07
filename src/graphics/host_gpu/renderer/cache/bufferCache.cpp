@@ -1146,8 +1146,25 @@ void BufferCache::RunGarbageCollector() {
 		// forever, and the images that share those pages are then re-sourced from the
 		// buffer's stale contents: the world renders black. Measured 2026-09-21.
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty) {
-			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
+		if (dirty && !DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size())) {
+			// Its pages are still marked GPU-written, but no byte waits for a download: they were
+			// downloaded with another range, or a game thread's asynchronous readback of them is
+			// still in flight (ReadMemoryStep's "page is current" case). This ended the session on
+			// cards small enough for the collector to run (a 4 GB laptop, 2026-10-06). In flight:
+			// leave the buffer to a later pass, after the publication. Otherwise the bytes are
+			// current in guest memory and the buffer goes like a clean one.
+			bool downloading = false;
+			{
+				std::shared_lock lock(m_dirty_ranges_mutex);
+				downloading = m_downloading_ranges.Intersects(buffer.CpuAddress(), buffer.Size());
+			}
+			if (downloading) {
+				return false;
+			}
+			m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			DeleteBuffer(id);
+		} else if (dirty) {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
