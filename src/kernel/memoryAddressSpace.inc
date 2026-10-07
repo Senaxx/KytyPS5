@@ -43,8 +43,20 @@ public:
 
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// SEC_COMMIT charged all of guest direct memory (13.5 GB) to the system commit limit at
+		// boot, before the game had mapped any of it (ISSUES #21: with a small page file the
+		// emulator could not start, or ran out of commit later). The section is reserved
+		// instead, and each range is committed when the guest first maps it (EnsureCommitted);
+		// a page committed through the alias below is committed in every view of the section.
+		// KYTY_LAZY_COMMIT=0 commits everything up front as before.
+		m_lazy_commit = [] {
+			const char* value = std::getenv("KYTY_LAZY_COMMIT");
+			return value == nullptr || value[0] != '0';
+		}();
+		m_committed.assign((m_size + CommitGranule * 64u - 1u) / (CommitGranule * 64u), 0u);
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr,
+		    PAGE_EXECUTE_READWRITE | (m_lazy_commit ? SEC_RESERVE : SEC_COMMIT),
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -161,6 +173,22 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (m_lazy_commit) {
+			// Pages not committed yet are zero when they are; touching them would fault.
+			std::lock_guard lock(m_commit_mutex);
+			const auto      end = backing_offset + size;
+			for (auto offset = backing_offset; offset < end;) {
+				const auto granule_end =
+				    std::min(end, (offset / CommitGranule + 1u) * CommitGranule);
+				if (IsCommittedUnlocked(offset / CommitGranule)) {
+					std::memset(m_backing_base + offset, 0, granule_end - offset);
+				}
+				offset = granule_end;
+			}
+			return true;
+		}
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -254,6 +282,7 @@ public:
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		EnsureCommitted(backing_offset, size);
 		void* mapped = ReplacePlaceholderView(vaddr, size, backing_offset, mode, failure_reason);
 		if (mapped == nullptr || reinterpret_cast<uint64_t>(mapped) != vaddr) {
 			if (mapped != nullptr) {
@@ -562,6 +591,51 @@ private:
 		return size != 0 && backing_offset < m_size && size <= m_size - backing_offset;
 	}
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	static constexpr uint64_t CommitGranule = 64u * 1024u;
+
+	[[nodiscard]] bool IsCommittedUnlocked(uint64_t granule) const {
+		return (m_committed[granule / 64u] >> (granule % 64u) & 1u) != 0;
+	}
+
+	// Commits the backing pages of [backing_offset, +size) that are not committed yet; see the
+	// constructor. Ends the emulator with a clear message when the system is out of commit.
+	void EnsureCommitted(uint64_t backing_offset, uint64_t size) {
+		if (!m_lazy_commit || size == 0) {
+			return;
+		}
+		std::lock_guard lock(m_commit_mutex);
+		const auto      first = backing_offset / CommitGranule;
+		const auto      last  = (backing_offset + size - 1u) / CommitGranule;
+		for (auto granule = first; granule <= last;) {
+			if (IsCommittedUnlocked(granule)) {
+				granule++;
+				continue;
+			}
+			auto run_end = granule + 1u;
+			while (run_end <= last && !IsCommittedUnlocked(run_end)) {
+				run_end++;
+			}
+			const auto offset = granule * CommitGranule;
+			const auto bytes  = std::min(run_end * CommitGranule, m_size) - offset;
+			if (VirtualAlloc(m_backing_base + offset, bytes, MEM_COMMIT, PAGE_READWRITE) ==
+			    nullptr) {
+				EXIT("Out of memory: Windows could not commit %" PRIu64
+				     " MB of guest memory (error 0x%08" PRIx32 ", %" PRIu64
+				     " MB committed so far).\nClose other programs or enlarge the page file "
+				     "(System > About > Advanced system settings > Performance > Virtual "
+				     "memory).\n",
+				     bytes >> 20u, static_cast<uint32_t>(GetLastError()),
+				     (m_committed_bytes) >> 20u);
+			}
+			m_committed_bytes += bytes;
+			for (; granule < run_end; granule++) {
+				m_committed[granule / 64u] |= uint64_t {1} << (granule % 64u);
+			}
+		}
+	}
+#endif
+
 	static void SetFailure(FailureReason* out, FailureReason reason) {
 		if (out != nullptr) {
 			*out = reason;
@@ -672,6 +746,12 @@ private:
 	uint64_t                     m_size         = 0;
 	std::mutex                   m_mutex;
 	std::map<uint64_t, MapEntry> m_maps;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool                  m_lazy_commit     = false;
+	std::mutex            m_commit_mutex;
+	std::vector<uint64_t> m_committed; // one bit per CommitGranule of the backing
+	uint64_t              m_committed_bytes = 0;
+#endif
 };
 
 class GuestAddressSpace {
