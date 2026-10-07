@@ -184,6 +184,14 @@ private:
 	mutable std::shared_mutex                          m_dirty_ranges_mutex;
 	MemoryTracker                                      m_memory_tracker;
 	StreamBuffer                                       m_staging_buffer;
+	// Guest reads UploadCopies leaves to the recording thread: staging destination, guest
+	// address, bytes.
+	struct UploadRead {
+		uint8_t* destination;
+		uint64_t address;
+		uint64_t size;
+	};
+	std::vector<UploadRead> m_upload_reads;
 	StreamBuffer                                       m_stream_buffer;
 	StreamBuffer                                       m_download_buffer;
 	StreamBuffer                                       m_device_buffer;

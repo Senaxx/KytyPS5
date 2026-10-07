@@ -825,6 +825,36 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
+		// Reading guest memory into staging was ~28 MB a frame of memcpy on the GPU thread in
+		// the jungle (~8,500 uploads). With a recording thread the reads run there instead, in
+		// the recorded command stream right before the copies that use them, which the caller
+		// records next; the staging memory must be host-coherent, since nothing flushes it after.
+		// A read sees the guest bytes of slightly later than the upload decision: newer CPU
+		// writes re-dirty their pages and are uploaded again, as before. Off by default: no
+		// measurable gain in the jungle (16.3 fps from 140 to 240 s with and without, 2026-10-07),
+		// and writes that bypass tracking land in the upload (two strict cache tests fail).
+		// KYTY_UPLOAD_READS_ON_RECORD_THREAD=1 turns it on.
+		static const bool deferred = [] {
+			const char* value = std::getenv("KYTY_UPLOAD_READS_ON_RECORD_THREAD");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (deferred && m_staging_buffer.IsCoherent() && m_scheduler.Current().Recorder().Threaded()) {
+			m_upload_reads.clear();
+			for (auto& copy: copies) {
+				m_upload_reads.push_back(
+				    {mapped + copy.srcOffset, buffer.CpuAddress() + copy.dstOffset, copy.size});
+				copy.srcOffset += base_offset;
+			}
+			const auto* reads = m_scheduler.Stash(m_upload_reads.data(), m_upload_reads.size());
+			const auto  count = m_upload_reads.size();
+			m_scheduler.Record([reads, count](vk::CommandBuffer) {
+				for (size_t i = 0; i < count; i++) {
+					ReadGuestForUpload(reads[i].destination, reads[i].address, reads[i].size);
+				}
+			});
+			m_staging_buffer.Commit();
+			return m_staging_buffer.Handle();
+		}
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			ReadGuestForUpload(mapped + copy.srcOffset, address, copy.size);
