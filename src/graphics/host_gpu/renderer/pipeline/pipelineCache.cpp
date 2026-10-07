@@ -2018,6 +2018,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	return result;
 }
 
+bool PipelineCache::IsSkipListed(uint64_t shader_addr) {
+	return SkipShaderRequested(ShaderDeclaredHash(shader_addr));
+}
+
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {

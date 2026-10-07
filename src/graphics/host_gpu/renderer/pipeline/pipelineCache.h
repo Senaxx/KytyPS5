@@ -184,6 +184,9 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
+	// Whether the shader at this address is on the skip list (--skip-shaders): its dispatches can
+	// be dropped before anything is prepared for them.
+	[[nodiscard]] static bool IsSkipListed(uint64_t shader_addr);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

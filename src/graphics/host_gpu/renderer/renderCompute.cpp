@@ -50,6 +50,14 @@ namespace Libs::Graphics {
 
 // KYTY_LOG_SKIPPED_DISPATCHES=<n>: log the first n dispatches of compute shaders that gave up,
 // with their user data, to see which guest buffers they would have written.
+static bool EarlyDispatchSkip() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EARLY_DISPATCH_SKIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 static void LogSkippedDispatch(const HW::ComputeShaderInfo& cs, const char* groups) {
 	static const uint32_t budget = [] {
 		const char* value = std::getenv("KYTY_LOG_SKIPPED_DISPATCHES");
@@ -469,6 +477,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		return;
 	}
+	// The skip list's ray-tracing dispatches are most of this title's dispatches in the jungle
+	// (~2,600 skip-list lookups a frame); drop them before preparing their inputs and program.
+	// KYTY_EARLY_DISPATCH_SKIP=0 drops them in ProgramCache::Get as before.
+	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(sh_ctx.GetCs().cs_regs.data_addr)) {
+		Profiler::Add(Profiler::Counter::SkippedSkipList);
+		ResetBindings();
+		return;
+	}
 
 	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
@@ -691,6 +707,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::LockGuard lock(m_context.GetMutex());
 	const auto&       cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
+		return;
+	}
+	if (EarlyDispatchSkip() && PipelineCache::IsSkipListed(cs_regs.cs_regs.data_addr)) {
+		Profiler::Add(Profiler::Counter::SkippedSkipList);
+		ResetBindings();
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
