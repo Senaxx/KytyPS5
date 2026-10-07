@@ -380,12 +380,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 
 // Runs on the GPU thread. Returns 0 when the access may proceed, or (asynchronous readback only)
 // the tick whose download publication the caller must wait for before asking again.
-// The readback window (KYTY_READBACK_WINDOW_KB, default 512; 0 reads only the requested pages,
-// as upstream does).
+// The readback window (KYTY_READBACK_WINDOW_KB, default 4096; 0 reads only the requested pages,
+// as upstream does). The game threads wait in readbacks for much of each frame at the Leap
+// Attack prompt; wider windows mean fewer of them. Jungle route, 2026-10-07, prompt / 140-240 s:
+// 512 KB 20.4 / 16.4 fps (6 runs), 4 MB 23.3 / 18.2 (3), 8 MB 22.6 / 17.3 (4), 16 MB 22.2 / 16.4,
+// 32 MB 22.5 / 15.9 (slower in the fight).
 static uint64_t ReadbackWindow() {
 	static const uint64_t window = [] {
 		const char* value = std::getenv("KYTY_READBACK_WINDOW_KB");
-		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {512}) * 1024u;
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {4096}) * 1024u;
 	}();
 	return window;
 }
