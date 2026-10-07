@@ -15,6 +15,8 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -32,6 +34,26 @@ struct TrackingFailure {};
 bool SrtRawReadsOnGpu() {
 	static const bool on_gpu = std::getenv("KYTY_SRT_RAW_READS_ON_GPU") != nullptr;
 	return on_gpu;
+}
+
+// KYTY_GPU_RESOURCES=<hash>[,<hash>...] (hex) or "all": the listed shaders read their buffers
+// through the descriptor words in the shader (BDA), as GPU-selected buffers do, instead of a
+// binding the host refreshes for every draw.
+bool GpuResources(uint64_t shader_hash) {
+	static const auto list = [] {
+		std::pair<bool, std::unordered_set<uint64_t>> result {false, {}};
+		const char* value = std::getenv("KYTY_GPU_RESOURCES");
+		if (value == nullptr) return result;
+		const std::string_view text(value);
+		result.first = text == "all";
+		for (size_t begin = 0; !result.first && begin < text.size();) {
+			const auto end = std::min(text.find(',', begin), text.size());
+			if (end > begin) result.second.insert(std::strtoull(std::string(text.substr(begin, end - begin)).c_str(), nullptr, 16));
+			begin = end + 1;
+		}
+		return result;
+	}();
+	return list.first || list.second.contains(shader_hash);
 }
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -3082,6 +3104,23 @@ private:
 		if (buffer != BufferAccess::None) {
 			handle = inst.Arg(0).Resolve().TryInstruction();
 			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
+			if (indirect == nullptr && buffer == BufferAccess::Read &&
+			    memory.kind == (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+			                                                       : ResourceKind::Buffer) &&
+			    memory.SupportsIndirectBufferLoad(op) && handle != nullptr &&
+			    handle->GetOpcode() == ValueOpcode::GetBufferResource && handle->NumArgs() == 4 &&
+			    GpuResources(m_program.shader_hash) &&
+			    std::ranges::all_of(handle->Uses(), [&](const Use& use) {
+				    const auto use_op = use.user->GetOpcode();
+				    const auto index  = use.user->Flags<MemoryFlags>().index;
+				    return BufferAccessOf(use_op) == BufferAccess::Read &&
+				           index < m_program.memory_info.size() &&
+				           m_program.memory_info[index].SupportsIndirectBufferLoad(use_op);
+			    })) {
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_info.uses_dma                         = true;
+				return;
+			}
 			if (indirect != nullptr) {
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
