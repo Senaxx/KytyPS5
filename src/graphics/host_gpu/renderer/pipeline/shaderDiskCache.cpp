@@ -494,7 +494,10 @@ struct Reader {
 			}
 			value.reset();
 			if (present) {
-				(*this)(value.emplace());
+				// Assigned rather than emplace()d: libstdc++ does not count a struct nested in a
+				// class with default member initializers as default-constructible (Linux build).
+				value = typename T::value_type {};
+				(*this)(*value);
 			}
 		} else if constexpr (std::is_same_v<T, IR::Value>) {
 			uint8_t tag = 0;
