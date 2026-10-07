@@ -2665,10 +2665,12 @@ private:
 	}
 
 	void PlanBindlessSamplers() {
-		// Opt-in while a regression is investigated: with the game's own samplers the title's
-		// fog shows a bright arch (DEBUGGING.md, 2026-09-28). KYTY_BINDLESS_SAMPLERS=1 enables them.
-		static const bool enabled = std::getenv("KYTY_BINDLESS_SAMPLERS") != nullptr &&
-		                            std::getenv("KYTY_BINDLESS_SAMPLERS")[0] == '1';
+		// On by default since 2026-10-07: the bright arch in the title's fog that made them opt-in
+		// (DEBUGGING.md, 2026-09-28) no longer shows (title and jungle frames compared with the
+		// default sampler), and the linear/wrap stand-in tiles textures the game samples with
+		// clamp, such as the moon (ISSUES #2). KYTY_BINDLESS_SAMPLERS=0 uses the stand-in.
+		static const bool enabled = std::getenv("KYTY_BINDLESS_SAMPLERS") == nullptr ||
+		                            std::getenv("KYTY_BINDLESS_SAMPLERS")[0] != '0';
 		if (!m_program.bindless_images || !enabled) {
 			return;
 		}
