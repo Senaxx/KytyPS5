@@ -160,6 +160,7 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 			    m_downloading_ranges.Add(start, end - start);
+			    m_downloading_list.emplace_back(start, end - start);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
@@ -249,7 +250,17 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 		}
 		std::unique_lock lock(m_dirty_ranges_mutex);
 		for (const auto& copy: copies) {
+			const auto entry = std::find(m_downloading_list.begin(), m_downloading_list.end(),
+			                             std::pair {buffer_address + copy.srcOffset, copy.size});
+			if (entry != m_downloading_list.end()) {
+				*entry = m_downloading_list.back();
+				m_downloading_list.pop_back();
+			}
 			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+		}
+		// Ranges another download still has in flight stay marked.
+		for (const auto& [start, bytes]: m_downloading_list) {
+			m_downloading_ranges.Add(start, bytes);
 		}
 	};
 	if constexpr (async) {

@@ -179,6 +179,11 @@ private:
 	RangeSet                                           m_gpu_modified_ranges;
 	// Bytes whose download is recorded but not yet in guest memory.
 	RangeSet                                           m_downloading_ranges;
+	// Every in-flight download's ranges, one entry each: m_downloading_ranges is their union. A
+	// publication removes only its own entries (ISSUES #26: the first of two downloads of one
+	// window cleared the range while the second was in flight; a game thread then took the
+	// page as current, wrote it, and the second publication put older GPU bytes over that).
+	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against
