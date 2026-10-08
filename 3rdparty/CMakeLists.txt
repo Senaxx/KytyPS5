@@ -193,6 +193,10 @@ set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
 set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
 set(TRACY_DELAYED_INIT ON CACHE BOOL "" FORCE)
 set(TRACY_MANUAL_LIFETIME ON CACHE BOOL "" FORCE)
+# Listen on 127.0.0.1 only and announce nothing on the network: --profile no longer opens a
+# port the Windows firewall asks about for every new emulator path.
+set(TRACY_ONLY_LOCALHOST ON CACHE BOOL "" FORCE)
+set(TRACY_NO_BROADCAST ON CACHE BOOL "" FORCE)
 add_subdirectory(tracy EXCLUDE_FROM_ALL)
 if (TARGET TracyClient)
 	if (MSVC)
