@@ -627,10 +627,10 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				    distance_pointer, state.clip_distance_variable,
 				    ConstantU32(state, state.invalid_position_clip_distance));
 				state.builder.AddFunction(spv::OpStore, distance_pointer, distance);
-				static std::atomic_bool logged = false;
-				if (!logged.exchange(true, std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "Shader: emitted zero-position clip guard\n");
+				static std::atomic<uint32_t> logged = 0;
+				if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+					LOGF("Shader: emitted zero-position clip guard hash=0x%016" PRIx64 "\n",
+					     state.program.shader_hash);
 				}
 			}
 			const auto pointer = state.builder.AllocateId();

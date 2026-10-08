@@ -678,7 +678,14 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state, clip_distance_count, cull_distance_count);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	// KYTY_ZERO_POSITION_GUARD=0 leaves the zero-position clip plane out (2026-10-08: prompt glyphs
+	// went missing in every new game whose session translated a vertex shader with it).
+	static const bool zero_position_guard = [] {
+		const char* value = std::getenv("KYTY_ZERO_POSITION_GUARD");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (zero_position_guard && state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u &&
 	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
 		    return output.kind == IR::StageOutputKind::Position;
 	    })) {
