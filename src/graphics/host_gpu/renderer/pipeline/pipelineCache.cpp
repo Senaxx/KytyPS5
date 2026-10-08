@@ -1868,6 +1868,34 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+// Glyphs, icons and other cached layers are drawn once into small offscreen targets, and a draw
+// skipped while its shaders translate or its pipeline compiles is lost for good: the Leap Attack
+// prompt lost letters ("L p Att k") in every new game whose session translated shaders
+// (2026-10-08, ISSUES #27), whatever the depth state of those draws. They translate and compile
+// at once instead; a one-time cost per program, none once the disk caches hold it.
+bool SmallColorTargetDraw(const HW::Context& context) {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_SMALL_TARGET_SYNC");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 1024u;
+	}();
+	if (limit == 0) {
+		return false;
+	}
+	const auto mask  = context.GetRenderTargetMask();
+	bool       found = false;
+	for (uint32_t slot = 0; slot < 8; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (((mask >> (slot * 4u)) & 0x0fu) == 0 || target.base.addr == 0) {
+			continue;
+		}
+		if (target.attrib2.width + 1u > limit || target.attrib2.height + 1u > limit) {
+			return false;
+		}
+		found = true;
+	}
+	return found;
+}
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -1997,7 +2025,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		ProgramCache& cache;
 		~DeferScope() { cache.SetDeferTranslation(false); }
 	} defer_scope {*m_program_cache};
-	m_program_cache->SetDeferTranslation(context.GetDepthControl().z_enable);
+	m_program_cache->SetDeferTranslation(context.GetDepthControl().z_enable &&
+	                                     !SmallColorTargetDraw(context));
 	struct PreparedScope {
 		ProgramCache& cache;
 		~PreparedScope() { cache.prepared = {}; }

@@ -149,6 +149,11 @@ struct PendingGraphicsPipeline;
 class PipelineCompiler;
 
 // The owning renderer serializes access, including saves while the GPU is running.
+// Whether every color target the draw writes is at most KYTY_SMALL_TARGET_SYNC pixels wide and
+// high (default 1024; 0 = never): such draws are never skipped while their shaders translate or
+// their pipeline compiles (pipelineCache.cpp).
+bool SmallColorTargetDraw(const HW::Context& context);
+
 class PipelineCache {
 public:
 	explicit PipelineCache(GraphicContext& graphics);

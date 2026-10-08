@@ -1249,6 +1249,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	for (const auto& stage: vertex_stages) {
 		may_defer = may_defer && !writes_memory(stage.stage);
 	}
+	// Glyphs and cached layers: drawn once into small targets (SmallColorTargetDraw).
+	may_defer = may_defer && !SmallColorTargetDraw(buffer.GetRegisters());
 	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
