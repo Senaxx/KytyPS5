@@ -2108,10 +2108,17 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 					m_bindless_srt[offset]      = region;
 					m_bindless_srt[offset + 1u] = entries;
 				}
+				// The first 256 distinct patches are logged; after that no draw takes the lock.
+				static std::atomic<bool>            logging_done = false;
 				static std::mutex                   logged_mutex;
 				static std::unordered_set<uint64_t> logged;
-				std::scoped_lock                    lock(logged_mutex);
-				if (logged.insert(program.shader_hash ^ offset).second && logged.size() < 256) {
+				if (logging_done.load(std::memory_order_relaxed)) {
+					continue;
+				}
+				std::scoped_lock lock(logged_mutex);
+				if (logged.size() >= 256) {
+					logging_done.store(true, std::memory_order_relaxed);
+				} else if (logged.insert(program.shader_hash ^ offset).second) {
 					LOGF("Bindless patch: stage=%u hash=0x%016" PRIx64
 					     " offset=%u region=%u entries=%u srt_words=%zu\n",
 					     static_cast<uint32_t>(program.stage), program.shader_hash, offset, region,
