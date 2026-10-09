@@ -935,15 +935,20 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+static thread_local bool t_gpu_read_delegate = false;
+
 bool IsGpuBufferWritten(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
-	    !Graphics::GuestGpu::IsGpuThread()) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	if (t_gpu_read_delegate) {
+		return GetGpuResources().GetBufferCache().HasGpuDirtyBytesShared(vaddr, size);
+	}
+	if (!Graphics::GuestGpu::IsGpuThread()) {
 		return false;
 	}
 	return GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
 }
-
-static thread_local bool t_gpu_read_delegate = false;
 
 void SetGpuReadDelegate(bool delegate) {
 	t_gpu_read_delegate = delegate;

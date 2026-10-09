@@ -21,6 +21,7 @@
 namespace Libs::Graphics {
 
 class RenderContext;
+class DrawPrepScanner;
 
 class GuestGpu final {
 public:
@@ -82,6 +83,7 @@ private:
 		bool                      constant_complete = false;
 		bool                      blocked           = false;
 		uint64_t                  flip_request_id   = 0;
+		uint64_t                  prep_seq          = 0; // draw prep: graphics submission number
 	};
 
 	void              Enqueue(Submission submission);
@@ -119,6 +121,10 @@ private:
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
+	// KYTY_DRAW_PREP: the scanner, and the number of the last graphics submission queued
+	// (under m_queue_mutex).
+	std::unique_ptr<DrawPrepScanner> m_draw_prep;
+	uint64_t                         m_prep_seq = 0;
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;

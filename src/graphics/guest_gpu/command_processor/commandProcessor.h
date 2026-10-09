@@ -26,6 +26,12 @@ enum class ContextStateOperation : uint32_t {
 class Pm4Execution {
 public:
 	[[nodiscard]] bool MadeProgress() const noexcept { return m_made_progress; }
+	// Draw prep (KYTY_DRAW_PREP): the submission number of a graphics command stream (0: not
+	// counted), whose draw and dispatch packets are numbered as the scanner numbers them.
+	void SetPrepSeq(uint64_t seq, uint32_t queue) noexcept {
+		m_prep_seq   = seq;
+		m_prep_queue = queue;
+	}
 
 private:
 	friend class CommandProcessor;
@@ -40,6 +46,10 @@ private:
 	bool                      m_chain         = false;
 	bool                      m_suspended     = false;
 	bool                      m_made_progress = false;
+	uint64_t                  m_prep_seq      = 0;
+	uint32_t                  m_prep_queue    = 0;
+	uint32_t                  m_prep_ordinal  = 0;
+	const uint32_t*           m_prep_packet   = nullptr; // the last numbered packet
 };
 
 class CommandProcessor {
