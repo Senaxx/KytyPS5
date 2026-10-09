@@ -164,6 +164,7 @@ public:
 	// Presented frame of the last access: overlapping aliases age by frames as well as by ticks
 	// (TextureCache::ResolveOverlap, KYTY_IMAGE_ALIAS_AGE).
 	uint64_t         frame_accessed_last = 0;
+	uint64_t         frame_guest_dropped = 0; // when the guest last dropped it from its heaps
 	size_t           lru_id             = 0;
 	// Last GPU writer among live overlapping aliases; cleared when another alias takes the bytes.
 	bool             alias_owner        = false;

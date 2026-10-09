@@ -1255,6 +1255,9 @@ void RenderExecutor::ReleaseBindlessKey(BindlessTable::Heap& heap, uint32_t key)
 		    image != nullptr && image->bindless_pinned) {
 			NoteBindlessStateChange(*image);
 			image->bindless_pinned = false;
+			if (BindlessEngineEnabled()) {
+				texture_cache.ReleaseDroppedByGuest(old_image);
+			}
 		}
 	}
 }
@@ -1284,6 +1287,10 @@ void RenderExecutor::SettleBindlessHeaps() {
 	if (frame != m_bindless_eager_frame) {
 		m_bindless_eager_frame = frame;
 		m_bindless_eager_left  = BindlessEngineBudget();
+		// Settling ahead stops while the device is at 80 % of its budget, below the 90 % at which
+		// the texture cache starts evicting, so the two do not chase each other. A new game's
+		// jungle load filled the 32 GB card when only the images' own threshold was checked.
+		m_bindless_eager_device_full = m_context.GetGraphics().DeviceMemoryAtLeast(80);
 		// Once a frame: stale keys a draw has sampled since are settled again (finer mips).
 		uint32_t stale_settled = 0;
 		for (auto& heap: table.Heaps()) {
@@ -1309,7 +1316,7 @@ void RenderExecutor::SettleBindlessHeaps() {
 	if (std::ranges::all_of(table.Heaps(), [](const auto& heap) { return heap.eager_complete; })) {
 		return;
 	}
-	if (m_context.GetTextureCache().UnderPressure()) {
+	if (m_context.GetTextureCache().UnderPressure() || m_bindless_eager_device_full) {
 		stats.eager_paused.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}

@@ -77,6 +77,9 @@ public:
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
+	// The guest no longer refers to this bindless image from any heap entry (it replaced or
+	// cleared them): free it once no draw has used it for a few frames (engine method).
+	void ReleaseDroppedByGuest(ImageId id);
 	// Bindless images no draw sampled during the last usage probe (BindlessTable::
 	// CollectUnusedImages). They stay pinned, but under memory pressure the collector may free
 	// them like any other image; a key that samples one again asks for it anew. Replaces the
@@ -198,6 +201,11 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
+	// Engine method: images the guest dropped from its texture heaps (no key refers to them any
+	// more), freed once no draw has used them for a few frames, whatever the memory pressure.
+	std::vector<ImageId>                              m_guest_dropped;
+	uint64_t                                          m_guest_dropped_freed       = 0;
+	uint64_t                                          m_guest_dropped_freed_bytes = 0;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
 	// Evictions are budgeted per frame, not per collector run: see RunGarbageCollector.

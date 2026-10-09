@@ -268,6 +268,7 @@ private:
 	std::vector<ImageId>                       m_bindless_changed;
 	uint64_t                                   m_bindless_eager_frame = UINT64_MAX;
 	uint32_t                                   m_bindless_eager_left  = 0;
+	bool                                       m_bindless_eager_device_full = false;
 	// Bindless usage probe (UpdateBindlessUsageProbe): the frame it was armed in (0 = idle), the
 	// first frame the next may start, and the frame the pending feedback snapshot was recorded.
 	uint64_t                              m_bindless_probe_frame      = 0;

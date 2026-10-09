@@ -2180,10 +2180,48 @@ struct GcSkipStats {
 GcSkipStats g_gc_skip;
 } // namespace
 
+void TextureCache::ReleaseDroppedByGuest(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+		image->frame_guest_dropped = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		m_guest_dropped.push_back(id);
+	}
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();
+	if (!m_guest_dropped.empty()) {
+		// Engine method: the guest's own streaming dropped these textures from its heaps, as an
+		// engine unloads a texture; free them once no draw has used them for a few frames, not
+		// when the cache reaches its memory threshold. Images the GPU wrote keep their data for
+		// the regular collector (it writes them back); one a heap entry or a render target uses
+		// again stays.
+		const auto frame = m_graphics.presented_frames.load(std::memory_order_relaxed);
+		std::erase_if(m_guest_dropped, [&](ImageId id) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered || image->bindless_pinned ||
+			    image->binding.is_target || image->IsGpuModified()) {
+				return true;
+			}
+			// A grace of 300 frames (10-20 s): the guest drops entries and takes the same texture
+			// back shortly after (the jungle slash stalled 13 s with a grace of 3 frames, each
+			// texture freed and created again). The drop time counts as a use.
+			if (std::max(image->frame_accessed_last, image->frame_guest_dropped) + 300 > frame) {
+				return false; // used or dropped lately: look again later
+			}
+			m_guest_dropped_freed++;
+			m_guest_dropped_freed_bytes += image->AccountedSize();
+			FreeImage(id);
+			return true;
+		});
+		if (m_gc_tick % 500 == 0) {
+			LOGF("TexGuestDrop: frame=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) waiting=%zu\n",
+			     frame, m_guest_dropped_freed, m_guest_dropped_freed_bytes >> 20u,
+			     m_guest_dropped.size());
+		}
+	}
 	if (m_graphics.CanReportMemoryUsage()) {
 		// Pressure is judged by this cache's own image bytes, which RegisterImage and
 		// UnregisterImage already track. Device-wide usage counts the images this cache has

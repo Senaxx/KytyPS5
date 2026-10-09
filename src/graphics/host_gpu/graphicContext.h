@@ -154,6 +154,15 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// Whether everything the device holds (images, buffers, the driver's own) has reached percent
+	// of the device-local budget. False when the driver cannot report usage.
+	[[nodiscard]] bool DeviceMemoryAtLeast(uint32_t percent) const {
+		if (!CanReportMemoryUsage()) {
+			return false;
+		}
+		const auto budget = GetTotalMemoryBudget();
+		return budget != 0 && GetDeviceMemoryUsage() / 100 >= budget / 100 * percent / 100;
+	}
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);
 
