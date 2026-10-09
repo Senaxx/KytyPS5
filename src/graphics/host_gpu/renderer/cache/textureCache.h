@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <span>
@@ -86,8 +87,16 @@ public:
 	// previous set.
 	void SetBindlessEvictable(std::span<const ImageId> ids);
 	// Whether the cache's images are above the collector's pressure threshold.
+	// All images, pinned ones included, against the bound: eager settling pauses on it. Settling
+	// ahead while the collector freed other images under the bound lost the device at ~57 s into
+	// a new game, every time (2026-10-07, ISSUES #17); the collector's own thresholds use
+	// CollectableMemory.
 	[[nodiscard]] bool UnderPressure() const noexcept {
 		return m_total_used_memory >= m_pressure_gc_memory;
+	}
+	// Image bytes the collector may free: all but the bindless-pinned ones (refreshed once a frame).
+	[[nodiscard]] uint64_t CollectableMemory() const noexcept {
+		return m_total_used_memory - std::min(m_total_used_memory, m_pinned_bytes);
 	}
 
 private:
@@ -203,6 +212,8 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	// Engine method: images the guest dropped from its texture heaps (no key refers to them any
 	// more), freed once no draw has used them for a few frames, whatever the memory pressure.
+	uint64_t                                          m_pinned_bytes = 0;
+	uint64_t                                          m_pinned_frame = UINT64_MAX;
 	std::vector<ImageId>                              m_guest_dropped;
 	uint64_t                                          m_guest_dropped_freed       = 0;
 	uint64_t                                          m_guest_dropped_freed_bytes = 0;

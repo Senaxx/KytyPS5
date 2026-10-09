@@ -197,6 +197,16 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 
 } // namespace
 
+// KYTY_TEXTURE_CACHE_MB / KYTY_BUFFER_CACHE_MB: an upper bound for a cache's collection thresholds,
+// whatever the card's size (default 6 GiB each; 0 = no bound). The thresholds otherwise follow the
+// device budget, and on a 32 GB card the caches kept everything up to ~25 GB: textures and buffers
+// of scenes the game had left stayed until the card was full (a new game's prologue, 2026-10-07).
+static uint64_t CacheCapBytes(const char* name) {
+	const char* value = std::getenv(name);
+	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 6144ull;
+	return mib == 0 ? UINT64_MAX : mib << 20u;
+}
+
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
@@ -214,6 +224,14 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	}
+	if (const auto cap = CacheCapBytes("KYTY_TEXTURE_CACHE_MB"); cap != UINT64_MAX) {
+		m_pressure_gc_memory = std::min(m_pressure_gc_memory, cap);
+		m_critical_gc_memory = std::min(m_critical_gc_memory, cap + cap / 4);
+		m_trigger_gc_memory  = std::min(m_trigger_gc_memory, cap / 4 * 3);
+		LOGF("TextureCache: thresholds capped at %" PRIu64 " MB (trigger %" PRIu64 ", critical %" PRIu64
+		     " MB)\n",
+		     m_pressure_gc_memory >> 20u, m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u);
 	}
 }
 
@@ -2235,7 +2253,20 @@ void TextureCache::RunGarbageCollector() {
 			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 		}
 	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	if (m_pinned_frame != clock) {
+		// Heap textures follow the guest (settled when it writes an entry, freed when it drops
+		// them) and the collector cannot free them; counted against the bound they kept the cache
+		// over it, and it freed every other image again and again (33,916 in 4 minutes of a new
+		// game, the frame rate a fifth lower). The bounds apply to the images it can free.
+		m_pinned_frame = clock;
+		m_pinned_bytes = 0;
+		m_slot_images.ForEach([&](ImageId, const Image& image) {
+			if (image.registered && image.bindless_pinned) {
+				m_pinned_bytes += image.AccountedSize();
+			}
+		});
+	}
+	if (CollectableMemory() < m_trigger_gc_memory) {
 		return;
 	}
 	// The collector runs once per guest submission -- this title submits hundreds of times a
@@ -2249,8 +2280,8 @@ void TextureCache::RunGarbageCollector() {
 		m_gc_written_back_bytes_frame = 0;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool pressured  = CollectableMemory() >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive && CollectableMemory() >= m_critical_gc_memory;
 		// Ages in frames. This collector runs once per guest submission, and a title can
 		// submit a hundred times a frame: an age counted in its ticks evicted textures inside
 		// the frame that used them, to recreate them the next (11 000 images a second at the
@@ -2269,7 +2300,7 @@ void TextureCache::RunGarbageCollector() {
 		size_t             deletions       = 10;
 		if (pressured || aggressive) {
 			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
-			const auto excess    = m_total_used_memory - threshold;
+			const auto excess    = CollectableMemory() - threshold;
 			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
 			                         : std::max<uint64_t>(16 * MiB, excess / 8);
 			if (m_gc_freed_bytes_frame >= byte_budget ||
@@ -2341,6 +2372,14 @@ void TextureCache::RunGarbageCollector() {
 					g_gc_skip.gpu_unpress++;
 					continue;
 				}
+				if (!safe) {
+					// GPU-written, and CPU- or copy-written as well: its contents exist only in
+					// this image and cannot be written back as they are. Freeing it lost them:
+					// under a 6 GiB bound the Leap Attack prompt read "L p Att k" (the glyph atlas,
+					// filled by both). It stays until it is safe or the guest drops it.
+					g_gc_skip.gpu_download++;
+					continue;
+				}
 				if (safe && !DownloadImageMemory(id, true)) {
 					g_gc_skip.gpu_download++;
 					continue;
@@ -2362,18 +2401,18 @@ void TextureCache::RunGarbageCollector() {
 					break;
 				}
 			}
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (CollectableMemory() < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (CollectableMemory() < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (CollectableMemory() >= m_critical_gc_memory) {
 		collect(true);
 	}
 	if (m_gc_tick % 500 == 0) {

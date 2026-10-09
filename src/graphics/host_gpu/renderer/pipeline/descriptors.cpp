@@ -1227,6 +1227,18 @@ static bool BindlessEngineEager() {
 	return eager;
 }
 
+// KYTY_BINDLESS_ENGINE_BUDGET_MB: the image memory eager settling may touch per presented frame
+// (default 32). A count alone let a new area's load settle ~9,800 textures in 300 frames, large
+// ones uploaded and detiled together, and the frames stalled; engines stream with a bandwidth.
+static uint64_t BindlessEngineBudgetBytes() {
+	static const uint64_t bytes = [] {
+		const char* value  = std::getenv("KYTY_BINDLESS_ENGINE_BUDGET_MB");
+		const auto  parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+		return (parsed != 0 ? parsed : 32ull) << 20u;
+	}();
+	return bytes;
+}
+
 static uint32_t BindlessEngineBudget() {
 	static const uint32_t budget = [] {
 		const char* value = std::getenv("KYTY_BINDLESS_ENGINE_BUDGET");
@@ -1287,6 +1299,7 @@ void RenderExecutor::SettleBindlessHeaps() {
 	if (frame != m_bindless_eager_frame) {
 		m_bindless_eager_frame = frame;
 		m_bindless_eager_left  = BindlessEngineBudget();
+		m_bindless_eager_bytes = BindlessEngineBudgetBytes();
 		// Settling ahead stops while the device is at 80 % of its budget, below the 90 % at which
 		// the texture cache starts evicting, so the two do not chase each other. A new game's
 		// jungle load filled the 32 GB card when only the images' own threshold was checked.
@@ -1365,6 +1378,15 @@ void RenderExecutor::SettleBindlessHeaps() {
 					capped++;
 				}
 				if (ResolveBindlessKey(heap, key + i)) {
+					if (const auto* image =
+					        m_context.GetTextureCache().m_slot_images.try_get(heap.images[key + i]);
+					    image != nullptr) {
+						const auto size = image->AccountedSize();
+						m_bindless_eager_bytes -= std::min(m_bindless_eager_bytes, size);
+						if (m_bindless_eager_bytes == 0) {
+							budget = 0; // this frame's bandwidth is spent
+						}
+					}
 					// Not asked for by a draw: marked until one samples it (WasSampled), which also
 					// lets the usage probe count it as unused under memory pressure.
 					table.MarkUnsampled(heap, key + i);
@@ -1744,7 +1766,11 @@ void RenderExecutor::UpdateBindlessUsageProbe(uint64_t frame, uint64_t snapshot_
 		}
 		return;
 	}
-	if (frame >= m_bindless_next_probe && texture_cache.UnderPressure()) {
+	// The heap's textures follow the guest (settled when it writes an entry, freed when it drops
+	// them), so the probe evicts them only when the device itself is short of memory (4-8 GB
+	// cards), not at the texture cache's bound: under a 6 GiB bound it evicted 27,915 of them in
+	// 14 minutes, each settled again when drawn.
+	if (frame >= m_bindless_next_probe && m_context.GetGraphics().DeviceMemoryAtLeast(90)) {
 		table.ArmUsageProbe();
 		m_bindless_probe_frame = frame;
 	}

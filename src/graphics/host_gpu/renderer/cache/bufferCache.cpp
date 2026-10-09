@@ -294,6 +294,18 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	const auto critical  = std::min(budget - 2 * threshold / 10, budget - GiB / 2);
 	m_trigger_gc_memory  = static_cast<uint64_t>(std::max<int64_t>(expected, GiB));
 	m_critical_gc_memory = static_cast<uint64_t>(std::max<int64_t>(critical, 2 * GiB));
+	// KYTY_BUFFER_CACHE_MB: an upper bound whatever the card's size (default 6 GiB; 0 = none), as
+	// KYTY_TEXTURE_CACHE_MB for images: on a 32 GB card buffers of scenes the game had left stayed
+	// until ~26 GB.
+	const char* value = std::getenv("KYTY_BUFFER_CACHE_MB");
+	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 6144ull;
+	if (mib != 0) {
+		const auto cap       = mib << 20u;
+		m_trigger_gc_memory  = std::min<uint64_t>(m_trigger_gc_memory, cap);
+		m_critical_gc_memory = std::min<uint64_t>(m_critical_gc_memory, cap + cap / 4);
+		LOGF("BufferCache: thresholds capped at %" PRIu64 " MB (critical %" PRIu64 " MB)\n",
+		     m_trigger_gc_memory >> 20u, m_critical_gc_memory >> 20u);
+	}
 }
 
 BufferCache::~BufferCache() {
