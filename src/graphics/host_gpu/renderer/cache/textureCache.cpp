@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <span>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
@@ -94,9 +95,23 @@ constexpr uint64_t AliasFramesBeforeRemoval = 4;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
 	if (cmask ? code == 0 : code == 0x20) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
-		return desc.type == TextureCache::BindingType::RenderTarget &&
-		       metadata.clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.clear_word, clear);
+		if (desc.type != TextureCache::BindingType::RenderTarget || !metadata.clear_register_valid) {
+			return false;
+		}
+		if (DecodePackedColorClear(format, metadata.clear_word, clear)) {
+			return true;
+		}
+		// KYTY_CLEAR_REGISTER_WIDE: 64-bit, 16-bit-channel and B10G11R11 targets (both words).
+		if (!DecodePackedColorClear64(format, metadata.clear_word, metadata.clear_word1, clear)) {
+			return false;
+		}
+		static std::mutex                   logged_mutex;
+		static std::unordered_set<uint32_t> logged;
+		if (std::lock_guard lock(logged_mutex); logged.insert(static_cast<uint32_t>(format)).second) {
+			LOGF("Register clear of format %u decoded with both clear words (was dropped)\n",
+			     static_cast<uint32_t>(format));
+		}
+		return true;
 	}
 	if (cmask) {
 		return false;

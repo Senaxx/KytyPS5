@@ -12,6 +12,8 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <limits>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -26,6 +28,7 @@ struct ImageMetadataInfo {
 	ImageMetadataKind   kind                 = ImageMetadataKind::None;
 	uint32_t            control              = 0;
 	uint32_t            clear_word           = 0;
+	uint32_t            clear_word1          = 0; // CB_COLORn_CLEAR_WORD1 (texel bits 32..63)
 	VideoOutCompression compression          = VideoOutCompression::Uncompressed;
 	bool                stencil_compressed   = false;
 	bool                clear_register_valid = false;
@@ -444,6 +447,120 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 			next.float32[3] = static_cast<float>((packed >> 30u) & 0x3u) / 3.0f;
 			break;
 		default: return false;
+	}
+	clear = next;
+	return true;
+}
+
+// KYTY_CLEAR_REGISTER_WIDE (default 1; 0 restores the old decoding): register clears (DCC key 0x20
+// and CMASK fast clears) of 64-bit targets use CLEAR_WORD1 as well, and 16-bit-channel and
+// B10G11R11 targets are decoded. Without it Astro Bot's galaxy map kept its RGBA16F normal G-buffer
+// uncleared (DCC key 0x20): moving objects left smeared copies that the lighting turned into red
+// ribbons and bands over the nebula. Our decoder had only the 8-bit and 10-10-10-2 formats.
+[[nodiscard]] inline bool ClearRegisterWideEnabled() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_CLEAR_REGISTER_WIDE");
+		return value == nullptr || value[0] == '\0' || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// The clear colour of a register clear (DCC key 0x20, CMASK fast clear): CB_COLORn_CLEAR_WORD0/1
+// hold the texel bits of the target format (word0 the low 32 bits). From Jetsku fb4819f0.
+[[nodiscard]] inline bool DecodePackedColorClear64(vk::Format format, uint32_t word0,
+                                                   uint32_t word1, vk::ClearColorValue& clear) {
+	const auto half_to_float = [](uint32_t bits) {
+		const uint32_t sign     = (bits & 0x8000u) << 16u;
+		const uint32_t exponent = (bits >> 10u) & 0x1fu;
+		uint32_t       mantissa = bits & 0x3ffu;
+		if (exponent == 0x1fu) {
+			return std::bit_cast<float>(sign | 0x7f800000u | (mantissa << 13u));
+		}
+		if (exponent != 0) {
+			return std::bit_cast<float>(sign | ((exponent + 112u) << 23u) | (mantissa << 13u));
+		}
+		if (mantissa == 0) {
+			return std::bit_cast<float>(sign);
+		}
+		// Subnormal half: normalize into a float.
+		uint32_t shift = 0;
+		while ((mantissa & 0x400u) == 0) {
+			mantissa <<= 1u;
+			shift++;
+		}
+		mantissa &= 0x3ffu;
+		return std::bit_cast<float>(sign | ((113u - shift) << 23u) | (mantissa << 13u));
+	};
+	if (!ClearRegisterWideEnabled()) {
+		return DecodePackedColorClear(format, word0, clear);
+	}
+	const std::array<uint32_t, 4> halves {word0 & 0xffffu, word0 >> 16u, word1 & 0xffffu,
+	                                      word1 >> 16u};
+	vk::ClearColorValue next {};
+	switch (format) {
+		case vk::Format::eR16G16B16A16Sfloat:
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = half_to_float(halves[i]);
+			break;
+		case vk::Format::eR16G16B16A16Unorm:
+			for (uint32_t i = 0; i < 4; i++) next.float32[i] = static_cast<float>(halves[i]) / 65535.0f;
+			break;
+		case vk::Format::eR16G16B16A16Uint:
+			for (uint32_t i = 0; i < 4; i++) next.uint32[i] = halves[i];
+			break;
+		case vk::Format::eR16G16B16A16Sint:
+			for (uint32_t i = 0; i < 4; i++) next.int32[i] = static_cast<int16_t>(halves[i]);
+			break;
+		case vk::Format::eR32G32Sfloat:
+			next.float32[0] = std::bit_cast<float>(word0);
+			next.float32[1] = std::bit_cast<float>(word1);
+			break;
+		case vk::Format::eR32G32Uint:
+			next.uint32[0] = word0;
+			next.uint32[1] = word1;
+			break;
+		case vk::Format::eR32G32Sint:
+			next.int32[0] = static_cast<int32_t>(word0);
+			next.int32[1] = static_cast<int32_t>(word1);
+			break;
+		default:
+			switch (format) {
+				// Channel 0 in the low bits of word0, as for the 4-byte formats above.
+				case vk::Format::eR16Sfloat: next.float32[0] = half_to_float(halves[0]); break;
+				case vk::Format::eR16G16Sfloat:
+					next.float32[0] = half_to_float(halves[0]);
+					next.float32[1] = half_to_float(halves[1]);
+					break;
+				case vk::Format::eR16Unorm: next.float32[0] = static_cast<float>(halves[0]) / 65535.0f; break;
+				case vk::Format::eR16G16Unorm:
+					next.float32[0] = static_cast<float>(halves[0]) / 65535.0f;
+					next.float32[1] = static_cast<float>(halves[1]) / 65535.0f;
+					break;
+				case vk::Format::eR8Unorm: next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f; break;
+				case vk::Format::eR8G8Unorm:
+					next.float32[0] = static_cast<float>(word0 & 0xffu) / 255.0f;
+					next.float32[1] = static_cast<float>((word0 >> 8u) & 0xffu) / 255.0f;
+					break;
+				case vk::Format::eB10G11R11UfloatPack32: {
+					// Unsigned 11-bit (5e6m) R and G, 10-bit (5e5m) B, R in the low bits.
+					const auto unsigned_small_float = [](uint32_t bits, uint32_t mantissa_bits) {
+						const uint32_t mantissa = bits & ((1u << mantissa_bits) - 1u);
+						const uint32_t exponent = bits >> mantissa_bits;
+						if (exponent == 0x1fu) {
+							return mantissa != 0 ? std::numeric_limits<float>::quiet_NaN()
+							                     : std::numeric_limits<float>::infinity();
+						}
+						const auto m = static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits);
+						return exponent == 0 ? std::ldexp(m, -14) : std::ldexp(1.0f + m, static_cast<int>(exponent) - 15);
+					};
+					next.float32[0] = unsigned_small_float(word0 & 0x7ffu, 6);
+					next.float32[1] = unsigned_small_float((word0 >> 11u) & 0x7ffu, 6);
+					next.float32[2] = unsigned_small_float(word0 >> 22u, 5);
+					next.float32[3] = 1.0f;
+					break;
+				}
+				default: return DecodePackedColorClear(format, word0, clear);
+			}
+			break;
 	}
 	clear = next;
 	return true;
