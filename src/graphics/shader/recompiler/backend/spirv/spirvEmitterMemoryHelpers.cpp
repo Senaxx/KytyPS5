@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -114,6 +115,56 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_dword_lengths[i] =
 		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
+	if (state.program.bindings.write_tracking) {
+		const auto load64 = [&](uint32_t dword) {
+			const auto u64 = TypeScalarU64(state);
+			const auto lo  = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
+			const auto hi = Unary(state, spv::OpUConvert, u64,
+			                      EmitShaderDataDwordLoad(state, dword + 1u));
+			return Binary(state, spv::OpBitwiseOr, u64, lo,
+			              Binary(state, spv::OpShiftLeftLogical, u64, hi,
+			                     ConstantDeviceAddress(state, 32)));
+		};
+		const auto start           = state.program.bindings.WriteTrackDword();
+		state.write_bitmap_address = load64(start);
+		for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
+			state.write_track_bases[i] = load64(start + 2u + 2u * i);
+		}
+	}
+}
+
+// Rework Phase 2, first step: a store or atomic through a write-tracked binding sets the bit of
+// its guest page (4 KiB) in the GPU write bitmap; the host then downloads only pages that were
+// written. A binding the host does not track in this draw has a base of 0 and skips it.
+void EmitWriteBitmapMark(EmitterState& state, const MemoryResourceAccess& access, uint32_t index) {
+	const auto u64     = TypeScalarU64(state);
+	const auto tracked = Binary(state, spv::OpINotEqual, TypeBool(state), access.write_base,
+	                            ConstantDeviceAddress(state, 0));
+	(void)EmitValueOrZeroIfCondition(state, tracked, [&]() {
+		const auto element = Unary(state, spv::OpUConvert, u64, index);
+		const auto shift   = std::countr_zero(std::max(access.element_bits / 8u, 1u));
+		const auto offset  = shift == 0 ? element
+		                                : Binary(state, spv::OpShiftLeftLogical, u64, element,
+		                                         ConstantDeviceAddress(state, shift));
+		const auto address = Binary(state, spv::OpIAdd, u64, access.write_base, offset);
+		const auto page    = Binary(state, spv::OpShiftRightLogical, u64, address,
+		                            ConstantDeviceAddress(state, 12));
+		const auto word    = Binary(state, spv::OpShiftRightLogical, u64, page,
+		                            ConstantDeviceAddress(state, 5));
+		const auto bit     = Binary(
+		    state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), Unary(state, spv::OpUConvert, TypeU32(state), page),
+		           ConstantU32(state, 31)));
+		const auto word_address =
+		    Binary(state, spv::OpIAdd, u64, state.write_bitmap_address,
+		           Binary(state, spv::OpShiftLeftLogical, u64, word, ConstantDeviceAddress(state, 2)));
+		const auto pointer = Unary(state, spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
+		                           word_address);
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), value, pointer,
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0), bit);
+		return value;
+	});
 }
 
 uint32_t LdsDwordCount(const EmitterState& state) {
@@ -204,12 +255,18 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
 	MemoryResourceAccess access {
-	    .kind = mem.kind,
+	    .kind          = mem.kind,
+	    .element_bits  = element_bits,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
+	if (state.emitting_write && mem.kind == IR::ResourceKind::Buffer &&
+	    state.program.bindings.write_tracking && mem.resource < state.program.info.buffers.size() &&
+	    state.program.info.buffers[mem.resource].write_tracked) {
+		access.write_base = state.write_track_bases[array_index];
+	}
 	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB.
 	// Use the actual bound range, including alignment, without truncating guest memory.
 	// The length is in dwords; the bounds checks index elements of the access's own width (narrow
@@ -317,6 +374,9 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state,
                                          const MemoryResourceAccess& access, uint32_t index,
                                          uint32_t pointer_type) {
+	if (access.write_base != 0) {
+		EmitWriteBitmapMark(state, access, index);
+	}
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);

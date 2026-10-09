@@ -136,6 +136,12 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
+	// Write bitmap (BindingLayout::write_tracking): the bitmap's device address, each memory
+	// binding's guest base (u64 ids; a base of 0 is not tracked in that draw), and whether the
+	// instruction being emitted writes memory.
+	uint32_t                                         write_bitmap_address    = 0;
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> write_track_bases {};
+	bool                                             emitting_write          = false;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -460,6 +466,8 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// Write-tracked binding, while a writing instruction is emitted: its guest base (u64 id).
+	uint32_t              write_base       = 0;
 };
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,

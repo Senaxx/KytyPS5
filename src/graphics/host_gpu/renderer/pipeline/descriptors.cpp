@@ -221,11 +221,22 @@ struct DiagShaderScope {
 	KYTY_CLASS_NO_COPY(DiagShaderScope);
 };
 
+// KYTY_WRITE_BITMAP_MIN_KB (default 1024), as BufferCache's.
+static uint64_t WriteBitmapMinBytesForBinding() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_WRITE_BITMAP_MIN_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) * 1024u;
+	}();
+	return bytes;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource&    resource,
-                    const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset,
+                    bool track_writes, uint64_t& tracked_base) {
 	buffer_offset = 0;
+	tracked_base  = 0;
 
 	const auto& [address, size, id] = source;
 	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
@@ -242,14 +253,21 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	                           g_bounded_buffer_writes;
 	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
 	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	// Unbounded writes through a large range: the shader marks the pages it writes in the GPU
+	// write bitmap, and only those are downloaded (BufferCache::ObtainBufferTracked).
+	const bool tracked = track_writes && resource.written && !bounded_write &&
+	                     size >= WriteBitmapMinBytesForBinding() &&
+	                     address + size <= (uint64_t {1} << 40u) &&
+	                     context.GetBufferCache().WriteBitmapAddress() != 0;
 	auto [buffer, offset] =
 	    bounded_write
 	        ? context.GetBufferCache().ObtainBufferWritten(address, size, address + written_begin,
 	                                                       written_end - std::min(written_begin,
 	                                                                              written_end),
 	                                                       id)
-	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                resource.formatted, id);
+	    : tracked ? context.GetBufferCache().ObtainBufferTracked(address, size, id)
+	              : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                      resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -257,6 +275,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
+	if (tracked) {
+		tracked_base = address - adjustment; // the guest address of the bound range's first byte
+	}
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
 	if (resource.written && written_end > written_begin) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address + written_begin,
@@ -2074,6 +2095,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
+	const bool write_tracking = layout.write_tracking;
+	if (write_tracking) {
+		const auto bitmap = m_context.GetBufferCache().WriteBitmapAddress();
+		prepared.shader_data[layout.WriteTrackDword()]      = static_cast<uint32_t>(bitmap);
+		prepared.shader_data[layout.WriteTrackDword() + 1u] = static_cast<uint32_t>(bitmap >> 32u);
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -2082,11 +2109,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
+		uint64_t tracked_base  = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(
 		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
 		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
 		                                                    : nullptr,
-		    buffer_offset));
+		    buffer_offset, write_tracking && program.info.buffers[resource].write_tracked,
+		    tracked_base));
+		if (write_tracking) {
+			const auto dword                     = layout.WriteTrackDword() + 2u + 2u * i;
+			prepared.shader_data[dword]          = static_cast<uint32_t>(tracked_base);
+			prepared.shader_data[dword + 1u]     = static_cast<uint32_t>(tracked_base >> 32u);
+		}
 		pack_memory_offset(i, buffer_offset);
 		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
 		// buffer still has no accessible elements. In particular, never let a null store

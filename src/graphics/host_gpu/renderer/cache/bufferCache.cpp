@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/timeline.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "kernel/memory.h"
@@ -470,6 +471,11 @@ uint64_t BufferCache::ReadMemoryStep(uint64_t vaddr, uint64_t size, bool is_writ
 	// page. The page is current, so lift its protection. Downloading the window instead drained
 	// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
 	// labels.
+	// GPU write bitmap: pages of tracked bindings the GPU did not write lose their GPU-written
+	// bytes here, so the window below downloads only what was written, or nothing.
+	if (uint64_t wait_tick = 0; RefineWithWriteBitmap(buffer, vaddr, size, async, wait_tick)) {
+		return wait_tick;
+	}
 	const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
@@ -962,10 +968,181 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, ui
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
-void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
+namespace {
+constexpr uint64_t WriteBitmapPageBits = 12;
+constexpr uint64_t WriteBitmapPage     = uint64_t {1} << WriteBitmapPageBits;
+constexpr uint64_t WriteBitmapLimit    = uint64_t {1} << 40u; // guest addresses it covers
+constexpr uint64_t WriteBitmapBytes    = WriteBitmapLimit / WriteBitmapPage / 8u;
+constexpr uint64_t WriteBitmapRegionBits = 22; // ticks per 4 MiB: a multiple of a bitmap word's span
+
+// KYTY_WRITE_BITMAP_MIN_KB (default 1024): smaller unbounded written bindings keep downloading
+// whole, as before; the bitmap pays off where a binding spans much more than it writes.
+uint64_t WriteBitmapMinBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_WRITE_BITMAP_MIN_KB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {1024}) * 1024u;
+	}();
+	return bytes;
+}
+} // namespace
+
+vk::DeviceAddress BufferCache::WriteBitmapAddress() {
+	if (!ShaderRecompiler::IR::WriteBitmapEnabled() || m_write_bitmap_failed) {
+		return 0;
+	}
+	if (m_write_bitmap == nullptr) {
+		m_write_bitmap = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Stream, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eShaderDeviceAddress,
+		    WriteBitmapBytes);
+		// The host reads and clears bits in place, so the memory must be host-coherent.
+		if (!m_write_bitmap->IsCoherent() || m_write_bitmap->Mapped().size() < WriteBitmapBytes ||
+		    !m_write_bitmap->HasDeviceAddress()) {
+			LOGF("BufferCache: GPU write bitmap unavailable (no host-coherent device memory)\n");
+			m_write_bitmap.reset();
+			m_write_bitmap_failed = true;
+			return 0;
+		}
+		std::memset(m_write_bitmap->Mapped().data(), 0, static_cast<size_t>(WriteBitmapBytes));
+		LOGF("BufferCache: GPU write bitmap on (%" PRIu64 " MB, pages of written bindings of at "
+		     "least %" PRIu64 " KB)\n",
+		     WriteBitmapBytes >> 20u, WriteBitmapMinBytes() >> 10u);
+	}
+	return m_write_bitmap->BufferDeviceAddress();
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferTracked(uint64_t vaddr, uint64_t size,
+                                                              BufferId id) {
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	buffer.last_use_tick = m_scheduler.CurrentTick();
+	(void)SynchronizeBuffer(buffer, vaddr, size, true, false);
+	MarkGpuWritten(vaddr, size, true);
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+bool BufferCache::RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        bool async, uint64_t& wait_tick) {
+	if (m_write_bitmap == nullptr) {
+		return false;
+	}
+	// The readback window ReadMemoryStep downloads (see there).
+	auto begin = vaddr;
+	auto end   = vaddr + size;
+	if (const auto window = ReadbackWindow(); window != 0) {
+		begin = std::max(Common::AlignDown(vaddr, window), buffer.CpuAddress());
+		end   = std::min(std::max(begin + window, vaddr + size), buffer.CpuAddress() + buffer.Size());
+	}
+	begin = Common::AlignDown(begin, WriteBitmapPage);
+	end   = Common::AlignUp(end, WriteBitmapPage);
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	if (m_bitmap_tracked.Empty() || !m_bitmap_tracked.Intersects(begin, end - begin)) {
+		return false;
+	}
+	// The bits are final only once no tracked write to these regions is in flight; that also
+	// keeps the GPU's atomic ORs off the words the host clears below.
+	uint64_t tick = 0;
+	for (auto region = begin >> WriteBitmapRegionBits; region <= (end - 1) >> WriteBitmapRegionBits;
+	     region++) {
+		if (const auto found = m_bitmap_ticks.find(region); found != m_bitmap_ticks.end()) {
+			tick = std::max(tick, found->second);
+		}
+	}
+	if (tick != 0 && !m_scheduler.IsFree(tick)) {
+		if (!async) {
+			return false; // the GPU thread downloads the window as before
+		}
+		lock.unlock();
+		if (tick >= m_scheduler.CurrentTick()) {
+			m_scheduler.Flush();
+		}
+		wait_tick = tick;
+		return true;
+	}
+	// Only GPU-written pieces of the window are looked at, and unwritten pages leave the set in
+	// runs: page-by-page set operations cost the GPU thread more than the downloads they saved.
+	auto*                                      words = reinterpret_cast<uint32_t*>(m_write_bitmap->Mapped().data());
+	std::vector<std::pair<uint64_t, uint64_t>> pieces;
+	m_gpu_modified_ranges.ForEachInRange(begin, end - begin, [&](uint64_t from, uint64_t to) {
+		pieces.emplace_back(from, to);
+	});
+	std::vector<std::pair<uint64_t, uint64_t>> unwritten; // runs of whole pages
+	uint64_t                                   dropped = 0;
+	for (const auto [from, to]: pieces) {
+		m_bitmap_tracked.ForEachInRange(from, to - from, [&](uint64_t tb, uint64_t te) {
+			for (auto page = Common::AlignUp(tb, WriteBitmapPage);
+			     page + WriteBitmapPage <= te && page + WriteBitmapPage <= WriteBitmapLimit;
+			     page += WriteBitmapPage) {
+				const auto index = page >> WriteBitmapPageBits;
+				auto&      word  = words[index >> 5u];
+				const auto bit   = uint32_t {1} << (index & 31u);
+				if ((word & bit) == 0) {
+					if (!unwritten.empty() && unwritten.back().second == page) {
+						unwritten.back().second = page + WriteBitmapPage;
+					} else {
+						unwritten.emplace_back(page, page + WriteBitmapPage);
+					}
+					dropped++;
+				} else {
+					word &= ~bit; // downloaded with the window now
+					m_bitmap_written_pages++;
+				}
+			}
+		});
+	}
+	for (const auto [from, to]: unwritten) {
+		m_gpu_modified_ranges.Subtract(from, to - from);
+	}
+	m_bitmap_dropped_pages += dropped;
+	static uint64_t calls = 0;
+	if (++calls % 4096 == 1) {
+		LOGF("WriteBitmap: %" PRIu64 " refinements, %" PRIu64 " pages dropped unwritten, %" PRIu64
+		     " pages written\n",
+		     calls, m_bitmap_dropped_pages, m_bitmap_written_pages);
+	}
+	return false;
+}
+
+void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked) {
 	KYTY_PROFILER_BLOCK("Obtain::MarkWritten");
 	{
 		std::unique_lock lock(m_dirty_ranges_mutex);
+		const auto first = Common::AlignDown(vaddr, WriteBitmapPage);
+		const auto last  = Common::AlignUp(vaddr + size, WriteBitmapPage);
+		if (tracked && !m_bitmap_tracked.Contains(first, last - first)) {
+			// A page stays untracked while it holds bytes an untracked write left GPU-written:
+			// the GPU-written pieces outside the tracked set, widened to pages, are left out.
+			RangeSet add;
+			add.Add(first, last - first);
+			std::vector<std::pair<uint64_t, uint64_t>> dirty;
+			m_gpu_modified_ranges.ForEachInRange(first, last - first, [&](uint64_t b, uint64_t e) {
+				dirty.emplace_back(b, e);
+			});
+			for (const auto [b, e]: dirty) {
+				RangeSet untracked;
+				untracked.Add(b, e - b);
+				m_bitmap_tracked.ForEachInRange(b, e - b, [&](uint64_t tb, uint64_t te) {
+					untracked.Subtract(tb, te - tb);
+				});
+				untracked.ForEach([&](uint64_t ub, uint64_t ue) {
+					const auto pb = Common::AlignDown(ub, WriteBitmapPage);
+					add.Subtract(pb, Common::AlignUp(ue, WriteBitmapPage) - pb);
+				});
+			}
+			add.ForEach([&](uint64_t b, uint64_t e) { m_bitmap_tracked.Add(b, e - b); });
+		}
+		if (tracked) {
+			const auto tick = m_scheduler.CurrentTick();
+			for (auto region = first >> WriteBitmapRegionBits;
+			     region <= (last - 1) >> WriteBitmapRegionBits; region++) {
+				m_bitmap_ticks[region] = tick;
+			}
+		} else if (!m_bitmap_tracked.Empty()) {
+			m_bitmap_tracked.Subtract(first, last - first);
+		}
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	// Diagnostics: KYTY_WATCH_GPU_WRITE=<address>[+<size>][,<address>[+<size>]...] (hex) names

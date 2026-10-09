@@ -12,8 +12,10 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <memory>
 #include <shared_mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -82,6 +84,14 @@ public:
 	[[nodiscard]] Buffer*       GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// GPU write bitmap (KYTY_WRITE_BITMAP=1, rework.md Phase 2 first step): one bit per 4 KiB
+	// guest page below 1 TiB, set by shaders through bindings whose writes the host cannot bound.
+	// Its device address, or 0 when it is off or unavailable.
+	[[nodiscard]] vk::DeviceAddress WriteBitmapAddress();
+	// ObtainBuffer for such a written binding: its pages become bitmap-tracked, so a guest read
+	// of a page the GPU did not write needs no download (ReadMemoryStep).
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferTracked(uint64_t vaddr, uint64_t size,
+	                                                               BufferId id);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
@@ -140,7 +150,11 @@ private:
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
 	// Records bytes a binding makes GPU-written (after SynchronizeBuffer marked their pages).
-	void MarkGpuWritten(uint64_t vaddr, uint64_t size);
+	void MarkGpuWritten(uint64_t vaddr, uint64_t size, bool tracked = false);
+	// ReadMemoryStep: drops the pages of the readback window the bitmap shows the GPU did not
+	// write. True with wait_tick set when an asynchronous caller must first wait for that tick.
+	bool RefineWithWriteBitmap(const Buffer& buffer, uint64_t vaddr, uint64_t size, bool async,
+	                           uint64_t& wait_tick);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
@@ -184,6 +198,15 @@ private:
 	// window cleared the range while the second was in flight; a game thread then took the
 	// page as current, wrote it, and the second publication put older GPU bytes over that).
 	std::vector<std::pair<uint64_t, uint64_t>>         m_downloading_list;
+	// Write bitmap (WriteBitmapAddress): the buffer, the whole pages whose GPU writes all came
+	// through tracked bindings, and per 4 MiB region the last tick a tracked binding wrote it.
+	// Guarded by m_dirty_ranges_mutex, as m_gpu_modified_ranges.
+	std::unique_ptr<Buffer>                            m_write_bitmap;
+	bool                                               m_write_bitmap_failed = false;
+	RangeSet                                           m_bitmap_tracked;
+	std::unordered_map<uint64_t, uint64_t>             m_bitmap_ticks;
+	uint64_t                                           m_bitmap_dropped_pages = 0;
+	uint64_t                                           m_bitmap_written_pages = 0;
 	// The tick of the latest asynchronous readback (KYTY_ASYNC_READBACK); GPU thread only.
 	uint64_t                                           m_last_async_download_tick = 0;
 	// Guards changes to both range sets (GPU thread and download completions) against

@@ -125,6 +125,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	const auto shared = CollectMemoryResources(program, buffers);
 	CollectShaderData(program, next);
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
+	next.write_tracking            = std::ranges::any_of(buffers, [&](uint32_t resource) {
+		           return resource < program.info.buffers.size() &&
+		                  program.info.buffers[resource].write_tracked;
+	           });
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

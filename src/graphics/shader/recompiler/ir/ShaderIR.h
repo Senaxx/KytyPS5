@@ -123,6 +123,8 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// From ResourceSpecialization::Buffer::write_tracked.
+	bool                   write_tracked      = false;
 	uint32_t               indirect_root              = NoIndirectBuffer;
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
@@ -458,14 +460,21 @@ struct BindingLayout {
 	uint32_t                       dispatch_thread_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	// Some memory binding is write-tracked: WriteTrackDword() holds the bitmap's device address
+	// (2 dwords), then the guest address of each memory binding's range start (2 dwords each; 0 =
+	// not tracked in this draw).
+	bool                           write_tracking      = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
 	[[nodiscard]] uint32_t BufferLengthDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
 	}
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	[[nodiscard]] uint32_t WriteTrackDword() const {
 		return BufferLengthDword() + memory_offset_count;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return WriteTrackDword() + (write_tracking ? 2u + 2u * memory_offset_count : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

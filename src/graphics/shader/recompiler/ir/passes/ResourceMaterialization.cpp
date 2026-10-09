@@ -1657,6 +1657,10 @@ bool MaterializeResourcesImpl(const ResourcePlan& program, const SrtRuntime& run
 		    base.formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		buffer.write_tracked      = WriteBitmapEnabled() && i < program.info.buffers.size() &&
+		                            base.written && base.image_alias == BufferResource::NoImageAlias &&
+		                            i < program.buffer_writes_bounded.size() &&
+		                            program.buffer_writes_bounded[i] == 0u;
 	}
 	{
 		// Write extents only size the GPU-written range; their reads do not specialize the
@@ -1881,6 +1885,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		buffer.packed_stride              = source.packed_stride;
 		buffer.descriptor_format          = source.descriptor_format;
 		buffer.descriptor_swizzle         = source.descriptor_swizzle;
+		buffer.write_tracked              = source.write_tracked;
 		buffer.indirect_root              = source.indirect_root;
 		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
 		buffer.indirect_search_iterations = source.indirect_search_iterations;
@@ -2073,6 +2078,18 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+}
+
+// KYTY_WRITE_BITMAP=1: buffers written at addresses the host cannot bound record the pages they
+// write in a GPU bitmap, so a guest read of a page the shader did not write needs no download
+// (rework.md, Phase 2 first step; compute shader eaa507075716aa3b adds into a 70 MiB range and
+// caused half of all readbacks in a new game).
+bool WriteBitmapEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_WRITE_BITMAP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
