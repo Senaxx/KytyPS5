@@ -2867,6 +2867,41 @@ private:
 		}
 	}
 
+	// True when a value the load returns reaches a resource handle (a descriptor kept in that
+	// buffer): the host evaluates such descriptors from the loaded bytes, so the load must stay
+	// a host-visible binding (KYTY_GPU_RESOURCES). The instructions that feed any handle are
+	// collected once per shader, walking back from every handle.
+	bool FeedsResourceHandle(const Inst& load) {
+		if (!m_handle_feeders) {
+			auto& feeders = m_handle_feeders.emplace();
+			std::vector<const Inst*> pending;
+			for (auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					switch (inst.GetOpcode()) {
+						case ValueOpcode::GetAddressResource:
+						case ValueOpcode::GetBufferResource:
+						case ValueOpcode::GetImageResource:
+						case ValueOpcode::GetSamplerResource:
+						case ValueOpcode::GetScratchResource:
+						case ValueOpcode::GetSrtResource: pending.push_back(&inst); break;
+						default: break;
+					}
+				}
+			}
+			while (!pending.empty()) {
+				const auto* current = pending.back();
+				pending.pop_back();
+				for (size_t arg = 0; arg < current->NumArgs(); arg++) {
+					const auto* next = current->Arg(arg).Resolve().TryInstruction();
+					if (next != nullptr && feeders.insert(next).second) {
+						pending.push_back(next);
+					}
+				}
+			}
+		}
+		return m_handle_feeders->contains(&load);
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
 	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
 	               bool sample_adjust = false) {
@@ -3115,7 +3150,8 @@ private:
 				    const auto index  = use.user->Flags<MemoryFlags>().index;
 				    return BufferAccessOf(use_op) == BufferAccess::Read &&
 				           index < m_program.memory_info.size() &&
-				           m_program.memory_info[index].SupportsIndirectBufferLoad(use_op);
+				           m_program.memory_info[index].SupportsIndirectBufferLoad(use_op) &&
+				           !FeedsResourceHandle(*use.user);
 			    })) {
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
@@ -3258,6 +3294,7 @@ private:
 	const CFG::Graph&                          m_native_cfg;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
+	std::optional<std::unordered_set<const Inst*>> m_handle_feeders;
 	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
