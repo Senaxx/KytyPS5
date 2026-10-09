@@ -29,6 +29,13 @@ public:
 	// be stale by the time the caller acts on it.
 	[[nodiscard]] bool IsReadWatched(uint64_t vaddr) const noexcept;
 
+	// The host protection of [vaddr, vaddr + size) was replaced behind the tracker (a view mapped
+	// again with its own access by a partial unmap, a guest mprotect that allows writes): the
+	// watched pages get the protection their counts ask for again, so CPU writes to them fault
+	// (and reach the GPU) once more. Unwatched pages keep what they were given. Any thread,
+	// outside the guest address-space lock.
+	void ResyncHostProtection(uint64_t vaddr, uint64_t size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

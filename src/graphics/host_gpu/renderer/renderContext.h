@@ -59,6 +59,11 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	// The host protection of the range was replaced behind the page tracker
+	// (PageManager::ResyncHostProtection): the watched pages get the tracker's protection back.
+	void ResyncHostProtection(uint64_t vaddr, uint64_t size) {
+		m_page_manager.ResyncHostProtection(vaddr, size);
+	}
 	void               PrepareBda();
 	void               RunGarbageCollector();
 
