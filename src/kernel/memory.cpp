@@ -248,6 +248,7 @@ public:
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -279,6 +280,7 @@ public:
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -311,6 +313,7 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -327,6 +330,7 @@ public:
 	                 const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_acq_rel);
+		m_coverage_generation.fetch_add(1, std::memory_order_acq_rel);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -463,11 +467,41 @@ public:
 		return m_generation.load(std::memory_order_acquire);
 	}
 
+	// Bumped only by the changes that can change which bytes are committed (add, remove,
+	// replace, release); protection, name and memory type changes leave it.
+	[[nodiscard]] uint64_t CoverageGeneration() const noexcept {
+		return m_coverage_generation.load(std::memory_order_acquire);
+	}
+
 	uint64_t ClampRangeSize(uint64_t virtual_addr, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
+		}
+		// Committed bytes as merged spans, rebuilt after coverage changed: a heap-wide descriptor
+		// spans thousands of mappings, and while the game streams (it maps memory hundreds of
+		// times a second) the per-thread answers of TryClampRangeSize keep missing, so the walk
+		// below ran under the lock at ~4 us a call (the helicopter cut, 2026-10-09).
+		// KYTY_CLAMP_SPANS=0 walks the ranges as before.
+		static const bool spans = [] {
+			const char* value = std::getenv("KYTY_CLAMP_SPANS");
+			return value == nullptr || value[0] != '0';
+		}();
+		if (spans) {
+			const auto generation = m_coverage_generation.load(std::memory_order_relaxed);
+			if (m_spans_generation != generation) {
+				RebuildSpansUnlocked();
+				m_spans_generation = generation;
+			}
+			auto span = std::upper_bound(
+			    m_spans.begin(), m_spans.end(), virtual_addr,
+			    [](uint64_t value, const Span& candidate) { return value < candidate.start; });
+			if (span == m_spans.begin()) {
+				return 0;
+			}
+			--span;
+			return virtual_addr < span->end ? std::min(size, span->end - virtual_addr) : 0;
 		}
 
 		auto vma = std::upper_bound(
@@ -527,6 +561,26 @@ public:
 private:
 	static uint64_t End(uint64_t start, uint64_t size) {
 		return (UINT64_MAX - start < size ? UINT64_MAX : start + size);
+	}
+
+	// Maximal runs of adjacent committed ranges, as ClampRangeSize's walk joins them.
+	struct Span {
+		uint64_t start = 0;
+		uint64_t end   = 0;
+	};
+	void RebuildSpansUnlocked() {
+		m_spans.clear();
+		for (const auto& r: m_ranges) {
+			if (!IsCommittedRangeType(r.type) || r.size == 0) {
+				continue;
+			}
+			const auto end = End(r.start, r.size);
+			if (!m_spans.empty() && m_spans.back().end == r.start) {
+				m_spans.back().end = end;
+			} else {
+				m_spans.push_back({r.start, end});
+			}
+		}
 	}
 
 	static bool SameMergeKey(const Range& left, const Range& right) {
@@ -689,9 +743,13 @@ private:
 
 	std::vector<Range> m_ranges;
 	Common::Mutex      m_mutex;
-	// Bumped by every change of the ranges: TryClampRangeSize's per-thread answers are valid
-	// while it is unchanged.
+	// Bumped by every change of the ranges.
 	std::atomic<uint64_t> m_generation {1};
+	// Bumped by the changes of committed coverage (CoverageGeneration): TryClampRangeSize's
+	// per-thread answers and m_spans are valid while it is unchanged.
+	std::atomic<uint64_t> m_coverage_generation {1};
+	std::vector<Span>     m_spans;
+	uint64_t              m_spans_generation = 0;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
@@ -1002,7 +1060,7 @@ uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 		return value == nullptr || value[0] != '0';
 	}();
 	thread_local std::array<Answer, 64> answers {};
-	const auto generation = g_virtual_ranges->Generation();
+	const auto generation = g_virtual_ranges->CoverageGeneration();
 	auto&      answer     = answers[((vaddr >> 12u) ^ (size >> 12u) ^ size) & 63u];
 	if (cached && answer.generation == generation && answer.vaddr == vaddr && answer.size == size) {
 		return answer.clamped;
