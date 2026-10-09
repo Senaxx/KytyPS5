@@ -1,4 +1,4 @@
-#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/bufferCachePages.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -1113,7 +1113,7 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 }
 
 void EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code) {
-	constexpr auto record_word = BufferCache::CACHING_NUMPAGES / 8 / sizeof(uint32_t);
+	constexpr auto record_word = BufferCachePages::kNumPages / 8 / sizeof(uint32_t);
 	const auto     pointer     = FaultElementPointer(state, ConstantU32(state, record_word));
 	const auto     old         = state.builder.AllocateId();
 	// Only the winning invocation writes the payload. Queue completion, rather
@@ -1155,14 +1155,14 @@ void DefineGetBdaPointer(EmitterState& state) {
 	EmitLabel(state, entry_label);
 
 	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
-	                             ConstantDeviceAddress(state, LibKernel::Memory::kExtendedMemoryBase));
+	                             ConstantDeviceAddress(state, BufferCachePages::kExtendedMemoryBase));
 	const auto packed = Select(state, type, extended,
 	                           Binary(state, spv::OpISub, type, address,
 	                                  ConstantDeviceAddress(state,
-	                                      LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                                      BufferCachePages::kExtendedMemoryBase - BufferCachePages::kLowerAddressSize)),
 	                           address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
+	                                  ConstantDeviceAddress(state, BufferCachePages::kPageBits));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
@@ -1184,7 +1184,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, available_label);
 	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
-	                              ConstantDeviceAddress(state, BufferCache::CACHING_PAGESIZE - 1));
+	                              ConstantDeviceAddress(state, BufferCachePages::kPageSize - 1));
 	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 

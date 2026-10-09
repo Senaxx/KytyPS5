@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_CACHE_FAULTMANAGER_H_
 
 #include "common/abi.h"
+#include "graphics/host_gpu/renderer/cache/bufferCachePages.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
@@ -11,18 +12,6 @@
 namespace Libs::Graphics {
 
 class BufferCache;
-
-// Appended after the page-fault bitset. The first invocation claiming the record
-// writes its payload; the host reads it only after the submission completes.
-struct ShaderTrapRecord {
-	uint32_t claimed          = 0;
-	uint32_t shader_hash_low  = 0;
-	uint32_t shader_hash_high = 0;
-	uint32_t pc               = 0;
-	uint32_t code             = 0;
-	uint32_t reserved[3] {};
-};
-static_assert(sizeof(ShaderTrapRecord) == 32);
 
 struct ShaderFaultReport {
 	uint64_t         page_count = 0;
