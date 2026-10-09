@@ -37,6 +37,10 @@ bool     Free(uint64_t address);
 bool     FreeRange(uint64_t address, uint64_t size);
 bool     Protect(uint64_t address, uint64_t size, Mode mode);
 bool     FlushInstructionCache(uint64_t address, uint64_t size);
+// The system's commit limit and what is left of it, in bytes: on Windows RAM plus page file, on
+// Linux the strict-overcommit CommitLimit. False where no such limit applies (Linux with heuristic
+// overcommit, macOS) or it cannot be read.
+bool     QueryCommit(uint64_t& limit, uint64_t& available);
 
 } // namespace VirtualMemory
 

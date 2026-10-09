@@ -8,6 +8,7 @@
 #include "common/virtualMemory.h"
 
 #include <atomic>
+#include <cstdio>
 #include <map>
 #include <pthread.h>
 #include <sys/mman.h>
@@ -551,6 +552,45 @@ bool Protect(uint64_t address, uint64_t size, Mode mode) {
 
 bool FlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 	return true;
+}
+
+bool QueryCommit(uint64_t& limit, uint64_t& available) {
+#if defined(__APPLE__)
+	(void)limit;
+	(void)available;
+	return false;
+#else
+	// Only strict overcommit (vm.overcommit_memory=2) enforces CommitLimit.
+	FILE* mode = std::fopen("/proc/sys/vm/overcommit_memory", "r");
+	if (mode == nullptr) {
+		return false;
+	}
+	int        value  = 0;
+	const bool strict = std::fscanf(mode, "%d", &value) == 1 && value == 2;
+	std::fclose(mode);
+	FILE* info = strict ? std::fopen("/proc/meminfo", "r") : nullptr;
+	if (info == nullptr) {
+		return false;
+	}
+	uint64_t commit_limit_kb = 0;
+	uint64_t committed_kb    = 0;
+	char     line[256];
+	while (std::fgets(line, sizeof(line), info) != nullptr) {
+		unsigned long long kb = 0;
+		if (std::sscanf(line, "CommitLimit: %llu kB", &kb) == 1) {
+			commit_limit_kb = kb;
+		} else if (std::sscanf(line, "Committed_AS: %llu kB", &kb) == 1) {
+			committed_kb = kb;
+		}
+	}
+	std::fclose(info);
+	if (commit_limit_kb == 0) {
+		return false;
+	}
+	limit     = commit_limit_kb * 1024u;
+	available = commit_limit_kb > committed_kb ? (commit_limit_kb - committed_kb) * 1024u : 0;
+	return true;
+#endif
 }
 
 } // namespace Common::VirtualMemory

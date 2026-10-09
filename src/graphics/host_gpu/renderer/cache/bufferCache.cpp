@@ -1344,6 +1344,23 @@ void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
 	m_gc_tick++;
 	const auto clock = LruClock();
+	// Memory pressure, as in TextureCache::RunGarbageCollector.
+	if (m_trigger_gc_memory != m_applied_trigger_gc_memory ||
+	    m_critical_gc_memory != m_applied_critical_gc_memory) {
+		m_base_trigger_gc_memory  = m_trigger_gc_memory;
+		m_base_critical_gc_memory = m_critical_gc_memory;
+	}
+	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
+		const auto cap = std::max<uint64_t>(
+		    m_total_used_memory > shortfall ? m_total_used_memory - shortfall : 0, 512ull << 20u);
+		m_trigger_gc_memory  = std::min(m_base_trigger_gc_memory, cap);
+		m_critical_gc_memory = std::min(m_base_critical_gc_memory, cap + cap / 8);
+	} else {
+		m_trigger_gc_memory  = m_base_trigger_gc_memory;
+		m_critical_gc_memory = m_base_critical_gc_memory;
+	}
+	m_applied_trigger_gc_memory  = m_trigger_gc_memory;
+	m_applied_critical_gc_memory = m_critical_gc_memory;
 	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images
 	// spilled to host memory, which on a 6 GB card keeps it above the critical mark forever
 	// and has the collector destroy and recreate every buffer twice a second (a third of

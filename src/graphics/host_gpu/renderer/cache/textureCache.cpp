@@ -2225,6 +2225,31 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();
+	// Memory pressure (GraphicContext::MemoryShortfall: device use past 90 % of the video memory
+	// target): the thresholds sit that far below what the cache holds, so the collector frees its
+	// oldest images until there is room again.
+	if (m_trigger_gc_memory != m_applied_trigger_gc_memory ||
+	    m_pressure_gc_memory != m_applied_pressure_gc_memory ||
+	    m_critical_gc_memory != m_applied_critical_gc_memory) {
+		m_base_trigger_gc_memory  = m_trigger_gc_memory;
+		m_base_pressure_gc_memory = m_pressure_gc_memory;
+		m_base_critical_gc_memory = m_critical_gc_memory;
+	}
+	if (const auto shortfall = m_graphics.MemoryShortfall(); shortfall != 0) {
+		const auto collectable = CollectableMemory();
+		const auto cap =
+		    std::max<uint64_t>(collectable > shortfall ? collectable - shortfall : 0, 512ull << 20u);
+		m_trigger_gc_memory  = std::min(m_base_trigger_gc_memory, cap);
+		m_pressure_gc_memory = std::min(m_base_pressure_gc_memory, cap);
+		m_critical_gc_memory = std::min(m_base_critical_gc_memory, cap + cap / 8);
+	} else {
+		m_trigger_gc_memory  = m_base_trigger_gc_memory;
+		m_pressure_gc_memory = m_base_pressure_gc_memory;
+		m_critical_gc_memory = m_base_critical_gc_memory;
+	}
+	m_applied_trigger_gc_memory  = m_trigger_gc_memory;
+	m_applied_pressure_gc_memory = m_pressure_gc_memory;
+	m_applied_critical_gc_memory = m_critical_gc_memory;
 	if (!m_guest_dropped.empty()) {
 		// Engine method: the guest's own streaming dropped these textures from its heaps, as an
 		// engine unloads a texture; free them once no draw has used them for a few frames, not

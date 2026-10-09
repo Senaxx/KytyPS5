@@ -154,9 +154,22 @@ struct GraphicContext {
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
+	// Memory pressure in bytes, read at most every 250 ms; the caches' collectors lower their
+	// thresholds by it, and DeviceMemoryAtLeast reports true while it is not 0. The larger of:
+	// - the system's free commit below a reserve (KYTY_COMMIT_RESERVE_MB; default 0 = off, see
+	//   MemoryShortfall for why). On Windows every GB of video memory in use is also charged to
+	//   the commit limit (WDDM backs pageable allocations), so a PC with a small page file runs
+	//   out of commit with video memory to spare (ISSUES #21);
+	// - everything the device holds past 90 % of the budget, which KYTY_VRAM_TARGET_MB caps
+	//   (default 14336: the emulator plans for a 16 GB card whatever card it runs on).
+	[[nodiscard]] uint64_t MemoryShortfall() const;
 	// Whether everything the device holds (images, buffers, the driver's own) has reached percent
-	// of the device-local budget. False when the driver cannot report usage.
+	// of the device-local budget, or memory is short (MemoryShortfall). False when the driver
+	// cannot report usage and nothing is short.
 	[[nodiscard]] bool DeviceMemoryAtLeast(uint32_t percent) const {
+		if (MemoryShortfall() != 0) {
+			return true;
+		}
 		if (!CanReportMemoryUsage()) {
 			return false;
 		}

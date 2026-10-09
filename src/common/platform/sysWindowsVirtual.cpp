@@ -335,6 +335,17 @@ bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	return true;
 }
 
+bool QueryCommit(uint64_t& limit, uint64_t& available) {
+	MEMORYSTATUSEX status {};
+	status.dwLength = sizeof(status);
+	if (GlobalMemoryStatusEx(&status) == 0) {
+		return false;
+	}
+	limit     = status.ullTotalPageFile;
+	available = status.ullAvailPageFile;
+	return true;
+}
+
 } // namespace Common::VirtualMemory
 
 #endif

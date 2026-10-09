@@ -235,6 +235,11 @@ private:
 	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
+	// As configured; the ones above come down while memory is short (as in the texture cache).
+	uint64_t m_base_trigger_gc_memory     = 0;
+	uint64_t m_base_critical_gc_memory    = 0;
+	uint64_t m_applied_trigger_gc_memory  = UINT64_MAX; // as in the texture cache
+	uint64_t m_applied_critical_gc_memory = UINT64_MAX;
 	uint64_t m_gc_tick            = 0;
 	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
 	// stretch without presents still ages its entries.

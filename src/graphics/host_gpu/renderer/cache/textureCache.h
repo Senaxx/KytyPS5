@@ -210,6 +210,16 @@ private:
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
+	// The thresholds as configured; the ones above come down from them while memory is short
+	// (GraphicContext::MemoryShortfall: device use past 90 % of the video memory target).
+	uint64_t                                          m_base_trigger_gc_memory  = 0;
+	uint64_t                                          m_base_pressure_gc_memory = 0;
+	uint64_t                                          m_base_critical_gc_memory = 0;
+	// What the collector last wrote into the thresholds: values that differ were set anew
+	// (the constructor's caps, a test's configuration) and become the base.
+	uint64_t                                          m_applied_trigger_gc_memory  = UINT64_MAX;
+	uint64_t                                          m_applied_pressure_gc_memory = UINT64_MAX;
+	uint64_t                                          m_applied_critical_gc_memory = UINT64_MAX;
 	// Engine method: images the guest dropped from its texture heaps (no key refers to them any
 	// more), freed once no draw has used them for a few frames, whatever the memory pressure.
 	uint64_t                                          m_pinned_bytes = 0;
