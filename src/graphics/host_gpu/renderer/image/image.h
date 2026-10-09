@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <mutex>
 #include <compare>
 #include <limits>
 #include <atomic>
@@ -152,6 +153,7 @@ public:
 	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
 	// table (TextureCache::on_bindless_unregister) to repoint the slot.
 	bool             bindless_pinned = false;
+	ImageId          self_id {}; // set by TextureCache::InsertImage
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
@@ -197,9 +199,18 @@ private:
 // (RenderExecutor::CommitBindings): its layout, render-target use and registration. A heap is
 // rechecked only when this changed since it was last checked, or for the images resolved since.
 inline std::atomic<uint64_t> g_bindless_state_generation {1};
+// The pinned images whose state changed, for the engine method's per-draw pass (E5), which looks
+// at these and at newly settled images only, instead of every image of a heap.
+struct BindlessStateChanges {
+	std::mutex           mutex;
+	std::vector<ImageId> ids;
+};
+inline BindlessStateChanges g_bindless_state_changes;
 inline void NoteBindlessStateChange(const Image& image) noexcept {
 	if (image.bindless_pinned) {
 		g_bindless_state_generation.fetch_add(1, std::memory_order_relaxed);
+		std::scoped_lock lock {g_bindless_state_changes.mutex};
+		g_bindless_state_changes.ids.push_back(image.self_id);
 	}
 }
 

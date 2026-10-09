@@ -753,6 +753,9 @@ bool GuestGpu::Process(Submission& submission) {
 
 	if (first_slice) {
 		g_guest_submission_seq.fetch_add(1, std::memory_order_relaxed);
+		// Texture-heap entries the guest wrote before submitting are visible to all of this
+		// submission's draws, as on the console.
+		m_renderer.GetRenderExecutor().SyncBindlessHeaps();
 	}
 
 	if (first_slice) {

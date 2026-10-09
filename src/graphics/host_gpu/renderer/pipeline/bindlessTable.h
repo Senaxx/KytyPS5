@@ -9,7 +9,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <array>
+#include <atomic>
 #include <deque>
+#include <mutex>
+#include <utility>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -20,7 +23,13 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class PageManager;
 class SamplerCache;
+
+// The engine method for the guest's texture heaps (engine-method.md): heap entries are noticed
+// when the guest writes them, through write-watched pages, instead of by a rolling scan.
+// On by default; KYTY_BINDLESS_ENGINE=0 restores the rolling scan and the per-draw image walk.
+[[nodiscard]] bool BindlessEngineEnabled();
 
 // Descriptor set 1 of every pipeline that samples bindless images: typed arrays of sampled
 // images a shader indexes with a slot it looks up per pixel, the key -> slot translation the
@@ -47,11 +56,11 @@ public:
 	static constexpr uint32_t ImageArrays        = 4;
 	static constexpr uint32_t PlaceholderColors  = 3;
 	static constexpr uint32_t Placeholders       = ImageArrays * PlaceholderColors;
-	static constexpr uint32_t MaxImagesPerArray  = 16384;
+	static constexpr uint32_t MaxImagesPerArray  = 65536; // E3 settles every entry of a heap
 	static constexpr uint32_t TranslationEntries = 1u << 20u;
 	static constexpr uint32_t MaxSamplers        = 4096;
 
-	BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler);
+	BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler, PageManager& page_manager);
 	~BindlessTable();
 	KYTY_CLASS_NO_COPY(BindlessTable);
 
@@ -70,10 +79,32 @@ public:
 		// Keys the region holds. The guest appends textures to a heap as it streams them in and
 		// its descriptor grows; each draw patches its own descriptor's entry count.
 		uint32_t                            entries      = 0;
+		// The most keys a draw's heap descriptor has covered (entries adds headroom to it).
+		uint32_t                            guest_entries = 0;
+		// Engine method: the entries WatchHeap watched, and the watch generation then. A draw calls
+		// WatchHeap only when either differs (the heap grew, or an unmap dropped its watch).
+		uint32_t                            watched_entries  = 0;
+		uint64_t                            watch_generation = 0;
+		// Engine method, E3: the next key the translation pass looks at, and whether a full pass
+		// found nothing left to settle (cleared when the heap grows or the guest writes it).
+		uint32_t                            eager_cursor   = 0;
+		bool                                eager_complete = false;
+		// Per key: how often E3 settled it since the guest last wrote it. A key whose image the
+		// texture cache keeps replacing (format aliases of one texture, or one texture under two
+		// view types) would be settled again every frame; past MaxEagerSettles it is left to
+		// the request path until the guest rewrites it.
+		std::vector<uint8_t>                eager_count;
+		// Keys whose T# only changed view fields (streaming lowers min LOD) while no draw sampled
+		// them: they keep their slot, the old view of the same texture, as an engine keeps a
+		// texture's descriptor until finer mips are needed, and are settled again once a draw
+		// samples them.
+		std::vector<uint8_t>                stale;
+		std::vector<uint32_t>               stale_keys;
 		ShaderRecompiler::IR::ImageResource resource;
 		std::vector<uint32_t>               slots;    // per key; 0 = not resolved
 		std::vector<uint8_t>                settled;  // per key; resolved, or known placeholder
 		std::vector<ImageId>                resolved; // images to keep readable for draws
+		std::vector<ImageId>                unchecked; // settled since the last bindless draw (E5)
 		// Per settled key, the T# it was settled from and the image it resolved to (none for a
 		// placeholder). The guest rewrites entries as it streams textures out and others in;
 		// RenderExecutor::RevalidateBindlessKeys settles a key whose T# changed again.
@@ -119,6 +150,12 @@ public:
 	// carry the mark in the current snapshot.
 	static constexpr uint32_t ProbeMark = 2;
 	void                      ArmUsageProbe();
+	// Engine method, E3: a key settled before any draw asked for it carries the probe mark until a
+	// draw samples it (the shader stores 0). WasSampled reads the last snapshot: true unless the
+	// mark is still there. FlushFeedback publishes marks set with MarkUnsampled.
+	void               MarkUnsampled(const Heap& heap, uint32_t key);
+	void               FlushFeedback(const Heap& heap);
+	[[nodiscard]] bool WasSampled(const Heap& heap, uint32_t key) const;
 	void                      CollectUnusedImages(std::vector<ImageId>& unused);
 	void AddImageReference(ImageId id, Heap& heap, uint32_t key);
 	// The key no longer samples what it was settled to: it is pending again, and its image loses
@@ -154,9 +191,30 @@ public:
 	// Slot 0 of the sampler array, used for keys outside their heap; written once.
 	void WriteDefaultSampler(vk::Sampler sampler);
 	[[nodiscard]] bool SamplersEnabled() const noexcept { return m_samplers_per_array != 0; }
+	// Engine method, E1. The guest pages holding a heap's entries are write-watched; a CPU write
+	// to one (a page fault on a game thread, or an explicit invalidation such as a file read into
+	// the heap) stops watching that page and records it as written. TakeWrittenRanges, on the GPU
+	// thread at the start of a guest submission, watches the written pages again before it
+	// returns them, so a write after that is caught by the next submission; the caller then
+	// reads the entries and compares them with the mirror. Heaps of different view bindings over
+	// the same guest table share one watch.
+	void WatchHeap(Heap& heap);
+	[[nodiscard]] bool NeedsWatch(const Heap& heap) const noexcept {
+		return heap.watched_entries != heap.guest_entries ||
+		       heap.watch_generation != m_watch_generation.load(std::memory_order_acquire);
+	}
+	void OnCpuWrite(uint64_t vaddr, uint64_t size); // any thread
+	void UnwatchRange(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool HasWrittenRanges() const noexcept {
+		return m_heap_writes.load(std::memory_order_acquire);
+	}
+	void TakeWrittenRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+
 	// The texture cache dropped a resolved image: point its slots back at the placeholder and
 	// make its keys pending again, so a draw that still needs it asks for it anew.
 	void OnImageUnregistered(ImageId id);
+	// Keys made pending because the texture cache dropped their image (statistics; reset on read).
+	[[nodiscard]] uint64_t TakeUnregisteredKeys() noexcept { return std::exchange(m_unregistered_keys, 0); }
 	// Before an image is destroyed: a slot that still holds one of its views is repointed to the
 	// placeholder and the keys that use it are pending again. True when one did, so the caller
 	// keeps the image until the GPU has finished the work recorded with that slot.
@@ -180,6 +238,22 @@ private:
 
 	GraphicContext&         m_graphics;
 	CommandScheduler&       m_scheduler;
+	PageManager&            m_page_manager;
+	// Write-watched guest ranges of the heaps, page by page (TRACKER_PAGE_SIZE).
+	struct Watch {
+		uint64_t             begin = 0;
+		uint64_t             end   = 0;
+		std::vector<uint8_t> watched;
+		std::vector<uint8_t> written;
+	};
+	std::mutex            m_watch_mutex;
+	std::vector<Watch>    m_watches;
+	std::atomic_bool      m_heap_writes {false};
+	// Bounds of every watch, so a write far from the heaps returns without the lock.
+	std::atomic<uint64_t> m_watch_low {UINT64_MAX};
+	std::atomic<uint64_t> m_watch_high {0};
+	std::atomic<uint64_t> m_watch_generation {1};
+	uint64_t              m_unregistered_keys = 0;
 	std::deque<Heap>        m_heaps;
 	std::array<std::deque<std::pair<uint32_t, uint64_t>>, ImageArrays> m_free_slots; // slot, tick
 	std::unordered_map<uint64_t, std::vector<std::pair<Heap*, uint32_t>>> m_image_refs;

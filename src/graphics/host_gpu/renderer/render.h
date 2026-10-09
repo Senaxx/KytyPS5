@@ -184,7 +184,17 @@ public:
 	// the keys shaders flagged as pending.
 	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void ResolveBindlessRequests();
+	// Engine method (engine-method.md, E2), at the start of a guest submission: the heap entries
+	// the guest wrote since the last one are compared and their keys settled again.
+	void SyncBindlessHeaps();
+	void SyncWrittenBindlessEntries();
+	// E3: settle entries no draw has asked for yet, within the per-submission budget.
+	void SettleBindlessHeaps();
 	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// The key's T# changed: release what it was settled to and settle it again.
+	bool ResettleBindlessKey(BindlessTable::Heap& heap, uint32_t key);
+	// Release only: the key is pending again and its image unpinned when nothing else uses it.
+	void ReleaseBindlessKey(BindlessTable::Heap& heap, uint32_t key);
 	// Settles again, within the budget, the keys of a window of each heap whose T# changed since
 	// they were settled; returns how many it resolved.
 	uint32_t RevalidateBindlessKeys(uint32_t budget);
@@ -254,6 +264,10 @@ private:
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
 	std::vector<std::array<uint32_t, 8>>  m_bindless_window;
+	std::vector<std::pair<uint64_t, uint64_t>> m_bindless_written;
+	std::vector<ImageId>                       m_bindless_changed;
+	uint64_t                                   m_bindless_eager_frame = UINT64_MAX;
+	uint32_t                                   m_bindless_eager_left  = 0;
 	// Bindless usage probe (UpdateBindlessUsageProbe): the frame it was armed in (0 = idle), the
 	// first frame the next may start, and the frame the pending feedback snapshot was recorded.
 	uint64_t                              m_bindless_probe_frame      = 0;

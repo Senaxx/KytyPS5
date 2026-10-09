@@ -281,6 +281,7 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	m_slot_images[id].self_id = id;
 	Profiler::Add(Profiler::Counter::ImagesCreated);
 	if (!info.data.Empty()) {
 		RegisterImage(id);

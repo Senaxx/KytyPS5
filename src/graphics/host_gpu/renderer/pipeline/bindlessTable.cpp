@@ -1,9 +1,12 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -15,11 +18,130 @@
 #include <cinttypes>
 #include <array>
 #include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
-BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler)
-    : m_graphics(graphics), m_scheduler(scheduler) {
+bool BindlessEngineEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_BINDLESS_ENGINE");
+		return value == nullptr || std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
+
+void BindlessTable::WatchHeap(Heap& heap) {
+	heap.watched_entries  = heap.guest_entries;
+	heap.watch_generation = m_watch_generation.load(std::memory_order_acquire);
+	const auto table = heap.base + heap.table_offset;
+	const auto begin = Common::AlignDown(table, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(table + uint64_t {heap.guest_entries} * 32u, TRACKER_PAGE_SIZE);
+	if (end <= begin) {
+		return;
+	}
+	std::scoped_lock lock {m_watch_mutex};
+	auto watch = std::ranges::find_if(m_watches, [&](const Watch& w) { return w.begin == begin; });
+	if (watch == m_watches.end()) {
+		watch        = m_watches.insert(m_watches.end(), Watch {});
+		watch->begin = begin;
+		watch->end   = begin;
+	}
+	heap.eager_complete = false; // new or more entries to settle
+	if (end <= watch->end) {
+		return;
+	}
+	// The heap grew (or is new): watch the pages it now covers.
+	const auto first = static_cast<size_t>((watch->end - begin) / TRACKER_PAGE_SIZE);
+	const auto pages = static_cast<size_t>((end - begin) / TRACKER_PAGE_SIZE);
+	watch->watched.resize(pages, 0u);
+	watch->written.resize(pages, 0u);
+	watch->end = end;
+	for (size_t page = first; page < pages; page++) {
+		watch->watched[page] = 1;
+	}
+	m_page_manager.UpdatePageWatchers<true>(begin + first * TRACKER_PAGE_SIZE,
+	                                        (pages - first) * TRACKER_PAGE_SIZE);
+	if (begin < m_watch_low.load(std::memory_order_relaxed)) {
+		m_watch_low.store(begin, std::memory_order_release);
+	}
+	if (end > m_watch_high.load(std::memory_order_relaxed)) {
+		m_watch_high.store(end, std::memory_order_release);
+	}
+}
+
+void BindlessTable::OnCpuWrite(uint64_t vaddr, uint64_t size) {
+	// Called for every CPU write fault: most are nowhere near a heap and must not take the lock.
+	if (vaddr + size <= m_watch_low.load(std::memory_order_acquire) ||
+	    vaddr >= m_watch_high.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::scoped_lock lock {m_watch_mutex};
+	for (auto& watch: m_watches) {
+		const auto begin = std::max(watch.begin, Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+		const auto end   = std::min(watch.end, vaddr + size);
+		for (auto address = begin; address < end; address += TRACKER_PAGE_SIZE) {
+			const auto page = static_cast<size_t>((address - watch.begin) / TRACKER_PAGE_SIZE);
+			if (watch.watched[page] == 0) {
+				continue;
+			}
+			// The faulting write must go through: stop watching the page until the next sync.
+			watch.watched[page] = 0;
+			watch.written[page] = 1;
+			m_page_manager.UpdatePageWatchers<false>(address, TRACKER_PAGE_SIZE);
+			m_heap_writes.store(true, std::memory_order_release);
+		}
+	}
+}
+
+void BindlessTable::UnwatchRange(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock {m_watch_mutex};
+	for (auto& watch: m_watches) {
+		if (vaddr + size <= watch.begin || vaddr >= watch.end) {
+			continue;
+		}
+		// Part of the table is unmapped: drop the whole watch. WatchHeap builds it again the
+		// next time a draw uses the heap, over what is mapped then.
+		for (size_t page = 0; page < watch.watched.size(); page++) {
+			if (watch.watched[page] != 0) {
+				m_page_manager.UpdatePageWatchers<false>(watch.begin + page * TRACKER_PAGE_SIZE,
+				                                         TRACKER_PAGE_SIZE);
+			}
+		}
+		watch.watched.clear();
+		watch.written.clear();
+		watch.end = watch.begin;
+		m_watch_generation.fetch_add(1, std::memory_order_acq_rel);
+	}
+}
+
+void BindlessTable::TakeWrittenRanges(std::vector<std::pair<uint64_t, uint64_t>>& ranges) {
+	ranges.clear();
+	std::scoped_lock lock {m_watch_mutex};
+	m_heap_writes.store(false, std::memory_order_release);
+	for (auto& watch: m_watches) {
+		for (size_t page = 0; page < watch.written.size(); page++) {
+			if (watch.written[page] == 0) {
+				continue;
+			}
+			const auto address  = watch.begin + page * TRACKER_PAGE_SIZE;
+			watch.written[page] = 0;
+			// Watched again before the caller reads the entries: a later write is not lost.
+			if (watch.watched[page] == 0) {
+				watch.watched[page] = 1;
+				m_page_manager.UpdatePageWatchers<true>(address, TRACKER_PAGE_SIZE);
+			}
+			if (!ranges.empty() && ranges.back().second == address) {
+				ranges.back().second += TRACKER_PAGE_SIZE;
+			} else {
+				ranges.emplace_back(address, address + TRACKER_PAGE_SIZE);
+			}
+		}
+	}
+}
+
+BindlessTable::BindlessTable(GraphicContext& graphics, CommandScheduler& scheduler,
+                             PageManager& page_manager)
+    : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager) {
 	if (!graphics.bindless_enabled) {
 		return;
 	}
@@ -395,6 +517,8 @@ bool BindlessTable::AllocateRegion(Heap& heap, uint32_t entries) {
 	m_next_region += capacity;
 	heap.slots.resize(capacity, 0u);
 	heap.settled.resize(capacity, 0u);
+	heap.eager_count.resize(capacity, 0u);
+	heap.stale.resize(capacity, 0u);
 	heap.descriptors.resize(capacity);
 	heap.images.resize(capacity);
 	auto* translation = reinterpret_cast<uint32_t*>(m_translation->Mapped().data());
@@ -427,14 +551,16 @@ BindlessTable::Heap* BindlessTable::FindOrCreateHeap(
 			if (entries > heap.entries && !AllocateRegion(heap, entries)) {
 				return nullptr;
 			}
+			heap.guest_entries = std::max(heap.guest_entries, entries);
 			return &heap;
 		}
 	}
-	auto& heap        = m_heaps.emplace_back();
-	heap.base         = base;
-	heap.table_offset = table_offset;
-	heap.binding      = binding;
-	heap.resource     = resource;
+	auto& heap         = m_heaps.emplace_back();
+	heap.base          = base;
+	heap.table_offset  = table_offset;
+	heap.binding       = binding;
+	heap.resource      = resource;
+	heap.guest_entries = entries;
 	if (!AllocateRegion(heap, std::max(entries, 1u << 14u))) {
 		m_heaps.pop_back();
 		return nullptr;
@@ -642,6 +768,21 @@ void BindlessTable::ArmUsageProbe() {
 	}
 }
 
+void BindlessTable::MarkUnsampled(const Heap& heap, uint32_t key) {
+	reinterpret_cast<uint32_t*>(m_feedback->Mapped().data())[heap.region + key] = ProbeMark;
+}
+
+void BindlessTable::FlushFeedback(const Heap& heap) {
+	m_feedback->Flush(heap.region * sizeof(uint32_t), heap.entries * sizeof(uint32_t));
+}
+
+bool BindlessTable::WasSampled(const Heap& heap, uint32_t key) const {
+	// The snapshot region was invalidated when TakeRequests last read it (every frame); a key
+	// marked after that snapshot reads as sampled, which only settles it again at once.
+	return reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data())[heap.region + key] !=
+	       ProbeMark;
+}
+
 void BindlessTable::CollectUnusedImages(std::vector<ImageId>& unused) {
 	const auto* snapshot = reinterpret_cast<const uint32_t*>(m_feedback_snapshot->Mapped().data());
 	m_feedback_snapshot->Invalidate(0, vk::DeviceSize {m_next_region} * sizeof(uint32_t));
@@ -712,6 +853,7 @@ void BindlessTable::OnImageUnregistered(ImageId id) {
 		heap->images[key]  = {};
 		SetTranslation(*heap, key, ShaderRecompiler::IR::BindlessPending);
 		std::erase(heap->resolved, id);
+		m_unregistered_keys++;
 	}
 	m_image_refs.erase(found);
 }
