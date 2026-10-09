@@ -13,8 +13,10 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <atomic>
 #include <functional>
 #include <map>
+#include <memory>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
@@ -191,7 +193,10 @@ private:
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// evicting: the collector writes the image back before freeing it; the write is dropped if
 	// the guest bytes change before it lands (KYTY_EVICT_WRITEBACK_GUARD).
-	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false);
+	// `landed`, when given, is set once the write-back has reached guest memory (or was dropped
+	// because the guest wrote the bytes first): an evicted image is freed only then.
+	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool evicting = false,
+	                                       std::shared_ptr<std::atomic<bool>>* landed = nullptr);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -234,6 +239,18 @@ private:
 	uint64_t         m_gc_freed_bytes_frame   = 0;
 	size_t           m_gc_freed_images_frame  = 0;
 	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// Two-phase eviction of GPU-written images: the write-back is deferred until the GPU is done,
+	// and the image stays registered until it has landed. Freeing it at once let a draw in between
+	// recreate it from the old guest bytes, without what the GPU had drawn into it (the glyph
+	// atlases: "half of the text is missing", 2026-10-09). One used again in the meantime stays.
+	struct PendingEviction {
+		ImageId                            id;
+		uint64_t                           address = 0; // the slot may be reused: checked
+		uint64_t                           frame   = 0; // frame_accessed_last at eviction
+		std::shared_ptr<std::atomic<bool>> landed;
+	};
+	std::vector<PendingEviction> m_pending_evictions;
+	std::unordered_set<ImageId>  m_evicting;
 	// The LRU clock: presented frames, advanced by the collector's own ticks as well so a
 	// stretch without presents (a loading screen) still ages its entries.
 	[[nodiscard]] uint64_t LruClock() const noexcept;

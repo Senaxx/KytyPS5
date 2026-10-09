@@ -2007,7 +2007,8 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
-bool TextureCache::DownloadImageMemory(ImageId id, bool evicting) {
+bool TextureCache::DownloadImageMemory(ImageId id, bool evicting,
+                                       std::shared_ptr<std::atomic<bool>>* landed) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;
@@ -2065,8 +2066,19 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool evicting) {
 	m_scheduler.Current().Recorder().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
+	std::shared_ptr<std::atomic<bool>> landed_flag;
+	if (landed != nullptr) {
+		landed_flag = std::make_shared<std::atomic<bool>>(false);
+		*landed     = landed_flag;
+	}
 	m_scheduler.DeferPriorityOperation([download, dedicated, range, mapped, offset, guard,
-	                                    guest_hash] {
+	                                    guest_hash, landed_flag] {
+		struct Landed {
+			const std::shared_ptr<std::atomic<bool>>& flag;
+			~Landed() {
+				if (flag != nullptr) flag->store(true, std::memory_order_release);
+			}
+		} landed_scope {landed_flag};
 		download->Invalidate(offset, range.size);
 		uint64_t current = 0;
 		if (guard && (!HashGuestBacking(range.address, range.size, current) ||
@@ -2209,6 +2221,9 @@ struct GcSkipStats {
 	uint64_t young        = 0; // runs where the LRU had nothing old enough
 	uint64_t written_back = 0; // GPU-written tiled images written back, then freed
 	uint64_t bindless     = 0; // bindless images freed: unsampled in the last usage probe
+	uint64_t small_target = 0; // render targets of at most 1024x1024 kept (glyphs, cached layers)
+	uint64_t pending      = 0; // evicted, write-back not landed yet
+	uint64_t revived      = 0; // used again before the write-back landed: stays
 };
 GcSkipStats g_gc_skip;
 } // namespace
@@ -2225,6 +2240,27 @@ void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	m_gc_tick++;
 	const uint64_t clock = LruClock();
+	// Evictions whose write-back has landed: free the image now, unless it was used since (then
+	// its pixels are newer than the guest bytes and it stays, as if never a candidate).
+	std::erase_if(m_pending_evictions, [&](const PendingEviction& pending) {
+		if (!pending.landed->load(std::memory_order_acquire)) {
+			return false;
+		}
+		m_evicting.erase(pending.id);
+		auto* image = m_slot_images.try_get(pending.id);
+		if (image == nullptr || !image->registered || image->info.data.address != pending.address) {
+			return true;
+		}
+		if (image->frame_accessed_last != pending.frame) {
+			g_gc_skip.revived++;
+			return true;
+		}
+		const auto freed = image->AccountedSize();
+		g_gc_skip.freed++;
+		g_gc_skip.freed_mb += freed >> 20u;
+		FreeImage(pending.id);
+		return true;
+	});
 	// Memory pressure (GraphicContext::MemoryShortfall: device use past 90 % of the video memory
 	// target): the thresholds sit that far below what the cache holds, so the collector frees its
 	// oldest images until there is room again.
@@ -2380,6 +2416,19 @@ void TextureCache::RunGarbageCollector() {
 				g_gc_skip.depth++;
 				continue;
 			}
+			if (m_evicting.contains(id)) {
+				g_gc_skip.pending++;
+				continue;
+			}
+			// Small render targets are the layers the game draws once and samples from then on
+			// (glyph atlases, cached UI): a few MB each, and a lost one is lost text (letters went
+			// missing when they were evicted under "critical", 2026-10-09). They are never evicted;
+			// the guest dropping them (ReleaseDroppedByGuest) is what frees them.
+			if (owner->usage.render_target && owner->info.extent.width <= 1024 &&
+			    owner->info.extent.height <= 1024) {
+				g_gc_skip.small_target++;
+				continue;
+			}
 			if (owner->bindless_pinned) {
 				// Pinned for bindless draws; under pressure one no draw sampled during the last
 				// usage probe may go (ISSUES #15: on 4-8 GB cards these grew to 2-5 GB and never
@@ -2420,7 +2469,8 @@ void TextureCache::RunGarbageCollector() {
 					g_gc_skip.gpu_download++;
 					continue;
 				}
-				if (safe && !DownloadImageMemory(id, true)) {
+				std::shared_ptr<std::atomic<bool>> landed;
+				if (safe && !DownloadImageMemory(id, true, &landed)) {
 					g_gc_skip.gpu_download++;
 					continue;
 				}
@@ -2428,6 +2478,20 @@ void TextureCache::RunGarbageCollector() {
 					m_gc_written_back_bytes_frame += owner->info.data.size;
 					g_gc_skip.written_back++;
 				}
+				// Freed once the write-back has landed (the top of the next run); the bytes count
+				// against this frame's budget now, since they are going.
+				m_pending_evictions.push_back(
+				    {id, owner->info.data.address, owner->frame_accessed_last, std::move(landed)});
+				m_evicting.insert(id);
+				if (pressured || aggressive) {
+					--deletions;
+					m_gc_freed_images_frame++;
+					m_gc_freed_bytes_frame += owner->AccountedSize();
+					if (m_gc_freed_bytes_frame >= byte_budget) {
+						break;
+					}
+				}
+				continue;
 			}
 			const auto freed = owner->AccountedSize();
 			g_gc_skip.freed++;
@@ -2472,10 +2536,11 @@ void TextureCache::RunGarbageCollector() {
 		LOGF("TexGc: visited=%" PRIu64 " freed=%" PRIu64 " (%" PRIu64 "MB) written_back=%" PRIu64
 		     " gone=%" PRIu64 " depth=%" PRIu64 " gpu_tiled=%" PRIu64 " gpu_unpressured=%" PRIu64
 		     " gpu_download_failed=%" PRIu64 " nothing_old_enough=%" PRIu64 " bindless=%" PRIu64
-		     "\n",
+		     " small_target=%" PRIu64 " pending=%" PRIu64 " revived=%" PRIu64 "\n",
 		     g_gc_skip.visited, g_gc_skip.freed, g_gc_skip.freed_mb, g_gc_skip.written_back,
 		     g_gc_skip.gone, g_gc_skip.depth, g_gc_skip.gpu_tiled, g_gc_skip.gpu_unpress,
-		     g_gc_skip.gpu_download, g_gc_skip.young, g_gc_skip.bindless);
+		     g_gc_skip.gpu_download, g_gc_skip.young, g_gc_skip.bindless, g_gc_skip.small_target,
+		     g_gc_skip.pending, g_gc_skip.revived);
 		g_gc_skip = {};
 	}
 }

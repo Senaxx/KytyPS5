@@ -8112,18 +8112,29 @@ public:
                                                 &gc_before_completion[index],
                                                 sizeof(uint32_t));
       }
-      Require(name, "batched image pressure retirement",
+      // Two-phase eviction: the images stay registered until their write-backs have landed
+      // (a draw in between would otherwise recreate them from the stale guest bytes), and
+      // nothing is published before the GPU is done.
+      Require(name, "batched image pressure write-back",
+              std::ranges::all_of(gc_images,
+                                  [&](ImageId image) {
+                                    return TextureCacheTestAccess::Contains(
+                                        texture_cache, image);
+                                  }) &&
+                  scheduler.CurrentTick() == gc_batch_tick &&
+                  gc_before_completion == gc_stale_values,
+              "GC freed an evicted image before its write-back landed, submitted per "
+              "image, or published a readback before GPU completion");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      texture_cache.RunGarbageCollector();
+      Require(name, "batched image retirement after landing",
               std::ranges::none_of(gc_images,
                                    [&](ImageId image) {
                                      return TextureCacheTestAccess::Contains(
                                          texture_cache, image);
-                                   }) &&
-                  scheduler.CurrentTick() == gc_batch_tick &&
-                  gc_before_completion == gc_stale_values,
-              "GC submitted per image or published a readback before GPU "
-              "completion");
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
+                                   }),
+              "GC kept an evicted image after its write-back landed");
       auto refreshed_buffer_alias = resources.GetBufferCache().ObtainBuffer(
           gc_image_desc_a.info.data.address, gc_image_desc_a.info.data.size,
           false);
@@ -8668,23 +8679,32 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_before_completion,
           sizeof(depth_before_completion));
+      // Two-phase eviction: the depth image stays until its write-back has landed; nothing
+      // is published before the GPU is done.
+      const bool depth_image_pending = TextureCacheTestAccess::Contains(
+          texture_cache, combined_destination_image);
+      Require(
+          name, "depth/stencil deferred pressure write-back",
+          depth_image_pending && scheduler.CurrentTick() == depth_gc_tick &&
+              depth_before_completion == stale_added_stencil_depth,
+          fmt::format(
+              "GC freed depth before its write-back landed, or published early: "
+              "pending={} tick={}/{} depth={}/{}",
+              depth_image_pending, scheduler.CurrentTick(), depth_gc_tick,
+              depth_before_completion, stale_added_stencil_depth)
+              .c_str());
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      texture_cache.RunGarbageCollector();
       const bool depth_image_retired = !TextureCacheTestAccess::Contains(
           texture_cache, combined_destination_image);
       const bool depth_proxy_retired = !texture_cache.FindImageFromRange(
           base + added_stencil_offset, added_stencil_size, false);
-      Require(
-          name, "depth/stencil deferred pressure retirement",
-          depth_image_retired && depth_proxy_retired &&
-              scheduler.CurrentTick() == depth_gc_tick &&
-              depth_before_completion == stale_added_stencil_depth,
-          fmt::format(
-              "GC failed to retire/defer depth: image={} proxy={} tick={}/{} "
-              "depth={}/{}",
-              depth_image_retired, depth_proxy_retired, scheduler.CurrentTick(),
-              depth_gc_tick, depth_before_completion, stale_added_stencil_depth)
-              .c_str());
-      scheduler.Finish();
-      scheduler.DrainPriorityOperations();
+      Require(name, "depth/stencil retirement after landing",
+              depth_image_retired && depth_proxy_retired,
+              fmt::format("GC kept depth after its write-back landed: image={} proxy={}",
+                          depth_image_retired, depth_proxy_retired)
+                  .c_str());
       float depth_after_completion = 0.0f;
       Libs::LibKernel::Memory::TryReadBacking(
           combined_destination.info.data.address, &depth_after_completion,
@@ -8777,13 +8797,18 @@ public:
         const auto handle =
             BufferCacheTestAccess::DownloadBuffer(resources.GetBufferCache())
                 .Handle();
+        // Two-phase eviction: the image stays until its write-back has landed.
         Require(
-            name, "near-capacity deferred retirement",
-            !TextureCacheTestAccess::Contains(texture_cache, image) &&
+            name, "near-capacity deferred write-back",
+            TextureCacheTestAccess::Contains(texture_cache, image) &&
                 scheduler.CurrentTick() == tick,
             "near-capacity readback was rejected or synchronously submitted");
         scheduler.Finish();
         scheduler.DrainPriorityOperations();
+        texture_cache.RunGarbageCollector();
+        Require(name, "near-capacity retirement after landing",
+                !TextureCacheTestAccess::Contains(texture_cache, image),
+                "GC kept the near-capacity image after its write-back landed");
         bool content = true;
         for (const auto offset : sample_offsets) {
           uint32_t value = 0;
