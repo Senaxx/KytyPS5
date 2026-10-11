@@ -58,6 +58,22 @@ cmake --install _Build/windows --prefix _Build/windows/install
 
 `../KytyPS5-bin/` holds a Release install built from exactly this tree.
 
+## Build (Linux)
+
+Tested by Ozmund on Bazzite (Fedora Atomic) with an RTX 3080 Ti (12 GB) on NVIDIA 615.71.09. The tree
+builds unchanged. Bazzite's base system is read-only, so the build runs in a Fedora 44 Distrobox
+container. Create it with `--nvidia`, or the container only sees llvmpipe. The packages are the ones in
+upstream's README, under "Building on Fedora and Fedora Atomic".
+
+```
+git submodule update --init --recursive
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build _Build/linux --target kyty_emulator launcher
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The installed emulator runs on the host, outside the container.
+
 ## Running the title
 
 In the launcher, add the game folder, edit its configuration and tick:
@@ -72,6 +88,16 @@ The command-line equivalent:
 
 ```
 kyty_emulator.exe --game "<dump>\eboot.bin" --readback-linear-images true --tessellation --redzone --bindless --printf-direction File --printf-output-file _kyty.txt
+```
+
+**On Linux** leave out `--redzone`: it is Windows-only, and the Linux emulator rejects it as an
+unknown option. On a 12 GB card the following gets to gameplay (see "Linux, 12 GB card" below).
+`KYTY_HOST_BUFFER_MB` comes from the open host-buffers PR to this branch; without it, drop that
+variable and expect the cutscene to fill the card. The skip list is Mac's.
+
+```
+SKIP=bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015,12f18ba73d4b5119,198a7ca6e3dfbec7,1d81053379396859,21e4ffa9eaebf903,29be8047c4e86afe,2a69c6facfa03f42,2bd971cbf9fd85b9,2bf24cdfe17d445a,2db5771324658f9b,2ea3957af2daf690,30d445ded2c91412,329858dd50dedcf6,337df7adf22cbcf8,384f47083f0d5e08,3cf86dbfc447bb8c,40978f6a2b51a610,4b32d12a59b34410,76c1cc14d6f7641d,883049efd1de9ca7,919b497919097925,949d0da52574b6bb,9c18c0b9ff0f7997,a0d3108311ea1997,a81255bc7d83eb26,ad3e817088b42ce0,b0164a333a8443f1,ce6af5b8f4b5d395,cf2433f75f08295e,d8cc8c65f6c476d7,d925be771906e8da,deb8684b019495fc,e98e6c7a12cfbb83,f61c05c40f988ea2,f687ff30ac856e49,fbd3835b6b17af6a,fc0537b7278db60c,fceac1321aa192d2
+KYTY_HOST_BUFFER_MB=1024 KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072 KYTY_VRAM_TARGET_MB=8192 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless --skip-shaders $SKIP
 ```
 
 No game patch is needed.
@@ -110,6 +136,42 @@ by wall time: a cold cache changes timing by about 2x without changing how far t
   Nobody knows yet whether it reaches gameplay.
 - That last run also flooded its log (see Save data below, now fixed), which may explain the
   slowness. Re-measure it first.
+
+### Linux, 12 GB card (RTX 3080 Ti, Ryzen 5 7600X, base 4802886, 2026-10-11)
+
+- **Reaches gameplay.** Intros, INITIAL SETUP, the title screen (~3 fps), the opening cutscene
+  ("30 YEARS AGO", Essex's line, ~5 fps), then the first jungle fight with its tutorials (leap
+  attack, shred, sprint) at 5-10 fps. About 10 minutes played without a crash or freeze.
+- **Screen-reader prompt.** It does not draw on Linux: the screen is blank, but J (Cross) still
+  dismisses it. On the 3060 laptop it draws fully.
+- **Cutscene hang: fixed by the skip list.** Without it, rendering stops partway through the
+  cutscene (audio and AMPR streaming carry on) right after a very large pipeline starts
+  compiling. With the skip list frames keep coming.
+- **Video memory: one 2.7 GB buffer.** The game describes its whole heap at `0x1210000000` as
+  one 2,801,664 KB buffer. In VRAM it is a quarter of the card, and the collector deletes and
+  re-creates it (each time a 2.7 GB upload), which spikes device use by ~2.8 GB in a second.
+  With the desktop's ~2 GB on top the card fills and the whole PC soft-locks. No cache cap
+  avoids it: the emulator went 2.2 GB past `KYTY_VRAM_TARGET_MB` before collecting.
+  `KYTY_HOST_BUFFER_MB=1024` puts it in system memory, and fps went up (2-5 to 5-7), since the
+  re-uploads stopped.
+- **CPU: write-fault lock contention.** perf in the fight showed ~13% of all CPU in game
+  threads spinning on the tracker's region lock in the write-fault handler, behind a holder
+  doing mprotect and a TLB shootdown per 4 KB page. Invalidating a 64 KB granule per buffer
+  write fault cut the spin-wait to 2.2%, but froze the game within minutes (rendering and AMM
+  streaming stop, audio carries on), so it was dropped; the spin lock pause stayed.
+- **GPU drains.** Collecting the 2.7 GB system-memory buffer downloads it first, a ~100 ms
+  drain. Keeping system-memory buffers out of the buffer GC (host-buffers PR) cut the worst
+  wait to ~33 ms; fps in the fight 5-20, no freeze in 6+ minutes.
+- **Textures.** Ground and tree textures stay low resolution: likely the stale bindless slots
+  under Gaps (streamed mips never re-synced).
+- **Visual.** Explosion smoke draws as solid black blobs (a skipped shader, or one of the
+  unsupported ones). Lighting, fire, fog and characters look right.
+- **Profiling on Linux.** Release builds are stripped, but the linker map
+  (`_Build/linux/kyty_emulator_*.map`) resolves perf's addresses. A rootless Distrobox cannot
+  attach perf or gdb to the emulator on the host; a rootful one (`distrobox create --root`)
+  can, after `sysctl kernel.perf_event_paranoid=-1`. Running the emulator inside the
+  container fails instead (`importing the supplied dmabufs failed`) and overwrites the
+  pipeline cache with an empty one.
 
 ## The work for this title, by area
 
