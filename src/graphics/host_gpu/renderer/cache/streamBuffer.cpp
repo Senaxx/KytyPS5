@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstring>
+#include <cstdlib>
 #include <numeric>
 #include <vk_mem_alloc.h>
 
@@ -81,6 +82,21 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	                                     ? VkMemoryPropertyFlags {}
 	                                     : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
+	// KYTY_HOST_BUFFER_MB (default 0 = off): device-local buffers at least this large are placed
+	// in system memory, which the GPU reads over PCIe. A title's whole-heap mirror (one 2.7 GB
+	// buffer) otherwise takes a quarter of a 12 GB card; with the desktop's share on top the card
+	// fills and the whole machine stalls (Linux, RTX 3080 Ti, 2026-10-11).
+	static const uint64_t host_buffer_bytes = [] {
+		const char* value = std::getenv("KYTY_HOST_BUFFER_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+	}();
+	const bool in_host = usage == MemoryUsage::DeviceLocal && host_buffer_bytes != 0 &&
+	                     size >= host_buffer_bytes;
+	if (in_host) {
+		allocation_info.usage          = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+		allocation_info.preferredFlags = 0;
+	}
+
 	VmaAllocationInfo allocation_result {};
 	VkBuffer          native_buffer = VK_NULL_HANDLE;
 	const auto        create        = [&](const VmaAllocationCreateInfo& create_info) {
@@ -122,6 +138,14 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 		     size >> 20u, vk::to_string(result).c_str());
 	}
 
+	if (in_host) {
+		static std::atomic<uint32_t> placed {0};
+		if (placed.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("Buffer placed in system memory (KYTY_HOST_BUFFER_MB): %" PRIu64
+			     " MB at guest 0x%016" PRIx64 "\n",
+			     size >> 20u, cpu_address);
+		}
+	}
 	m_buffer = native_buffer;
 	if (with_bda) {
 		vk::BufferDeviceAddressInfo address_info {};

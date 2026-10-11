@@ -1340,6 +1340,23 @@ uint64_t BufferCache::LruClock() const noexcept {
 	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
 }
 
+namespace {
+// Buffers that KYTY_HOST_BUFFER_MB placed in system memory cost no video memory, and the one
+// such a title has is its whole heap (2.7 GB): collecting it downloads it when the GPU wrote
+// to it, a drain of ~100 ms, and the next draw uploads all of it again. They stay unless
+// KYTY_GC_HOST_BUFFERS=1.
+bool KeptOutOfCollection(const Buffer& buffer) {
+	static const uint64_t host_bytes = [] {
+		if (std::getenv("KYTY_GC_HOST_BUFFERS") != nullptr) {
+			return uint64_t {0};
+		}
+		const char* value = std::getenv("KYTY_HOST_BUFFER_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+	}();
+	return host_bytes != 0 && buffer.Size() >= host_bytes;
+}
+} // namespace
+
 void BufferCache::RunGarbageCollector() {
 	KYTY_PROFILER_FUNCTION();
 	m_gc_tick++;
@@ -1392,6 +1409,9 @@ void BufferCache::RunGarbageCollector() {
 		gc_visited++;
 		if (buffer.CpuAddress() == 0) {
 			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
+			return false;
+		}
+		if (KeptOutOfCollection(buffer)) {
 			return false;
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
