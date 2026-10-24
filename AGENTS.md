@@ -221,8 +221,13 @@ kyty_emulator.exe --game <dump>\eboot.bin --readback-linear-images true --tessel
 These are the 12 GB values above scaled to 8 GB; `KYTY_VRAM_BUDGET_MB` was not set.
 
 - **Reaches the opening cutscenes, no crash.** Intros, INITIAL SETUP, the title screen, "30 YEARS
-  AGO" (Logan in the jungle), then the "PRESENT DAY" scenes at night. The run ends there at
-  600 s, still in cutscenes; gameplay is not reached in 10 minutes.
+  AGO" (Logan in the jungle), then the "PRESENT DAY" scenes at night, then gameplay: the first
+  jungle fight at ~630 s, with the "L + Triangle Leap Attack" tutorial prompt, ~3 fps (frame 4,076
+  at 990 s). A 1,200 s warm run stayed there without a crash (the script only presses Cross).
+- **One crash in four runs.** A third run lost the device at ~240 s, right after INITIAL SETUP
+  while the title loaded: `MasterSemaphore: wait for tick ... failed: ErrorDeviceLost`, then
+  `commandScheduler.cpp:570` from `Presenter::Present`; Windows logged nvlddmkm event 153 (not a
+  4101 timeout). Card use was 7.7 GB at the time. The other three runs passed the same point.
 - **Speed.** Cold pipeline cache: frame 2,478 at 300 s, 2,719 at 570 s. Warm (second run, same
   folder): frame 2,626 at 300 s, 2,935 at 570 s; the title bar shows 0-4 fps in the cutscenes.
 - **The giant buffer goes to system memory.** `Buffer placed in system memory (KYTY_HOST_BUFFER_MB):
