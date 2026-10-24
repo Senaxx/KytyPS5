@@ -133,6 +133,19 @@ static uint64_t VramTargetBytes() {
 	return target;
 }
 
+// KYTY_VRAM_BUDGET_MB (default 0 = off): the video memory the emulator may use, in place of the
+// driver's budget less its reserve. The Linux NVIDIA driver reports a conservative budget: on a
+// 12 GB RTX 3080 Ti with the desktop holding ~2 GB it left the emulator ~7.9 GB, so the caches
+// collected from 7.1 GB on and evicted heap textures a draw still sampled (blank and blurry ground
+// in Wolverine). An allocation past the real heap still falls back to host memory.
+static uint64_t VramBudgetOverrideBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_VRAM_BUDGET_MB");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : uint64_t {0}) << 20u;
+	}();
+	return bytes;
+}
+
 uint64_t GraphicContext::MemoryShortfall() const {
 	// KYTY_COMMIT_RESERVE_MB (default 0 = off): collecting video memory for a commit shortfall
 	// was tried on 2026-10-09 and withdrawn. On a PC whose commit limit is short for other reasons
@@ -245,7 +258,9 @@ uint64_t GraphicContext::GetTotalMemoryBudget() const {
 		}
 	}
 	if (discrete) {
-		const auto own = budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
+		const auto forced = VramBudgetOverrideBytes();
+		const auto own    = forced != 0 ? forced
+		                                : budget - std::min<uint64_t>(budget / 8, 1024ull * 1024 * 1024);
 		const auto target = VramTargetBytes();
 		return target != 0 ? std::min(own, target) : own;
 	}
