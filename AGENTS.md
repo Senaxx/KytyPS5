@@ -58,6 +58,22 @@ cmake --install _Build/windows --prefix _Build/windows/install
 
 `../KytyPS5-bin/` holds a Release install built from exactly this tree.
 
+## Build (Linux)
+
+Tested by Ozmund on Bazzite (Fedora Atomic) with an RTX 3080 Ti (12 GB) on NVIDIA 615.71.09. The tree
+builds unchanged. Bazzite's base system is read-only, so the build runs in a Fedora 44 Distrobox
+container. Create it with `--nvidia`, or the container only sees llvmpipe. The packages are the ones in
+upstream's README, under "Building on Fedora and Fedora Atomic".
+
+```
+git submodule update --init --recursive
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build _Build/linux --target kyty_emulator launcher
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The installed emulator runs on the host, outside the container.
+
 ## Running the title
 
 In the launcher, add the game folder, edit its configuration and tick:
@@ -72,6 +88,17 @@ The command-line equivalent:
 
 ```
 kyty_emulator.exe --game "<dump>\eboot.bin" --readback-linear-images true --tessellation --redzone --bindless --printf-direction File --printf-output-file _kyty.txt
+```
+
+**On Linux** leave out `--redzone`: it is Windows-only, and the Linux emulator rejects it as an
+unknown option. On a 12 GB card the following gets to gameplay (see "Linux, 12 GB card" below).
+`KYTY_HOST_BUFFER_MB` comes from the open host-buffers PR to this branch, and `KYTY_VRAM_BUDGET_MB`
+from the vram-budget PR; without them, drop those variables and expect the cutscene to fill the
+card and the texture cache to run clamped (see 2026-10-18 below). The skip list is Mac's.
+
+```
+SKIP=bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015,12f18ba73d4b5119,198a7ca6e3dfbec7,1d81053379396859,21e4ffa9eaebf903,29be8047c4e86afe,2a69c6facfa03f42,2bd971cbf9fd85b9,2bf24cdfe17d445a,2db5771324658f9b,2ea3957af2daf690,30d445ded2c91412,329858dd50dedcf6,337df7adf22cbcf8,384f47083f0d5e08,3cf86dbfc447bb8c,40978f6a2b51a610,4b32d12a59b34410,76c1cc14d6f7641d,883049efd1de9ca7,919b497919097925,949d0da52574b6bb,9c18c0b9ff0f7997,a0d3108311ea1997,a81255bc7d83eb26,ad3e817088b42ce0,b0164a333a8443f1,ce6af5b8f4b5d395,cf2433f75f08295e,d8cc8c65f6c476d7,d925be771906e8da,deb8684b019495fc,e98e6c7a12cfbb83,f61c05c40f988ea2,f687ff30ac856e49,fbd3835b6b17af6a,fc0537b7278db60c,fceac1321aa192d2
+KYTY_HOST_BUFFER_MB=1024 KYTY_TEXTURE_CACHE_MB=5632 KYTY_BUFFER_CACHE_MB=2560 KYTY_VRAM_TARGET_MB=11264 KYTY_VRAM_BUDGET_MB=8704 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless --skip-shaders $SKIP
 ```
 
 No game patch is needed.
@@ -110,6 +137,75 @@ by wall time: a cold cache changes timing by about 2x without changing how far t
   Nobody knows yet whether it reaches gameplay.
 - That last run also flooded its log (see Save data below, now fixed), which may explain the
   slowness. Re-measure it first.
+
+### Linux, 12 GB card (RTX 3080 Ti, Ryzen 5 7600X, base 4802886, 2026-10-11)
+
+- **Reaches gameplay.** Intros, INITIAL SETUP, the title screen (~3 fps), the opening cutscene
+  ("30 YEARS AGO", Essex's line, ~5 fps), then the first jungle fight with its tutorials (leap
+  attack, shred, sprint) at 5-10 fps. About 10 minutes played without a crash or freeze.
+- **Screen-reader prompt.** It does not draw on Linux: the screen is blank, but J (Cross) still
+  dismisses it. On the 3060 laptop it draws fully.
+- **Cutscene hang: fixed by the skip list.** Without it, rendering stops partway through the
+  cutscene (audio and AMPR streaming carry on) right after a very large pipeline starts
+  compiling. With the skip list frames keep coming.
+- **Video memory: one 2.7 GB buffer.** The game describes its whole heap at `0x1210000000` as
+  one 2,801,664 KB buffer. In VRAM it is a quarter of the card, and the collector deletes and
+  re-creates it (each time a 2.7 GB upload), which spikes device use by ~2.8 GB in a second.
+  With the desktop's ~2 GB on top the card fills and the whole PC soft-locks. No cache cap
+  avoids it: the emulator went 2.2 GB past `KYTY_VRAM_TARGET_MB` before collecting.
+  `KYTY_HOST_BUFFER_MB=1024` puts it in system memory, and fps went up (2-5 to 5-7), since the
+  re-uploads stopped.
+- **CPU: write-fault lock contention.** perf in the fight showed ~13% of all CPU in game
+  threads spinning on the tracker's region lock in the write-fault handler, behind a holder
+  doing mprotect and a TLB shootdown per 4 KB page. Invalidating a 64 KB granule per buffer
+  write fault cut the spin-wait to 2.2%, but froze the game within minutes (rendering and AMM
+  streaming stop, audio carries on), so it was dropped; the spin lock pause stayed.
+- **GPU drains.** Collecting the 2.7 GB system-memory buffer downloads it first, a ~100 ms
+  drain. Keeping system-memory buffers out of the buffer GC (host-buffers PR) cut the worst
+  wait to ~33 ms; fps in the fight 5-20, no freeze in 6+ minutes.
+- **Textures.** Ground and tree textures stay low resolution. On 2026-10-18 this turned out to be
+  the cache bounds, not stale bindless slots (see below).
+- **Visual.** Explosion smoke draws as solid black blobs (a skipped shader, or one of the
+  unsupported ones). Lighting, fire, fog and characters look right.
+- **Profiling on Linux.** Release builds are stripped, but the linker map
+  (`_Build/linux/kyty_emulator_*.map`) resolves perf's addresses. A rootless Distrobox cannot
+  attach perf or gdb to the emulator on the host; a rootful one (`distrobox create --root`)
+  can, after `sysctl kernel.perf_event_paranoid=-1`. Running the emulator inside the
+  container fails instead (`importing the supplied dmabufs failed`) and overwrites the
+  pipeline cache with an empty one.
+
+### Linux, 12 GB card, re-test (base 4802886 + host-buffers, 2026-10-18)
+
+Same machine. Played into Trask Outpost; no crash. The controller (DualSense) works.
+
+- **Missing and low-detail textures: the video memory budget.** With the 2026-10-11 settings
+  (`KYTY_VRAM_TARGET_MB=8192`) and the desktop holding ~2.2 GB, `MemoryShortfall` was non-zero most
+  of the session, which clamped the texture collector's thresholds to 512-728 MB while the cache
+  held ~4.5 GB. It ran in "critical" every submission (229,500 runs by frame 2,852) and evicted
+  bindless heap textures that draws still sampled (`TexGc ... bindless=141`, `125`, `41`).
+- **The Linux NVIDIA driver's budget is the limit, not the target.** Raising the target to 11264
+  changed nothing: `GetTotalMemoryBudget` takes the smaller of the target and the driver's budget
+  less its 1 GB reserve, and the driver reported a budget that left the emulator ~7.9 GB
+  (`Memory: short ... device 7374 MB of 7965 MB budget`). `KYTY_VRAM_BUDGET_MB` (vram-budget PR)
+  replaces the driver's figure. 9728 overshot (11,493 MB on the card with the desktop, the run
+  script's watchdog killed it); 8704 held: thresholds stayed at 3,788-4,812 MB, no bindless
+  evictions, 11,010 MB peak on the card, and `Memory: short` only briefly near the top.
+- **CPU: tracked page faults dominate.** One 5 min 23 s session (3,357 frames, ~3 fps in the
+  outpost) took 9,950,000 tracked faults (379,201 on the GPU thread) at 1,680 sites. The twelve
+  slowest sites alone spent ~747 s in the handler, summed over threads: more than two of the six
+  cores for the whole session.
+  - Reads of GPU-written bytes: site `0x903ee0a9d` took 46,682 reads at ~5.6 ms each (262 s),
+    `0x903ee16ac` 9,968 at ~6 ms (61 s). Both last faulted in the heap buffer at `0x1210000000`,
+    the one `KYTY_HOST_BUFFER_MB` puts in system memory. None were served by clean-read emulation.
+  - Writes: site `0x903d64dc0` took 3,882,355 faults at ~51 us each (197 s), `0x903ee6cf6`
+    798,359 (45 s), `0x903dc951d` 794,512 (26 s).
+  - `RecordTrackedFault` takes one global mutex and searches the site list linearly on every
+    fault, 10 million times here. It is diagnostic only and could be opt-in.
+  - `GpuWaits`: 381,696 waits, 51.4 s in total.
+- **Log volume.** The session wrote 3.8 million lines (230 MB). About half are libAjm per-call
+  parameters (`ajm.cpp`, the `instance = ...` lines).
+- **Build.** The host-buffers GC-keep lambda had two return types that clang rejects; fixed on
+  that PR's branch. A build script that ignored ninja's exit status had hidden it.
 
 ## The work for this title, by area
 
