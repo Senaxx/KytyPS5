@@ -207,6 +207,37 @@ Same machine. Played into Trask Outpost; no crash. The controller (DualSense) wo
 - **Build.** The host-buffers GC-keep lambda had two return types that clang rejects; fixed on
   that PR's branch. A build script that ignored ninja's exit status had hidden it.
 
+### Windows, 8 GB card (RTX 3070, i7-11700KF, base 75dea37, 2026-10-24)
+
+Windows 11, NVIDIA 617.14, Release build with clang-cl (VS 2022), 64 MB main stack
+(`editbin /STACK:67108864`; without it the official builds exit at ~30 s on this machine). Window
+1280x720 (default), fresh save, Cross (J) pressed every 15 s by a script, 600 s per run.
+
+```
+KYTY_HOST_BUFFER_MB=1024 KYTY_TEXTURE_CACHE_MB=3584 KYTY_BUFFER_CACHE_MB=1536 KYTY_VRAM_TARGET_MB=6656
+kyty_emulator.exe --game <dump>\eboot.bin --readback-linear-images true --tessellation --redzone --bindless --skip-shaders $SKIP
+```
+
+These are the 12 GB values above scaled to 8 GB; `KYTY_VRAM_BUDGET_MB` was not set.
+
+- **Reaches the opening cutscenes, no crash.** Intros, INITIAL SETUP, the title screen, "30 YEARS
+  AGO" (Logan in the jungle), then the "PRESENT DAY" scenes at night, then gameplay: the first
+  jungle fight at ~630 s, with the "L + Triangle Leap Attack" tutorial prompt, ~3 fps (frame 4,076
+  at 990 s). A 1,200 s warm run stayed there without a crash (the script only presses Cross).
+- **One crash in four runs.** A third run lost the device at ~240 s, right after INITIAL SETUP
+  while the title loaded: `MasterSemaphore: wait for tick ... failed: ErrorDeviceLost`, then
+  `commandScheduler.cpp:570` from `Presenter::Present`; Windows logged nvlddmkm event 153 (not a
+  4101 timeout). Card use was 7.7 GB at the time. The other three runs passed the same point.
+- **Speed.** Cold pipeline cache: frame 2,478 at 300 s, 2,719 at 570 s. Warm (second run, same
+  folder): frame 2,626 at 300 s, 2,935 at 570 s; the title bar shows 0-4 fps in the cutscenes.
+- **The giant buffer goes to system memory.** `Buffer placed in system memory (KYTY_HOST_BUFFER_MB):
+  2736 MB at guest 0x0000001210000000`. Card use (nvidia-smi, includes the desktop) peaked at
+  7.7 GB of 8 GB and stayed there from ~200 s on.
+- **Budget.** The Windows driver leaves the emulator 6,342 MB (`Memory: short ... device 6769 MB of
+  6342 MB budget`, once). Some collections freed bindless heap textures (`TexGc ... bindless=177`,
+  `152`), the same pattern as the 12 GB re-test before `KYTY_VRAM_BUDGET_MB`; a lower texture cache
+  or a budget override may help here, not tested yet.
+
 ## The work for this title, by area
 
 ### Bindless textures (`--bindless`, off by default)
