@@ -145,7 +145,8 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 					m_scheduler->BindSparseBuffer(m_buffer,
 					                             {begin, std::min(m_page_size, m_sparse_size - begin), memory, memory_offset});
 				}
-				Fill(0, std::min(m_page_size, size), 0);
+				// Built before the first command buffer (BufferCache's page table): the owner zeroes it.
+				if (m_scheduler->Active()) Fill(0, std::min(m_page_size, size), 0);
 			}
 			return;
 		}

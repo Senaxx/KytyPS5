@@ -279,7 +279,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE, graphics.sparse_page_table),
+                             BDA_PAGETABLE_SIZE, graphics.sparse_page_table, graphics.zero_page_table),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, StagingBufferSize()),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -298,7 +298,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	                     "BDA Page Table Buffer");
 	m_scheduler.BeginCommand();
 	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
-		if (!buffer->IsSparse()) buffer->Fill(0, buffer->Size(), 0); // a sparse one's unbound pages read 0
+		if (!buffer->IsSparse()) {
+			buffer->Fill(0, buffer->Size(), 0); // a sparse one's unbound pages read 0
+		} else if (buffer->HasZeroPage()) {
+			buffer->Fill(0, std::min(buffer->PageSize(), buffer->Size()), 0); // its zero page, through page 0
+		}
 	}
 	// Zeroed: an empty guest buffer is bound to it, and with robustBufferAccess2 its loads have no
 	// guard of their own (its stores and atomics do: its length in the shader data is 0).

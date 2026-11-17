@@ -63,6 +63,9 @@ struct GraphicContext {
 	// memory mapped; the other pages sit on one shared zero page (sparse_buffers_aliased) or unbound (residencyNonResidentStrict).
 	bool                               sparse_buffers                         = false;
 	bool                               sparse_buffers_aliased                 = false;
+	// The sparse page table's unbound pages sit on a zero page (sparse aliased): AMD's scalar loads can hang on an unbound
+	// page (nullPrtWorkaround.h, KYTY_ZERO_PAGE_TABLE).
+	bool                               zero_page_table                        = false;
 	uint64_t                           max_buffer_size                        = 0; // Vulkan 1.3 maxBufferSize
 	uint32_t                           sparse_queue_index                     = 0;       // of queue_family
 	vk::Queue                          sparse_queue                           = nullptr; // binds only (CommandScheduler)

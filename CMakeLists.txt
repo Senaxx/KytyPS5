@@ -685,6 +685,11 @@ add_executable(wolverine_physics_step_tests EXCLUDE_FROM_ALL
 target_include_directories(wolverine_physics_step_tests PRIVATE ${inc_headers})
 target_link_libraries(wolverine_physics_step_tests xbyak::xbyak)
 
+add_executable(null_prt_workaround_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/NullPrtWorkaroundTests.cpp"
+)
+target_include_directories(null_prt_workaround_tests PRIVATE ${inc_headers})
+
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
@@ -998,6 +1003,7 @@ if(BUILD_TESTING)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
+	add_test(NAME null_prt_workaround COMMAND $<TARGET_FILE:null_prt_workaround_tests>)
 	add_test(NAME wolverine_render_step COMMAND $<TARGET_FILE:wolverine_render_step_tests>)
 	add_test(NAME wolverine_physics_step COMMAND $<TARGET_FILE:wolverine_physics_step_tests>)
 	add_test(NAME group_reuse COMMAND $<TARGET_FILE:group_reuse_tests>)
@@ -1147,6 +1153,7 @@ if(BUILD_TESTING)
 		wolverine_render_step_tests
 		wolverine_physics_step_tests
 		lru_cache_tests
+		null_prt_workaround_tests
 		group_reuse_tests
 		wolverine_stores_tests
 		group_notices_tests

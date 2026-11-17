@@ -76,6 +76,7 @@ public:
 	void Back(uint64_t offset, uint64_t size);
 	[[nodiscard]] bool IsSparse() const noexcept { return m_page_size != 0; }
 	[[nodiscard]] uint64_t PageSize() const noexcept { return m_page_size; }
+	[[nodiscard]] bool HasZeroPage() const noexcept { return m_zero_page != nullptr; }
 	[[nodiscard]] bool IsBacked(uint64_t offset) const noexcept { return !IsSparse() || m_pages[offset / m_page_size] != nullptr; }
 	[[nodiscard]] uint64_t BackedBytes() const noexcept { return m_backed_pages * m_page_size; }
 

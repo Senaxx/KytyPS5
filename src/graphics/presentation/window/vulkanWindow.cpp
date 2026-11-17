@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/nullPrtWorkaround.h"
 #include "graphics/host_gpu/renderer/fsr3FrameGen.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -482,6 +483,26 @@ static void ChooseSparseBuffers(GraphicContext& graphics, vk::PhysicalDevice phy
 	     static_cast<unsigned long long>(graphics.max_buffer_size >> 20u));
 }
 
+// The BDA page table's unbound pages go on a zero page where the driver may hang on them (nullPrtWorkaround.h).
+static void ChooseZeroPageTable(GraphicContext& graphics, vk::PhysicalDevice physical_device,
+                                const vk::PhysicalDeviceFeatures& supported) {
+	vk::PhysicalDeviceDriverProperties driver {};
+	vk::PhysicalDeviceProperties2      properties2 {};
+	properties2.pNext = &driver;
+	physical_device.getProperties2(&properties2);
+	const auto& properties = properties2.properties;
+	const char* force      = std::getenv("KYTY_ZERO_PAGE_TABLE");
+	const bool  wanted     = WantZeroPageTable(force, properties.vendorID, static_cast<uint32_t>(driver.driverID),
+	                                           properties.driverVersion);
+	graphics.zero_page_table = graphics.sparse_page_table && wanted && supported.sparseResidencyAliased;
+	LOGF("Zero page table (NULL PRT workaround): %s (%s; vendor 0x%04x, driver id %u, version 0x%08x)\n",
+	     graphics.zero_page_table ? "on" : "off",
+	     force != nullptr && (force[0] == '0' || force[0] == '1') ? "KYTY_ZERO_PAGE_TABLE"
+	     : wanted                                                  ? "driver match"
+	                                                               : "driver not affected",
+	     properties.vendorID, static_cast<uint32_t>(driver.driverID), properties.driverVersion);
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics, vk::SurfaceKHR surface,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -827,10 +848,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics, vk::SurfaceKHR su
 		    physical_device.getProperties().sparseProperties.residencyNonResidentStrict && queue_family < family_count &&
 		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding) &&
 		    !(sparse_table != nullptr && sparse_table[0] == '0');
+		ChooseZeroPageTable(graphics, physical_device, supported_features2.features);
 		device_features.sparseBinding          = graphics.sparse_textures_enabled || graphics.sparse_page_table || graphics.sparse_buffers;
 		device_features.sparseResidencyImage2D = graphics.sparse_textures_enabled;
 		device_features.sparseResidencyBuffer  = graphics.sparse_page_table || graphics.sparse_buffers;
-		device_features.sparseResidencyAliased = graphics.sparse_buffers_aliased;
+		device_features.sparseResidencyAliased = graphics.sparse_buffers_aliased || graphics.zero_page_table;
 		// Binds go to a second queue of the family where it has one (as vkd3d-proton binds on its own
 		// submission thread): the GPU thread does not wait for the driver's binds.
 		graphics.sparse_queue_index =
@@ -1241,10 +1263,11 @@ static vk::Device VulkanCreateDeviceChains(GraphicContext& graphics, vk::Surface
 		    physical_device.getProperties().sparseProperties.residencyNonResidentStrict && queue_family < family_count &&
 		    static_cast<bool>(families[queue_family].queueFlags & vk::QueueFlagBits::eSparseBinding) &&
 		    !(sparse_table != nullptr && sparse_table[0] == '0');
+		ChooseZeroPageTable(graphics, physical_device, supported2.features);
 		device_features.sparseBinding          = graphics.sparse_textures_enabled || graphics.sparse_page_table || graphics.sparse_buffers;
 		device_features.sparseResidencyImage2D = graphics.sparse_textures_enabled;
 		device_features.sparseResidencyBuffer  = graphics.sparse_page_table || graphics.sparse_buffers;
-		device_features.sparseResidencyAliased = graphics.sparse_buffers_aliased;
+		device_features.sparseResidencyAliased = graphics.sparse_buffers_aliased || graphics.zero_page_table;
 		graphics.sparse_queue_index =
 		    (graphics.sparse_textures_enabled || graphics.sparse_page_table || graphics.sparse_buffers) && families[queue_family].queueCount > 1
 		        ? 1u
