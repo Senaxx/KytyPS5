@@ -648,7 +648,25 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
-	const auto overlap = ResolveOverlaps(vaddr, size);
+	auto overlap = ResolveOverlaps(vaddr, size);
+
+	// A sparse buffer covers the whole guest reservation it lies in (up to 4 GiB past each end), so a pool the game commits
+	// as it goes is made once: it grew 1-3 MiB a step at Wolverine's place 44, a whole new 1.9 GB copy each time, about ten
+	// copies held until the GPU finished (2026-11-17). Pages the guest hasn't committed stay unbacked and cost no memory.
+	// shortcut: a pool still under 1 GiB grows as a dense buffer, rebuilt per step; widen those too if that shows up.
+	if (m_graphics.sparse_buffers && overlap.end - overlap.begin >= (uint64_t {1} << 30u)) {
+		const auto [span_begin, span_end] =
+		    LibKernel::Memory::GuestSpan(overlap.begin, overlap.end - overlap.begin, uint64_t {4} << 30u);
+		const auto begin = Common::AlignUp(span_begin, CACHING_PAGESIZE);
+		const auto end   = Common::AlignDown(span_end, CACHING_PAGESIZE);
+		if ((begin < overlap.begin || end > overlap.end) && begin <= overlap.begin && end >= overlap.end &&
+		    (m_graphics.max_buffer_size == 0 || end - begin <= m_graphics.max_buffer_size)) {
+			LOGF("BufferCache: sparse buffer at guest 0x%016" PRIx64 " widened from %llu to %llu MiB, its reservation\n",
+			     begin, static_cast<unsigned long long>((overlap.end - overlap.begin) >> 20u),
+			     static_cast<unsigned long long>((end - begin) >> 20u));
+			overlap = ResolveOverlaps(begin, end - begin);
+		}
+	}
 
 	const auto bytes = overlap.end - overlap.begin;
 	if (m_graphics.max_buffer_size != 0 && bytes > m_graphics.max_buffer_size) {

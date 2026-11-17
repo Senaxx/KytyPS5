@@ -450,6 +450,44 @@ public:
 		return remember(clamped_size);
 	}
 
+	// The gapless span of guest data memory (reserved, direct, flexible or pooled; no stack or code) around
+	// [virtual_addr, virtual_addr + size), at most limit bytes past each end; the range itself when it isn't all such
+	// memory.
+	std::pair<uint64_t, uint64_t> GuestSpan(uint64_t virtual_addr, uint64_t size, uint64_t limit) {
+		const auto is_data = [](const Range& range) {
+			return range.type != VirtualRangeType::Stack && range.type != VirtualRangeType::Code &&
+			       range.type != VirtualRangeType::Runtime;
+		};
+		const auto end = End(virtual_addr, size);
+		const auto low = virtual_addr - std::min(virtual_addr, limit);
+		const auto high = End(end, limit);
+		auto       first = FindContaining(virtual_addr);
+		if (first == m_ranges.end() || !is_data(first->second)) {
+			return {virtual_addr, end};
+		}
+		auto last = first;
+		while (End(last->second.start, last->second.size) < high) {
+			const auto next = std::next(last);
+			if (next == m_ranges.end() || next->second.start != End(last->second.start, last->second.size) ||
+			    !is_data(next->second)) {
+				break;
+			}
+			last = next;
+		}
+		const auto span_end = End(last->second.start, last->second.size);
+		if (span_end < end) {
+			return {virtual_addr, end};
+		}
+		while (first->second.start > low && first != m_ranges.begin()) {
+			const auto previous = std::prev(first);
+			if (End(previous->second.start, previous->second.size) != first->second.start || !is_data(previous->second)) {
+				break;
+			}
+			first = previous;
+		}
+		return {std::max(first->second.start, low), std::min(span_end, high)};
+	}
+
 	uint64_t CountPageTableEntries(bool gpu) {
 		return gpu ? m_gpu_page_table_entries : m_cpu_page_table_entries;
 	}

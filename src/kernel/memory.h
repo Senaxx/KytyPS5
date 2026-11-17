@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <utility>
+
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -148,6 +150,9 @@ bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t siz
 // reserved ranges too (unmapped pages there read as zero), stopping where the address space is free.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool through_reserved);
+// [begin, end) of the gapless guest data memory (reserved or committed, no stack or code) around [vaddr, vaddr + size),
+// at most limit bytes past each end; the range itself when it isn't all such memory.
+[[nodiscard]] std::pair<uint64_t, uint64_t> GuestSpan(uint64_t vaddr, uint64_t size, uint64_t limit);
 // True when all of [vaddr, vaddr + size) is committed guest memory; for an address read from data that may be stale.
 [[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;

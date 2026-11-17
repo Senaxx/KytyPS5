@@ -67,6 +67,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size, bool through_reserved) {
 	return clamped_size;
 }
 
+std::pair<uint64_t, uint64_t> GuestSpan(uint64_t vaddr, uint64_t size, uint64_t limit) {
+	std::shared_lock state(g_memory_state_mutex);
+	return g_virtual_ranges->GuestSpan(vaddr, size, limit);
+}
+
 // Commit on first touch (lean 438cb01c5, fb82648a3; Windows, on by default, KYTY_FIRST_TOUCH=0 turns it off) with lazy
 // protection (08d26ed16, c7f883880) and the second view committed first (4ece93a3f), on upstream's store.
 void EnableFirstTouchCommit() {

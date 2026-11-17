@@ -1070,6 +1070,33 @@ void TestClampRangeSizeThroughReserved() {
 	CheckOk(test, KernelMunmap(base + 3 * page, page), "release arena past the freed page");
 }
 
+void TestGuestSpan() {
+	using namespace Libs::LibKernel::Memory;
+	const char*        test  = "GuestSpan";
+	constexpr uint64_t page  = SceKernelPageSize;
+	void*              arena = nullptr;
+	// Pages 1-6 reserved with page 2 mapped; pages 0 and 7 freed so nothing else borders the span.
+	CheckOk(test, KernelReserveVirtualRange(&arena, 8 * page, 0, 4 * page), "reserve arena");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, KernelMunmap(base, page), "free page 0");
+	CheckOk(test, KernelMunmap(base + 7 * page, page), "free page 7");
+	void* mapped = reinterpret_cast<void*>(base + 2 * page);
+	CheckOk(test, KernelMapNamedFlexibleMemory(&mapped, page, SceKernelProtCpuRw, SceKernelMapFixed, "span_page"),
+	        "map one page into the reservation");
+	using Span = std::pair<uint64_t, uint64_t>;
+	Check(test, GuestSpan(base + 2 * page, page, 64 * page) == Span {base + page, base + 7 * page},
+	      "the span must cover the reservation around a mapped page and stop at free space");
+	Check(test, GuestSpan(base + 2 * page, page, page) == Span {base + page, base + 4 * page},
+	      "the span must stop at the limit past each end");
+	Check(test, GuestSpan(base + 3 * page, page, 0) == Span {base + 3 * page, base + 4 * page},
+	      "a zero limit must give the range itself");
+	Check(test, GuestSpan(base + 6 * page, 2 * page, 64 * page) == Span {base + 6 * page, base + 8 * page},
+	      "a range running into free space must come back as it is");
+	Check(test, GuestSpan(base + 7 * page, page, 64 * page) == Span {base + 7 * page, base + 8 * page},
+	      "a free range must come back as it is");
+	CheckOk(test, KernelMunmap(base + page, 6 * page), "release arena");
+}
+
 void TestFragmentedGuestFreeRangeHints() {
 	using namespace Libs::LibKernel::Memory;
 	const char*        test  = "FragmentedGuestFreeRangeHints";
@@ -6165,6 +6192,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestClampRangeSizeThroughReserved);
+	RunTest(TestGuestSpan);
 	RunTest(TestFragmentedGuestFreeRangeHints);
 	RunTest(TestGuestFreeRangeSearchSkipsEarlierFragments);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);
