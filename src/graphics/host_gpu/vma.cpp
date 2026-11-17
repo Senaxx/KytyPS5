@@ -42,6 +42,9 @@ bool GraphicContext::CreateAllocator() {
 	info.pVulkanFunctions = &functions;
 	info.vulkanApiVersion = VULKAN_TARGET_API_VERSION;
 	info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+	// VMA's default 256 MiB blocks left 0.6-1.2 GB unused inside them in Marvel's Wolverine (Pro mode, Telambang; most of
+	// it in a few blocks holding a handful of allocations). Smaller blocks are freed sooner and leave smaller gaps.
+	info.preferredLargeHeapBlockSize = 64ull * 1024ull * 1024ull;
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
