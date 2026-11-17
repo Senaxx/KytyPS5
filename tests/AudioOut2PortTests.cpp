@@ -654,7 +654,8 @@ void TestDevicePushWithoutPcmQueuesSilence() {
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push before any PCM failed");
 	Check(OutputCalls().empty(), "a port that never had PCM got a silent grain");
 
-	std::vector<uint32_t> pcm(512, 0x01020304u);
+	// One grain of the port's format (0x200: two float channels): the push reads 512 * 2 * 4 bytes.
+	std::vector<uint32_t> pcm(512 * 2, 0x01020304u);
 	const auto            pcm_bytes = pcm.size() * sizeof(uint32_t);
 	SetPcm(port, pcm.data());
 	CaptureOutputPcm(pcm_bytes);
